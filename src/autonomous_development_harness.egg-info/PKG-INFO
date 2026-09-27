@@ -1,0 +1,15 @@
+Metadata-Version: 2.4
+Name: autonomous-development-harness
+Version: 0.1.0
+Summary: Stateful autonomous AI development harness for Apple Silicon macOS
+Requires-Python: >=3.11
+Requires-Dist: fastapi>=0.115
+Requires-Dist: uvicorn>=0.30
+Requires-Dist: pydantic>=2.7
+Requires-Dist: PyYAML>=6.0
+Requires-Dist: typer>=0.12
+Requires-Dist: httpx>=0.27
+Provides-Extra: dev
+Requires-Dist: pytest>=8; extra == "dev"
+Requires-Dist: pytest-cov>=5; extra == "dev"
+Requires-Dist: ruff>=0.6; extra == "dev"

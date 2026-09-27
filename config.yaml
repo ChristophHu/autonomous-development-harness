@@ -1,0 +1,41 @@
+harness:
+  name: autonomous-development-harness
+  environment: development
+paths:
+  workspace: ./workspace
+  obsidian_vault: ./vault
+  logs: ./logs
+  database: ./data/harness.db
+database: {type: sqlite}
+git: {enabled: false, main: main, dev: dev, remote: null}
+memory:
+  obsidian: {enabled: true}
+  qdrant: {enabled: false, url: http://127.0.0.1:6333, collection: harness-memory}
+  embeddings: {provider: lmstudio, base_url: http://127.0.0.1:1234/v1, model: text-embedding-model, dimensions: 1024}
+models:
+  defaults: {provider: lmstudio}
+  providers:
+    openai: {enabled: true, base_url: https://api.openai.com/v1}
+    openrouter: {enabled: true, base_url: https://openrouter.ai/api/v1}
+    lmstudio: {enabled: true, base_url: http://127.0.0.1:1234/v1}
+profiles:
+  planner:
+    model: {primary: lmstudio, fallback: [openai]}
+    instructions: Produce grounded, executable dependency plans; never invent completion evidence.
+    tools: []
+    permissions: []
+  coding:
+    model: {primary: lmstudio, fallback: [openai]}
+    instructions: Implement the assigned step using workspace tools and report actual observations.
+    tools: [filesystem.read, filesystem.search, filesystem.write, filesystem.create, shell.execute]
+    permissions: [filesystem, shell]
+    max_steps: 20
+  validator:
+    model: {primary: lmstudio, fallback: [openai]}
+    instructions: Independently inspect observed artifacts, tests and requirements; fail closed on missing evidence.
+    tools: []
+    permissions: []
+api: {host: 127.0.0.1, port: 8080, swagger: true}
+logging: {level: INFO, file: ./logs/harness.log}
+tools:
+  permissions: {filesystem: write, shell: write, git: read, filesystem.delete: denied}

@@ -1,0 +1,117 @@
+"""Typed task contracts and explicit lifecycle transitions."""
+
+from enum import StrEnum
+from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+
+class Status(StrEnum):
+    PENDING = "pending"
+    ANALYZING = "analyzing"
+    PLANNING = "planning"
+    READY = "ready"
+    EXECUTING = "executing"
+    TESTING = "testing"
+    VALIDATING = "validating"
+    CORRECTING = "correcting"
+    RECOVERING = "recovering"
+    WAITING_HUMAN = "waiting_human"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    BLOCKED = "blocked"
+    CANCELLED = "cancelled"
+
+
+TERMINAL = {Status.COMPLETED, Status.CANCELLED}
+TRANSITIONS = {
+    Status.PENDING: {Status.ANALYZING},
+    Status.ANALYZING: {Status.PLANNING},
+    Status.PLANNING: {Status.READY},
+    Status.READY: {Status.EXECUTING},
+    Status.EXECUTING: {Status.TESTING, Status.CORRECTING},
+    Status.TESTING: {Status.VALIDATING},
+    Status.VALIDATING: {Status.COMPLETED, Status.CORRECTING},
+    Status.CORRECTING: {Status.EXECUTING, Status.PLANNING},
+    Status.RECOVERING: {Status.ANALYZING},
+    Status.WAITING_HUMAN: {Status.ANALYZING, Status.RECOVERING},
+    Status.FAILED: {Status.ANALYZING, Status.RECOVERING},
+    Status.BLOCKED: {Status.ANALYZING, Status.RECOVERING},
+}
+
+
+def may_transition(source, target):
+    source, target = Status(source), Status(target)
+    if source in TERMINAL:
+        return False
+    if target in {
+        Status.CANCELLED,
+        Status.FAILED,
+        Status.BLOCKED,
+        Status.WAITING_HUMAN,
+    }:
+        return True
+    return target in TRANSITIONS.get(source, set())
+
+
+class AcceptanceCriterion(BaseModel):
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+    id: str = Field(min_length=1)
+    description: str = Field(min_length=1)
+    kind: Literal["review", "file_exists", "file_contains", "command"] = "review"
+    path: str = ""
+    contains: str = ""
+    command: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def executable_contract(self):
+        if self.kind.startswith("file_") and not self.path:
+            raise ValueError("file acceptance criterion requires path")
+        if self.kind == "file_contains" and not self.contains:
+            raise ValueError("file_contains requires expected content")
+        if self.kind == "command" and not self.command:
+            raise ValueError("command criterion requires an argument list")
+        return self
+
+
+class Task(BaseModel):
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+    id: int | None = None
+    parent_task_id: int | None = None
+    title: str = Field(min_length=1)
+    description: str = ""
+    goal: str = ""
+    priority: int = 0
+    status: Status = Status.PENDING
+    created_at: str = ""
+    updated_at: str = ""
+    requirements: list[str] = Field(default_factory=list)
+    constraints: list[str] = Field(default_factory=list)
+    acceptance_criteria: list[AcceptanceCriterion] = Field(default_factory=list)
+    dependencies: list[int] = Field(default_factory=list)
+    assigned_agent: str | None = None
+    assigned_profile: str | None = None
+    complexity: str | None = None
+    context: dict[str, Any] = Field(default_factory=dict)
+    decisions: list[dict[str, Any]] = Field(default_factory=list)
+    plan: dict[str, Any] | None = None
+    validation_result: dict[str, Any] | None = None
+    test_result: dict[str, Any] | None = None
+    test_commands: list[list[str]] = Field(default_factory=list)
+    lint_commands: list[list[str]] = Field(default_factory=list)
+    coverage_command: list[str] = Field(default_factory=list)
+    coverage_report: str = "coverage.json"
+    coverage_threshold: float = Field(default=100, ge=0, le=100)
+    result: str | None = None
+    workflow: Literal["feature", "bugfix", "hotfix", "release", "other"] | None = None
+    release_version: str = ""
+    git_state: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def unique_acceptance_ids(self):
+        ids = [criterion.id for criterion in self.acceptance_criteria]
+        if len(ids) != len(set(ids)):
+            raise ValueError("acceptance criterion IDs must be unique")
+        if not self.title.strip():
+            raise ValueError("task title must not be blank")
+        return self
