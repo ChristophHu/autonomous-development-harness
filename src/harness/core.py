@@ -27,6 +27,7 @@ from .approvals import ApprovalService
 from .audit import AuditRecorder
 from .database import (
     AgentRunRepository,
+    CorrectionRepository,
     Database,
     DecisionRepository,
     EventRepository,
@@ -238,6 +239,29 @@ class Config:
                 if phase != "total" and seconds > value["total"]:
                     raise ValueError(f"{name}.{phase} cannot exceed total")
 
+        def provider_retry(value, name):
+            retry = mapping(value, name)
+            if set(retry) - {"max_attempts", "base_delay", "max_delay"}:
+                raise ValueError(f"{name} has unknown retry settings")
+            attempts = retry.get("max_attempts", 3)
+            if isinstance(attempts, bool) or not isinstance(attempts, int):
+                raise ValueError(  # noqa: TRY004
+                    f"{name}.max_attempts must be an integer"
+                )
+            if not 1 <= attempts <= 5:
+                raise ValueError(f"{name}.max_attempts must be between 1 and 5")
+            base = retry.get("base_delay", 0.25)
+            maximum = retry.get("max_delay", 4.0)
+            for field, seconds in (("base_delay", base), ("max_delay", maximum)):
+                if (
+                    isinstance(seconds, bool)
+                    or not isinstance(seconds, (int, float))
+                    or not 0 <= seconds <= 60
+                ):
+                    raise ValueError(f"{name}.{field} must be between 0 and 60 seconds")
+            if base > maximum:
+                raise ValueError(f"{name}.base_delay cannot exceed max_delay")
+
         root = mapping(self.data, "configuration root")
         api = mapping(root.get("api", {}), "api")
         port = api.get("port", 8080)
@@ -310,6 +334,7 @@ class Config:
             if provider.get("model") is not None:
                 text(provider["model"], f"models.providers.{name}.model")
             timeout(provider.get("timeout", 120), f"models.providers.{name}.timeout")
+            provider_retry(provider.get("retry", {}), f"models.providers.{name}.retry")
         registry = mapping(models.get("registry", {}), "models.registry")
         for name, definition in registry.items():
             definition = mapping(definition, f"models.registry.{name}")
@@ -368,6 +393,7 @@ class Store:
         self.events = EventRepository(self.database)
         self.plans = PlanRepository(self.database)
         self.validations = ValidationRepository(self.database)
+        self.corrections = CorrectionRepository(self.database)
         self.subtasks = SubtaskRepository(self.database)
         self.questions = QuestionRepository(self.database)
         self.decisions = DecisionRepository(self.database)
@@ -576,6 +602,12 @@ class Orchestrator:
 
         try:
             task = self.store.get(task_id)
+            # A previous process may have stopped after claiming a correction.
+            # Re-open it so the next leased run can safely retry it.
+            for item in self.store.corrections.list_for_task(
+                task_id, status="in_progress"
+            ):
+                self.store.corrections.set_status(item["id"], "open")
             reconciliation = None
             recovery_scope = None
             interrupted = task.status not in {
@@ -734,10 +766,36 @@ class Orchestrator:
                 | {"plan": plan.model_dump(mode="json")},
             )
             transition(Status.READY)
-            findings = []
             attempt = 0
             while True:
                 transition(Status.EXECUTING)
+                open_corrections = self.store.corrections.list_for_task(
+                    task_id, status="open"
+                )
+                for item in open_corrections:
+                    self.store.corrections.set_status(item["id"], "in_progress")
+                active_corrections = self.store.corrections.list_for_task(
+                    task_id, status="in_progress"
+                )
+                correction_context = [
+                    {
+                        "category": item["category"],
+                        "rule": item["rule"],
+                        "message": item["message"],
+                        "subtask_id": item["subtask_id"],
+                        "affected_paths": item["affected_paths"],
+                        "evidence": item["evidence"],
+                        "expected": item["expected"],
+                    }
+                    for item in active_corrections
+                ]
+                workspace_before = await asyncio.to_thread(
+                    self._invoke,
+                    task,
+                    "validator",
+                    "validator",
+                    self.validator.workspace_snapshot,
+                )
                 outputs = []
                 for step in plan.ordered_steps():
                     if any(
@@ -760,7 +818,9 @@ class Orchestrator:
                             self._execute_step,
                             task,
                             step,
-                            context + "\\nCorrections: " + json.dumps(findings),
+                            context
+                            + "\\nCorrections: "
+                            + json.dumps(correction_context),
                             recovery_scope,
                         )
                     outputs.append(output)
@@ -771,6 +831,13 @@ class Orchestrator:
                         output.model_dump_json(),
                         plan_id,
                     )
+                workspace_after = await asyncio.to_thread(
+                    self._invoke,
+                    task,
+                    "validator",
+                    "validator",
+                    self.validator.workspace_snapshot,
+                )
                 transition(Status.TESTING)
                 tests = await asyncio.to_thread(
                     self._invoke,
@@ -793,6 +860,9 @@ class Orchestrator:
                     task,
                     outputs,
                     tests,
+                    self.store.questions.has_open_required(task_id),
+                    workspace_before,
+                    workspace_after,
                 )
                 self.store.validations.record(
                     task_id, validation.valid, validation.model_dump_json()
@@ -805,7 +875,32 @@ class Orchestrator:
                         "validation_result": validation.model_dump(mode="json"),
                     },
                 )
+                validation_findings = [
+                    finding.model_dump(mode="json") for finding in validation.findings
+                ]
+                if (
+                    not validation.valid
+                    and not validation_findings
+                    and validation.errors
+                ):
+                    # Compatibility for custom validators that still return only
+                    # the legacy errors field; never infer category from its text.
+                    validation_findings = [
+                        {
+                            "category": "validation",
+                            "source": "legacy_validator",
+                            "rule": "validator.unclassified",
+                            "message": "; ".join(validation.errors),
+                            "evidence": {"errors": validation.errors},
+                        }
+                    ]
+                for finding in validation_findings:
+                    self.store.corrections.record(task_id, finding, plan_id)
                 if validation.valid:
+                    for item in self.store.corrections.list_for_task(
+                        task_id, status="in_progress"
+                    ):
+                        self.store.corrections.set_status(item["id"], "resolved")
                     if recovery_scope is not None:
                         recovery_scope.verify_preserved()
                     if self.git_enabled:
@@ -817,6 +912,12 @@ class Orchestrator:
                                 "validator",
                                 self.validator.run_tests,
                                 task,
+                            )
+                            target_workspace = self._invoke(
+                                task,
+                                "target-validator",
+                                "validator",
+                                self.validator.workspace_snapshot,
                             )
                             self.store.event(
                                 task_id,
@@ -831,6 +932,10 @@ class Orchestrator:
                                 task,
                                 step_outputs,
                                 target_tests,
+                                self.store.questions.has_open_required(task_id),
+                                None,
+                                target_workspace,
+                                False,
                             )
                             self.store.validations.record(
                                 task_id,
@@ -884,6 +989,10 @@ class Orchestrator:
                         task_id, EventKind.TASK_COMPLETED, {"attempt": attempt}
                     )
                     return self.store.get(task_id)
+                for item in self.store.corrections.list_for_task(
+                    task_id, status="in_progress"
+                ):
+                    self.store.corrections.set_status(item["id"], "open")
                 findings = validation.errors
                 if attempt == int(
                     self.config.data.get("harness", {}).get(

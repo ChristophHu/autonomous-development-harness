@@ -25,6 +25,7 @@ def test_task_lifecycle(tmp_path):
     s = Store(c)
     t = s.create(Task(title="x"))
     assert s.get(t.id).title == "x"
+    assert s.corrections is not None
 
 
 def test_permissions():
@@ -267,6 +268,38 @@ def test_config_rejects_enabled_provider_without_url(tmp_path):
         (
             {"models": {"providers": {"x": {"enabled": False, "model": 3}}}},
             "models.providers.x.model must be a non-empty string",
+        ),
+        (
+            {"models": {"providers": {"x": {"retry": []}}}},
+            "models.providers.x.retry must be a mapping",
+        ),
+        (
+            {"models": {"providers": {"x": {"retry": {"extra": 1}}}}},
+            "models.providers.x.retry has unknown retry settings",
+        ),
+        (
+            {"models": {"providers": {"x": {"retry": {"max_attempts": True}}}}},
+            "models.providers.x.retry.max_attempts must be an integer",
+        ),
+        (
+            {"models": {"providers": {"x": {"retry": {"max_attempts": 6}}}}},
+            "models.providers.x.retry.max_attempts must be between 1 and 5",
+        ),
+        (
+            {"models": {"providers": {"x": {"retry": {"base_delay": True}}}}},
+            "models.providers.x.retry.base_delay must be between 0 and 60 seconds",
+        ),
+        (
+            {"models": {"providers": {"x": {"retry": {"max_delay": 61}}}}},
+            "models.providers.x.retry.max_delay must be between 0 and 60 seconds",
+        ),
+        (
+            {
+                "models": {
+                    "providers": {"x": {"retry": {"base_delay": 2, "max_delay": 1}}}
+                }
+            },
+            "models.providers.x.retry.base_delay cannot exceed max_delay",
         ),
         (
             {

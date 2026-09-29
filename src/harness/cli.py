@@ -143,6 +143,27 @@ def doctor():
         raise typer.Exit(1)
 
 
+@app.command("qdrant-smoke")
+def qdrant_smoke(confirm: bool = typer.Option(False, "--confirm")):
+    """Run a disposable isolated Qdrant health/persistence/restart check."""
+    if not confirm:
+        typer.echo(
+            "No action taken. Repeat with --confirm to start an isolated test stack."
+        )
+        raise typer.Exit(2)
+    try:
+        result = DockerComposeBroker().live_smoke_test()
+    except (OSError, RuntimeError, ValueError) as error:
+        typer.echo(f"Isolated Qdrant smoke test failed: {error}")
+        raise typer.Exit(1) from error
+    typer.echo(
+        "Isolated Qdrant smoke test passed: "
+        f"healthy={result['healthy']} "
+        f"persisted_after_restart={result['persisted_after_restart']} "
+        f"cleaned={result['cleaned']}"
+    )
+
+
 @memory.command("sync")
 def memory_sync():
     """Rebuild the Obsidian decision-note projection from canonical SQLite."""

@@ -82,12 +82,26 @@ class ExecutorOutput(BaseModel):
     tool_evidence: list[dict] = Field(default_factory=list)
 
 
+class CorrectionFinding(BaseModel):
+    """Stable, structured validator evidence suitable for persistence and retries."""
+
+    category: str
+    source: str = "validator"
+    rule: str
+    message: str
+    subtask_id: str | None = None
+    affected_paths: list[str] = Field(default_factory=list)
+    evidence: dict = Field(default_factory=dict)
+    expected: dict = Field(default_factory=dict)
+
+
 class ValidatorOutput(BaseModel):
     valid: bool
     checks: list[str] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
     missing_requirements: list[str] = Field(default_factory=list)
     required_corrections: list[str] = Field(default_factory=list)
+    findings: list[CorrectionFinding] = Field(default_factory=list)
 
 
 class RecoveryOutput(BaseModel):
@@ -137,6 +151,7 @@ class ModelRegistry:
                     model=data.get("model")
                     or config.data.get("secrets", {}).get(f"{name.upper()}_MODEL"),
                     timeout=data.get("timeout", 120),
+                    retry=data.get("retry"),
                 )
 
     def register(self, name: str, provider: ModelProvider):
@@ -283,6 +298,7 @@ class Planner:
             "planner",
             "PLAN: Return JSON matching this schema:\n"
             + json.dumps(PlannerOutput.model_json_schema())
+            + "\nFor every step that may change workspace files, declare the narrowest possible write_paths."
             + "\nTask:\n"
             + json.dumps(payload)
             + "\nContext:\n"
@@ -385,13 +401,21 @@ class Executor:
                         "filesystem.move",
                         "filesystem.copy",
                         "filesystem.delete",
+                        "filesystem.mkdir",
                     }:
-                        changed.append(
+                        changed_paths = [
                             str(
                                 call.arguments.get("destination")
                                 or call.arguments["path"]
                             )
-                        )
+                        ]
+                        if call.name in {"filesystem.move", "filesystem.delete"}:
+                            changed_paths.append(str(call.arguments["path"]))
+                        for changed_path in changed_paths:
+                            if changed_path not in changed:
+                                changed.append(changed_path)
+                        evidence[-1]["changed_paths"] = changed_paths
+                        evidence[-1]["changed_path"] = changed_paths[0]
             raise RuntimeError("profile tool step limit exceeded")
         except TaskCancelled:
             raise

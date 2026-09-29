@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
 
 import httpx
 
 from .http_control import request
+from .process_control import current_run_control
 
 
 @dataclass
@@ -34,7 +36,14 @@ class ProviderError(RuntimeError):
 
 class OpenAICompatibleProvider:
     def __init__(
-        self, name, base_url, api_key=None, model=None, transport=None, timeout=120
+        self,
+        name,
+        base_url,
+        api_key=None,
+        model=None,
+        transport=None,
+        timeout=120,
+        retry=None,
     ):
         self.name = name
         self.base_url = base_url.rstrip("/")
@@ -43,6 +52,12 @@ class OpenAICompatibleProvider:
         self.client = httpx.Client(transport=transport)
         self.transport = transport
         self.timeout = timeout
+        self.retry = {
+            "max_attempts": 3,
+            "base_delay": 0.25,
+            "max_delay": 4.0,
+        }
+        self.retry.update(retry or {})
 
     def headers(self):
         return {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
@@ -90,16 +105,41 @@ class OpenAICompatibleProvider:
         }
         if tools:
             body["tools"] = [{"type": "function", "function": tool} for tool in tools]
-        r = request(
-            "POST",
-            f"{self.base_url}/chat/completions",
-            client=self.client,
-            transport=self.transport,
-            owned_client=True,
-            headers={**self.headers(), "Content-Type": "application/json"},
-            json=body,
-            timeout=self.timeout,
-        )
+        retryable_statuses = {408, 429, 500, 502, 503, 504}
+        for attempt in range(self.retry["max_attempts"]):
+            control = current_run_control()
+            if control is not None:
+                control.check()
+            r = request(
+                "POST",
+                f"{self.base_url}/chat/completions",
+                client=self.client,
+                transport=self.transport,
+                owned_client=True,
+                headers={**self.headers(), "Content-Type": "application/json"},
+                json=body,
+                timeout=self.timeout,
+            )
+            if r.is_success:
+                break
+            if r.status_code not in retryable_statuses:
+                raise ProviderError(f"{self.name}: HTTP {r.status_code}")
+            if attempt + 1 < self.retry["max_attempts"]:
+                delay = min(
+                    self.retry["base_delay"] * (2**attempt), self.retry["max_delay"]
+                )
+                retry_after = r.headers.get("Retry-After")
+                if retry_after is not None:
+                    try:
+                        delay = min(
+                            max(delay, float(retry_after)), self.retry["max_delay"]
+                        )
+                    except ValueError:
+                        pass
+                if control is None:
+                    time.sleep(delay)
+                elif control.stop_event.wait(delay):
+                    control.check()
         if not r.is_success:
             raise ProviderError(f"{self.name}: HTTP {r.status_code}")
         try:

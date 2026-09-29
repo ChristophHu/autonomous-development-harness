@@ -6,7 +6,7 @@ import sys
 
 import pytest
 
-from harness.agents import ExecutorOutput
+from harness.agents import ExecutorOutput, ValidatorOutput
 from harness.core import Config, Orchestrator, Store
 from harness.domain import AcceptanceCriterion, Task
 
@@ -51,6 +51,8 @@ def runtime(tmp_path):
                     targets = json.loads(
                         prompt.split("RECOVERY_SCOPE_JSON:\n")[-1].splitlines()[0]
                     )["remaining_targets"]
+                else:
+                    write_paths = ["addition.py"]
                 if "AUTHORIZED_GIT_REPAIR_JSON:\n" in prompt:
                     write_paths = json.loads(
                         prompt.split("AUTHORIZED_GIT_REPAIR_JSON:\n")[-1].splitlines()[
@@ -181,6 +183,9 @@ def test_real_failure_is_corrected_and_independently_validated(tmp_path):
                 success=True,
                 output="implemented",
                 changed_files=["addition.py"],
+                tool_evidence=[
+                    {"tool": "filesystem.write", "changed_path": "addition.py"}
+                ],
             )
 
     executor = Executor()
@@ -191,7 +196,136 @@ def test_real_failure_is_corrected_and_independently_validated(tmp_path):
     assert result.test_result["coverage"]["totals"]["percent_covered"] == 100
     assert result.validation_result["valid"] is True
     assert len(store.events.list(created.id, "correction.started")) == 1
+    assert [item["status"] for item in store.corrections.list_for_task(created.id)] == [
+        "resolved"
+    ]
+    assert store.corrections.list_for_task(created.id)[0]["attempts"] == 1
     assert store.tasks.claim(created.id, "other") is False
+
+
+def test_persisted_correction_is_retried_and_resolved_without_subprocesses(tmp_path):
+    from harness.agents import CorrectionFinding
+
+    store, orchestrator, task = ready_runtime(tmp_path)
+    created = store.create(task)
+    contexts = []
+
+    class ValidatorFixture:
+        def __init__(self):
+            self.calls = 0
+
+        def workspace_snapshot(self):
+            return {"applicable": False, "filesystem": {}}
+
+        def run_tests(self, _task):
+            return {"commands": [], "coverage": {"totals": {}}}
+
+        def validate(self, *_args):
+            self.calls += 1
+            if self.calls == 1:
+                return ValidatorOutput(
+                    valid=False,
+                    errors=["acceptance criterion failed: sum"],
+                    findings=[
+                        CorrectionFinding(
+                            category="acceptance",
+                            source="acceptance_validator",
+                            rule="acceptance.criterion_failed",
+                            message="sum criterion failed",
+                        )
+                    ],
+                )
+            return ValidatorOutput(valid=True)
+
+    orchestrator.validator = ValidatorFixture()
+
+    def execute(_task, step, context, _recovery_scope):
+        contexts.append(context)
+        return ExecutorOutput(
+            subtask_id=step.id,
+            success=True,
+            output="corrected",
+        )
+
+    orchestrator._execute_step = execute
+    result = asyncio.run(orchestrator.run(created.id))
+
+    items = store.corrections.list_for_task(created.id)
+    assert result.status == "completed"
+    assert len(contexts) == 2
+    assert '"rule": "acceptance.criterion_failed"' in contexts[1]
+    assert len(items) == 1
+    assert items[0]["status"] == "resolved"
+    assert items[0]["attempts"] == 1
+
+
+def test_unresolved_correction_stays_open_when_retry_budget_exhausts(tmp_path):
+    store, orchestrator, task = ready_runtime(tmp_path)
+    created = store.create(task)
+    orchestrator.config.data["harness"] = {"max_correction_attempts": 1}
+
+    class ValidatorFixture:
+        def workspace_snapshot(self):
+            return {"applicable": False, "filesystem": {}}
+
+        def run_tests(self, _task):
+            return {"commands": [], "coverage": {"totals": {}}}
+
+        def validate(self, *_args):
+            return ValidatorOutput(
+                valid=False,
+                errors=["acceptance criterion failed: sum"],
+            )
+
+    orchestrator.validator = ValidatorFixture()
+    orchestrator._execute_step = lambda _task, step, _context, _scope: ExecutorOutput(
+        subtask_id=step.id, success=True, output="unchanged"
+    )
+
+    with pytest.raises(RuntimeError, match="acceptance criterion failed"):
+        asyncio.run(orchestrator.run(created.id))
+
+    item = store.corrections.list_for_task(created.id)[0]
+    assert item["status"] == "open"
+    assert item["attempts"] == 1
+    assert store.get(created.id).status == "failed"
+
+
+def test_interrupted_in_progress_correction_is_reopened_on_restart(tmp_path):
+    store, orchestrator, task = ready_runtime(tmp_path)
+    created = store.create(task)
+    item = store.corrections.record(
+        created.id,
+        {
+            "category": "tests",
+            "source": "test_runner",
+            "rule": "test_command.failed",
+            "message": "previous run was interrupted",
+        },
+    )
+    store.corrections.set_status(item["id"], "in_progress")
+
+    class ValidatorFixture:
+        def workspace_snapshot(self):
+            return {"applicable": False, "filesystem": {}}
+
+        def run_tests(self, _task):
+            return {"commands": [], "coverage": {"totals": {}}}
+
+        def validate(self, *_args):
+            return ValidatorOutput(valid=True)
+
+    orchestrator.validator = ValidatorFixture()
+    orchestrator._execute_step = lambda _task, step, _context, _scope: ExecutorOutput(
+        subtask_id=step.id, success=True, output="verified"
+    )
+
+    result = asyncio.run(orchestrator.run(created.id))
+
+    resumed_item = store.corrections.get(item["id"])
+    assert result.status == "completed"
+    assert resumed_item["status"] == "resolved"
+    assert resumed_item["attempts"] == 2
 
 
 def test_missing_requirements_pause_without_model_or_success(tmp_path):
@@ -263,6 +397,7 @@ def test_real_executor_tool_loop_corrects_a_real_test_failure(tmp_path):
                                 "expected_result": "sum",
                                 "acceptance_criteria": ["sum"],
                                 "required_tools": ["filesystem.write"],
+                                "write_paths": ["addition.py"],
                             }
                         ],
                     }
@@ -281,7 +416,13 @@ def test_real_executor_tool_loop_corrects_a_real_test_failure(tmp_path):
     result = asyncio.run(orchestrator.run(store.create(task).id))
     assert result.status == "completed"
     assert result.test_result["coverage"]["totals"]["percent_covered"] == 100
-    assert len(store.events.list(event_type="TOOL_CALL_COMPLETED")) == 2
+    completed_tools = [
+        json.loads(event["payload"])
+        for event in store.events.list(event_type="TOOL_CALL_COMPLETED")
+    ]
+    assert sum(event["tool"] == "filesystem.write" for event in completed_tools) == 2
+    assert sum(event["tool"] == "test.run_tests" for event in completed_tools) == 2
+    assert sum(event["tool"] == "test.run_coverage" for event in completed_tools) == 2
     assert len(store.events.list(result.id, "correction.started")) == 1
 
 

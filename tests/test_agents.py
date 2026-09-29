@@ -1,6 +1,7 @@
 import json
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from harness.agents import (
@@ -16,7 +17,8 @@ from harness.agents import (
     Validator,
 )
 from harness.domain import Task
-from harness.providers import ModelUsage
+from harness.process_control import RunControl, TaskCancelled, use_run_control
+from harness.providers import ModelUsage, OpenAICompatibleProvider
 
 
 class FakeProvider:
@@ -91,6 +93,49 @@ def test_router_fallback_and_exhaustion():
     r.register("good", FakeProvider(error=OSError("offline")))
     with pytest.raises(RuntimeError, match="all model providers failed"):
         ModelRouter(r, c).complete("p", "x")
+
+
+def test_router_does_not_fallback_after_provider_backoff_cancellation(monkeypatch):
+    c = config({"profiles": {"p": {"model": {"primary": "bad", "fallback": ["good"]}}}})
+    registry = ModelRegistry(c)
+    calls = []
+    registry.register(
+        "bad",
+        OpenAICompatibleProvider(
+            "bad",
+            "http://model",
+            model="m",
+            transport=httpx.MockTransport(
+                lambda request: calls.append(request) or httpx.Response(503)
+            ),
+            retry={"max_attempts": 3, "base_delay": 0.1, "max_delay": 1},
+        ),
+    )
+
+    class CountingProvider(FakeProvider):
+        def __init__(self):
+            super().__init__("must not run")
+            self.calls = 0
+
+        def complete(self, prompt, **kwargs):
+            self.calls += 1
+            return self.result
+
+    fallback = CountingProvider()
+    registry.register("good", fallback)
+    control = RunControl()
+    wait = control.stop_event.wait
+
+    def stop_during_backoff(delay):
+        if delay > 0.02:
+            control.request_stop("test cancellation")
+            return True
+        return wait(delay)
+
+    monkeypatch.setattr(control.stop_event, "wait", stop_during_backoff)
+    with use_run_control(control), pytest.raises(TaskCancelled):
+        ModelRouter(registry, c).complete("p", "prompt")
+    assert len(calls) == 1 and fallback.calls == 0
 
 
 def test_planner_structured_and_fallback():
@@ -209,6 +254,66 @@ def test_executor_dispatches_only_profile_granted_tools(tmp_path):
         schema["name"]
         for schema in tool_registry.schemas(["filesystem.read", "shell.execute"])
     ]
+
+
+def test_executor_tracks_move_sources_destinations_and_deduplicates(tmp_path):
+    from harness.agents import ModelResponse
+    from harness.providers import ToolCall
+
+    c = config(
+        {
+            "profiles": {
+                "coding": {
+                    "model": {"primary": "fake"},
+                    "permissions": ["filesystem"],
+                    "tools": ["filesystem.move"],
+                    "max_steps": 2,
+                }
+            }
+        }
+    )
+
+    class Router:
+        config = c
+
+        def __init__(self):
+            self.responses = iter(
+                [
+                    ModelResponse(
+                        text="",
+                        tool_calls=[
+                            ToolCall(
+                                "move-1",
+                                "filesystem.move",
+                                {"path": "old.py", "destination": "new.py"},
+                            ),
+                            ToolCall(
+                                "move-2",
+                                "filesystem.move",
+                                {"path": "old.py", "destination": "new.py"},
+                            ),
+                        ],
+                    ),
+                    ModelResponse(text="done"),
+                ]
+            )
+
+        def complete(self, *args, **kwargs):
+            return next(self.responses)
+
+    class Tools:
+        def schemas(self, names):
+            return [{"name": name} for name in names]
+
+        def execute(self, *args, **kwargs):
+            return "moved"
+
+    result = Executor(Router(), Tools()).execute(
+        Subtask(id="move", title="move", description="move file")
+    )
+    assert result.success
+    assert result.changed_files == ["new.py", "old.py"]
+    assert result.tool_evidence[0]["changed_paths"] == ["new.py", "old.py"]
 
 
 def test_executor_rejects_ungranted_call_and_step_exhaustion():

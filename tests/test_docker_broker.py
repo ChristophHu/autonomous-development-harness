@@ -3,8 +3,11 @@ import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
 import pytest
+import yaml
 
+import harness.docker_broker as docker_broker_module
 from harness.docker_broker import (
     IMAGE,
     MAX_OUTPUT,
@@ -72,6 +75,40 @@ def test_docker_logs_require_bounded_integer_tail(broker, tail):
 def test_docker_command_rejects_arbitrary_actions(broker):
     with pytest.raises(PermissionError, match="not allowlisted"):
         broker[0].command("exec")
+
+
+def test_internal_compose_command_allowlist_and_isolated_lifecycle(broker, monkeypatch):
+    service, compose, _sock = broker
+    with pytest.raises(PermissionError, match="not allowlisted"):
+        service._command(
+            "exec",
+            compose_file=compose,
+            project_directory=compose.parent,
+            project_name="adh-test-denied",
+        )
+    monkeypatch.setattr(service, "_docker", lambda: Path("/usr/bin/true"))
+    monkeypatch.setattr(service, "_socket", lambda: Path("/tmp/docker.sock"))
+    monkeypatch.setattr(service, "_available_host_port", lambda: 45686)
+    project, _port = service.create_isolated_project()
+    for action, suffix in (
+        ("restart", ["restart", "--timeout", "10", "qdrant"]),
+        ("cleanup", ["down", "--volumes", "--remove-orphans", "--timeout", "10"]),
+    ):
+        command = service._isolated_command(
+            action, project_name=project, compose_file=compose
+        )
+        assert command[-len(suffix) :] == suffix
+        assert command[command.index("--project-name") + 1] == project
+    with pytest.raises(PermissionError, match="not allowlisted"):
+        service._isolated_command("exec", project_name=project, compose_file=compose)
+    with pytest.raises(PermissionError, match="not owned"):
+        service._isolated_command(
+            "cleanup", project_name="adh-test-unowned", compose_file=compose
+        )
+    with pytest.raises(PermissionError, match="not allowlisted"):
+        service.run_isolated("exec", project_name=project)
+    with pytest.raises(PermissionError, match="not owned"):
+        service.run_isolated("cleanup", project_name="adh-test-unowned")
 
 
 @pytest.mark.parametrize(
@@ -217,3 +254,283 @@ def test_docker_run_uses_scrubbed_environment_and_caps_output(broker, monkeypatc
     assert result.returncode == 0
     assert result.stdout.endswith("[output truncated by Docker broker]")
     assert result.stderr == ""
+
+
+def test_isolated_compose_uses_unique_project_port_and_scoped_volume(
+    broker, monkeypatch
+):
+    service, compose, _sock = broker
+    monkeypatch.setattr(service, "_available_host_port", lambda: 45678)
+    project, port = service.create_isolated_project()
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        captured["manifest"] = yaml.safe_load(
+            Path(command[command.index("-f") + 1]).read_text()
+        )
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr("harness.docker_broker.subprocess.run", fake_run)
+    result = service.run_isolated("start", project_name=project)
+    command = captured["command"]
+    assert result.returncode == 0
+    assert command[command.index("--project-name") + 1] == project
+    assert (
+        project.startswith("adh-test-") and project != "autonomous-development-harness"
+    )
+    assert captured["manifest"]["services"]["qdrant"]["ports"] == [
+        f"127.0.0.1:{port}:6333"
+    ]
+    assert captured["manifest"]["services"]["qdrant"]["restart"] == "no"
+    assert captured["manifest"]["volumes"] == {"qdrant_data": None}
+    assert compose.read_text() == compose_text()
+
+
+def test_isolated_project_must_be_reserved_and_cleanup_is_narrow(broker, monkeypatch):
+    service, _compose, _sock = broker
+    monkeypatch.setattr(service, "_available_host_port", lambda: 45679)
+    with pytest.raises(PermissionError, match="not owned"):
+        service.run_isolated("cleanup", project_name="adh-test-000000000000")
+    project, _port = service.create_isolated_project()
+    captured = {}
+
+    def fake_run(command, **_kwargs):
+        captured["command"] = command
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr("harness.docker_broker.subprocess.run", fake_run)
+    assert service.run_isolated("cleanup", project_name=project).returncode == 0
+    command = captured["command"]
+    assert command[command.index("--project-name") + 1] == project
+    assert command[-5:] == [
+        "down",
+        "--volumes",
+        "--remove-orphans",
+        "--timeout",
+        "10",
+    ]
+    assert project not in service._isolated_projects
+    with pytest.raises(PermissionError, match="not allowlisted"):
+        service.command("cleanup")
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (subprocess.TimeoutExpired(["docker"], 1, b"partial", b"late"), 124),
+        (OSError("daemon vanished"), 127),
+    ],
+)
+def test_isolated_run_normalizes_timeout_and_os_errors(
+    broker, monkeypatch, error, expected
+):
+    service, _compose, _sock = broker
+    monkeypatch.setattr(service, "_available_host_port", lambda: 45684)
+    project, _port = service.create_isolated_project()
+    monkeypatch.setattr(
+        "harness.docker_broker.subprocess.run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(error),
+    )
+    result = service.run_isolated("start", project_name=project)
+    assert result.returncode == expected
+    assert (
+        "timed out" in result.stderr
+        if expected == 124
+        else "daemon vanished" in result.stderr
+    )
+
+
+def test_isolated_smoke_checks_persistence_across_restart_and_cleans_up(
+    broker, monkeypatch
+):
+    service, _compose, _sock = broker
+    monkeypatch.setattr(service, "_available_host_port", lambda: 45680)
+    actions = []
+    monkeypatch.setattr(
+        service,
+        "run_isolated",
+        lambda action, *, project_name: (
+            actions.append((action, project_name))
+            or subprocess.CompletedProcess([], 0, "", "")
+        ),
+    )
+    stored = {}
+
+    class Response:
+        def __init__(self, status=200, result=None):
+            self.status_code = status
+            self.is_success = 200 <= status < 300
+            self.result = result or {}
+
+        def raise_for_status(self):
+            if not self.is_success:
+                raise httpx.HTTPStatusError("bad status", request=None, response=None)
+
+        def json(self):
+            return {"result": self.result}
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            self.health_calls = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get(self, url):
+            if url.endswith("/healthz"):
+                self.health_calls += 1
+                return Response(503 if self.health_calls == 1 else 200)
+            return Response(result={"payload": stored})
+
+        def put(self, url, *, json):
+            if "/points?" in url:
+                stored.update(json["points"][0]["payload"])
+            return Response()
+
+    monkeypatch.setattr(docker_broker_module.httpx, "Client", Client)
+    monkeypatch.setattr(docker_broker_module.time, "sleep", lambda _delay: None)
+    result = service.live_smoke_test()
+    assert result == {
+        "healthy": True,
+        "persisted_after_restart": True,
+        "cleaned": True,
+    }
+    assert [action for action, _project in actions] == ["start", "restart", "cleanup"]
+    assert len({project for _action, project in actions}) == 1
+    assert stored["smoke_marker"]
+
+
+def test_isolated_smoke_cleans_up_after_failed_start(broker, monkeypatch):
+    service, _compose, _sock = broker
+    monkeypatch.setattr(service, "_available_host_port", lambda: 45681)
+    actions = []
+
+    def run(action, *, project_name):
+        actions.append(action)
+        return subprocess.CompletedProcess([], 1 if action == "start" else 0, "", "")
+
+    monkeypatch.setattr(service, "run_isolated", run)
+    with pytest.raises(RuntimeError, match="Compose start failed"):
+        service.live_smoke_test()
+    assert actions == ["start", "cleanup"]
+
+
+def test_available_port_binds_only_loopback_ephemerally(monkeypatch):
+    class PortProbe:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def bind(self, address):
+            self.address = address
+
+        def getsockname(self):
+            return (*self.address[:1], 45682)
+
+    probe = PortProbe()
+    monkeypatch.setattr(docker_broker_module.socket, "socket", lambda: probe)
+    assert DockerComposeBroker._available_host_port() == 45682
+    assert probe.address == ("127.0.0.1", 0)
+
+
+def test_qdrant_readiness_timeout_is_bounded(monkeypatch):
+    class UnhealthyClient:
+        def get(self, _url):
+            return SimpleNamespace(is_success=False)
+
+    times = iter([0, 0, 2, 2])
+    monkeypatch.setattr(docker_broker_module.time, "monotonic", lambda: next(times))
+    monkeypatch.setattr(docker_broker_module.time, "sleep", lambda _delay: None)
+    with pytest.raises(RuntimeError, match="did not become healthy"):
+        DockerComposeBroker._wait_for_qdrant(UnhealthyClient(), "http://127.0.0.1", 1)
+
+
+def test_qdrant_readiness_retries_transport_error(monkeypatch):
+    class RecoveringClient:
+        def __init__(self):
+            self.calls = 0
+
+        def get(self, _url):
+            self.calls += 1
+            if self.calls == 1:
+                raise httpx.ConnectError("not ready")
+            return SimpleNamespace(is_success=True)
+
+    monkeypatch.setattr(docker_broker_module.time, "sleep", lambda _delay: None)
+    client = RecoveringClient()
+    monkeypatch.setattr(docker_broker_module.time, "monotonic", lambda: 0)
+    DockerComposeBroker._wait_for_qdrant(client, "http://127.0.0.1", 1)
+    assert client.calls == 2
+
+
+def test_isolated_smoke_reports_cleanup_failure(broker, monkeypatch):
+    service, _compose, _sock = broker
+    monkeypatch.setattr(service, "_available_host_port", lambda: 45683)
+    actions = []
+
+    def run(action, *, project_name):
+        actions.append(action)
+        return subprocess.CompletedProcess([], 1, "", "")
+
+    monkeypatch.setattr(service, "run_isolated", run)
+    with pytest.raises(RuntimeError, match="cleanup failed for adh-test-"):
+        service.live_smoke_test()
+    assert actions == ["start", "cleanup"]
+
+
+@pytest.mark.parametrize(
+    ("failed_action", "message"),
+    [
+        ("restart", "Compose restart failed"),
+        ("persistence", "did not persist after restart"),
+    ],
+)
+def test_isolated_smoke_fails_closed_on_restart_or_persistence_mismatch(
+    broker, monkeypatch, failed_action, message
+):
+    service, _compose, _sock = broker
+    monkeypatch.setattr(service, "_available_host_port", lambda: 45685)
+    actions = []
+
+    def run(action, *, project_name):
+        actions.append(action)
+        failed = action == failed_action
+        return subprocess.CompletedProcess([], 1 if failed else 0, "", "")
+
+    class Response:
+        is_success = True
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"result": {"payload": {}}}
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get(self, _url):
+            return Response()
+
+        def put(self, _url, *, json):
+            return Response()
+
+    monkeypatch.setattr(service, "run_isolated", run)
+    monkeypatch.setattr(docker_broker_module.httpx, "Client", Client)
+    with pytest.raises(RuntimeError, match=message):
+        service.live_smoke_test()
+    assert actions == ["start", "restart", "cleanup"]

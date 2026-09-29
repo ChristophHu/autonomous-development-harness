@@ -704,7 +704,7 @@ class ToolRegistry:
             for name in allowed_names
         ]
 
-    def execute(self, name, arguments, profile=None):
+    def execute(self, name, arguments, profile=None, *, allow_nonzero=False):
         control = current_run_control()
         if control is not None:
             control.check()
@@ -754,7 +754,7 @@ class ToolRegistry:
                 control.check()
             if hasattr(result, "raise_for_status"):
                 result.raise_for_status()
-            if getattr(result, "returncode", 0):
+            if getattr(result, "returncode", 0) and not allow_nonzero:
                 raise ToolExecutionError(f"{name} exited with code {result.returncode}")
             if spec.output_schema:
                 Draft202012Validator(spec.output_schema).validate(result)

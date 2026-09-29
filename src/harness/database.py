@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import time
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import ClassVar
 
 
 class Database:
@@ -112,6 +114,36 @@ class Database:
                 ):
                     c.execute(f"ALTER TABLE decisions ADD COLUMN {column} {kind}")
                 c.execute("INSERT INTO schema_versions VALUES(4,?)", (self.now(),))
+            if not c.execute(
+                "SELECT 1 FROM schema_versions WHERE version=5"
+            ).fetchone():
+                c.execute(
+                    """CREATE TABLE IF NOT EXISTS correction_items(
+                        id TEXT PRIMARY KEY CHECK(length(id)=64),
+                        task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                        plan_id INTEGER REFERENCES plans(id) ON DELETE SET NULL,
+                        subtask_id TEXT,
+                        category TEXT NOT NULL,
+                        source TEXT NOT NULL,
+                        rule TEXT NOT NULL,
+                        message TEXT NOT NULL,
+                        affected_paths TEXT NOT NULL,
+                        evidence TEXT NOT NULL,
+                        expected TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'open'
+                            CHECK(status IN ('open','in_progress','resolved')),
+                        attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        resolved_at TEXT,
+                        UNIQUE(task_id,id)
+                    )"""
+                )
+                c.execute(
+                    "CREATE INDEX IF NOT EXISTS correction_items_task_status "
+                    "ON correction_items(task_id,status,created_at,id)"
+                )
+                c.execute("INSERT INTO schema_versions VALUES(5,?)", (self.now(),))
 
     @staticmethod
     def now():
@@ -268,6 +300,14 @@ class TaskRepository:
                 ).fetchone()
             ):
                 raise ValueError("required question is still open")
+            if (
+                target == "completed"
+                and c.execute(
+                    "SELECT 1 FROM correction_items WHERE task_id=? AND status IN ('open','in_progress') LIMIT 1",
+                    (task_id,),
+                ).fetchone()
+            ):
+                raise ValueError("required correction is still open or unverified")
             now = self.db.now()
             c.execute(
                 "UPDATE tasks SET status=?,updated_at=? WHERE id=?",
@@ -385,6 +425,259 @@ class ValidationRepository:
         result["valid"] = bool(result["valid"])
         result["report"] = json.loads(result["report"])
         return result
+
+
+class CorrectionRepository:
+    """Persist idempotent, task-scoped correction findings and transitions."""
+
+    STATUSES: ClassVar[set[str]] = {"open", "in_progress", "resolved"}
+    TRANSITIONS: ClassVar[dict[str, set[str]]] = {
+        "open": {"in_progress", "resolved"},
+        "in_progress": {"open", "resolved"},
+        "resolved": {"open"},
+    }
+    REQUIRED_FIELDS: ClassVar[set[str]] = {"category", "source", "rule", "message"}
+    OPTIONAL_FIELDS: ClassVar[set[str]] = {
+        "subtask_id",
+        "affected_paths",
+        "evidence",
+        "expected",
+    }
+
+    def __init__(self, db):
+        self.db = db
+
+    @staticmethod
+    def _task_id(task_id):
+        if not isinstance(task_id, int) or isinstance(task_id, bool) or task_id < 1:
+            raise ValueError("task_id must be a positive integer")
+
+    @classmethod
+    def _normalize_finding(cls, finding):
+        if not isinstance(finding, dict) or not cls.REQUIRED_FIELDS <= set(finding):
+            raise ValueError("finding fields are invalid")
+        if not set(finding) <= cls.REQUIRED_FIELDS | cls.OPTIONAL_FIELDS:
+            raise ValueError("finding fields are invalid")
+        normalized = {}
+        for name in ("category", "source", "rule", "message"):
+            value = finding[name]
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"finding {name} must be a nonempty string")
+            normalized[name] = value.strip()
+        subtask_id = finding.get("subtask_id")
+        if subtask_id is not None and (
+            not isinstance(subtask_id, str) or not subtask_id.strip()
+        ):
+            raise ValueError("finding subtask_id must be a nonempty string or null")
+        normalized["subtask_id"] = subtask_id.strip() if subtask_id else None
+        paths = finding.get("affected_paths", [])
+        if (
+            not isinstance(paths, list)
+            or any(not isinstance(path, str) or not path.strip() for path in paths)
+            or len([path.strip() for path in paths])
+            != len({path.strip() for path in paths})
+        ):
+            raise ValueError("affected_paths must contain unique nonempty strings")
+        normalized["affected_paths"] = sorted(path.strip() for path in paths)
+        for name in ("evidence", "expected"):
+            value = finding.get(name, {})
+            if not isinstance(value, dict):
+                raise TypeError(f"{name} must be a mapping")
+            try:
+                json.dumps(value, sort_keys=True, allow_nan=False)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{name} must be JSON serializable") from exc
+            normalized[name] = value
+        return normalized
+
+    @staticmethod
+    def _decode(row):
+        if row is None:
+            return None
+        result = dict(row)
+        for name in ("affected_paths", "evidence", "expected"):
+            result[name] = json.loads(result[name])
+        return result
+
+    @staticmethod
+    def _stable_id(task_id, finding):
+        identity = {
+            "task_id": task_id,
+            "category": finding["category"],
+            "source": finding["source"],
+            "rule": finding["rule"],
+            "subtask_id": finding["subtask_id"],
+            "affected_paths": sorted(finding["affected_paths"]),
+        }
+        serialized = json.dumps(
+            identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _append_event(connection, task_id, kind, payload, now):
+        from .domain import EventKind
+
+        connection.execute(
+            "INSERT INTO events(task_id,kind,payload,created_at) VALUES(?,?,?,?)",
+            (task_id, EventKind(kind).value, json.dumps(payload), now),
+        )
+
+    def record(self, task_id, finding, plan_id=None):
+        """Create or refresh a finding atomically; repeated reports keep one ID."""
+        self._task_id(task_id)
+        if plan_id is not None and (
+            not isinstance(plan_id, int) or isinstance(plan_id, bool) or plan_id < 1
+        ):
+            raise ValueError("plan_id must be a positive integer or null")
+        finding = self._normalize_finding(finding)
+        item_id = self._stable_id(task_id, finding)
+        now = self.db.now()
+        values = (
+            plan_id,
+            finding["subtask_id"],
+            finding["category"],
+            finding["source"],
+            finding["rule"],
+            finding["message"],
+            json.dumps(finding["affected_paths"]),
+            json.dumps(finding["evidence"], sort_keys=True, allow_nan=False),
+            json.dumps(finding["expected"], sort_keys=True, allow_nan=False),
+        )
+        with self.db.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            task = connection.execute(
+                "SELECT status FROM tasks WHERE id=?", (task_id,)
+            ).fetchone()
+            if task is None:
+                raise ValueError("task not found")
+            if task["status"] == "completed":
+                raise ValueError("cannot record a correction for a completed task")
+            if plan_id is not None:
+                plan = connection.execute(
+                    "SELECT task_id FROM plans WHERE id=?", (plan_id,)
+                ).fetchone()
+                if plan is None or plan["task_id"] != task_id:
+                    raise ValueError("plan does not belong to task")
+            existing = connection.execute(
+                "SELECT * FROM correction_items WHERE id=?", (item_id,)
+            ).fetchone()
+            if existing is None:
+                connection.execute(
+                    """INSERT INTO correction_items(
+                        id,task_id,plan_id,subtask_id,category,source,rule,message,
+                        affected_paths,evidence,expected,status,attempts,created_at,
+                        updated_at,resolved_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,'open',0,?,?,NULL)""",
+                    (item_id, task_id, *values, now, now),
+                )
+                status = "open"
+                changed = True
+            else:
+                status = (
+                    "open" if existing["status"] == "resolved" else existing["status"]
+                )
+                changed = (
+                    status != existing["status"]
+                    or tuple(
+                        existing[name]
+                        for name in (
+                            "plan_id",
+                            "subtask_id",
+                            "category",
+                            "source",
+                            "rule",
+                            "message",
+                            "affected_paths",
+                            "evidence",
+                            "expected",
+                        )
+                    )
+                    != values
+                )
+                if changed:
+                    connection.execute(
+                        """UPDATE correction_items SET plan_id=?,subtask_id=?,
+                            category=?,source=?,rule=?,message=?,affected_paths=?,
+                            evidence=?,expected=?,status=?,updated_at=?,resolved_at=?
+                            WHERE id=?""",
+                        (
+                            *values,
+                            status,
+                            now,
+                            None if status == "open" else existing["resolved_at"],
+                            item_id,
+                        ),
+                    )
+            if changed:
+                self._append_event(
+                    connection,
+                    task_id,
+                    "correction.item_recorded",
+                    {"item_id": item_id, "status": status, "source": finding["source"]},
+                    now,
+                )
+            row = connection.execute(
+                "SELECT * FROM correction_items WHERE id=?", (item_id,)
+            ).fetchone()
+            return self._decode(row)
+
+    def get(self, item_id):
+        with self.db.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM correction_items WHERE id=?", (item_id,)
+            ).fetchone()
+        return self._decode(row)
+
+    def list_for_task(self, task_id, status=None):
+        self._task_id(task_id)
+        if status is not None and (
+            not isinstance(status, str) or status not in self.STATUSES
+        ):
+            raise ValueError("unsupported correction status")
+        query = "SELECT * FROM correction_items WHERE task_id=?"
+        parameters = [task_id]
+        if status is not None:
+            query += " AND status=?"
+            parameters.append(status)
+        query += " ORDER BY created_at,id"
+        with self.db.connect() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return [self._decode(row) for row in rows]
+
+    def set_status(self, item_id, status):
+        if not isinstance(status, str) or status not in self.STATUSES:
+            raise ValueError("unsupported correction status")
+        now = self.db.now()
+        with self.db.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM correction_items WHERE id=?", (item_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            current = row["status"]
+            if current == status:
+                return self._decode(row)
+            if status not in self.TRANSITIONS.get(current, set()):
+                raise ValueError("invalid correction status transition")
+            attempts = row["attempts"] + (status == "in_progress")
+            resolved_at = now if status == "resolved" else None
+            connection.execute(
+                "UPDATE correction_items SET status=?,attempts=?,updated_at=?,resolved_at=? WHERE id=?",
+                (status, attempts, now, resolved_at, item_id),
+            )
+            self._append_event(
+                connection,
+                row["task_id"],
+                "correction.item_status",
+                {"item_id": item_id, "from": current, "status": status},
+                now,
+            )
+            updated = connection.execute(
+                "SELECT * FROM correction_items WHERE id=?", (item_id,)
+            ).fetchone()
+            return self._decode(updated)
 
 
 class SubtaskRepository:

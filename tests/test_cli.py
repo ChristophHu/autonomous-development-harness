@@ -102,7 +102,6 @@ def test_status_and_doctor(harness_context, monkeypatch, capsys):
     monkeypatch.setattr(cli.platform, "system", lambda: "Linux")
     with pytest.raises(cli.typer.Exit):
         cli.doctor()
-
     docker_actions.clear()
     monkeypatch.setattr(
         cli.DockerComposeBroker,
@@ -127,6 +126,40 @@ def test_status_and_doctor(harness_context, monkeypatch, capsys):
     monkeypatch.setattr(cli.socket, "create_connection", lambda *a, **k: BoundSocket())
     with pytest.raises(cli.typer.Exit):
         cli.doctor()
+
+
+def test_qdrant_smoke_requires_explicit_confirmation(monkeypatch, capsys):
+    calls = []
+    monkeypatch.setattr(
+        cli.DockerComposeBroker,
+        "live_smoke_test",
+        lambda _self: (
+            calls.append("smoke")
+            or {
+                "healthy": True,
+                "persisted_after_restart": True,
+                "cleaned": True,
+            }
+        ),
+    )
+    with pytest.raises(cli.typer.Exit):
+        cli.qdrant_smoke(confirm=False)
+    assert calls == []
+    assert "No action taken" in capsys.readouterr().out
+    cli.qdrant_smoke(confirm=True)
+    assert calls == ["smoke"]
+    assert "persisted_after_restart=True" in capsys.readouterr().out
+
+
+def test_qdrant_smoke_reports_daemon_failure(monkeypatch, capsys):
+    monkeypatch.setattr(
+        cli.DockerComposeBroker,
+        "live_smoke_test",
+        lambda _self: (_ for _ in ()).throw(PermissionError("daemon unavailable")),
+    )
+    with pytest.raises(cli.typer.Exit):
+        cli.qdrant_smoke(confirm=True)
+    assert "daemon unavailable" in capsys.readouterr().out
 
 
 def test_task_commands(harness_context, capsys):

@@ -498,17 +498,193 @@ def test_executor_observation_and_failure_paths(tmp_path):
 def test_remaining_validator_paths(tmp_path):
     _, orchestrator = runtime(tmp_path)
     task = specification()
+    task.plan = {"subtasks": [{"id": "planned"}]}
     task.acceptance_criteria = [
         AcceptanceCriterion(id="sum", description="independent review")
     ]
-    report = {"commands": [], "coverage": {"totals": {"percent_covered": 100}}}
-    assert orchestrator.validator.validate(task, [], report).valid
+    report = {
+        "commands": [],
+        "coverage": {
+            "totals": {
+                "percent_covered": 100,
+                "missing_lines": 0,
+                "missing_branches": 0,
+            }
+        },
+    }
+    from harness.agents import ExecutorOutput
+
+    snapshot = {
+        "applicable": False,
+        "reason": "workspace is not a Git repository",
+        "filesystem": {},
+    }
+    assert orchestrator.validator.validate(
+        task,
+        [ExecutorOutput(subtask_id="planned", success=True, output="done")],
+        report,
+        workspace_before=snapshot,
+        workspace_after=snapshot,
+    ).valid
+
+
+def test_validator_fails_closed_on_malformed_coverage_and_review(tmp_path):
+    _store, orchestrator = runtime(tmp_path)
+    task = specification()
+    report = {"commands": [], "coverage": {"totals": {"percent_covered": "100"}}}
+
+    result = orchestrator.validator.validate(task, [], report)
+    assert not result.valid
+    assert "coverage report is invalid" in result.errors
+
+    orchestrator.models.register(
+        "fixture", SimpleNamespace(complete=lambda *a, **kw: "not-json")
+    )
+    report["coverage"] = {
+        "totals": {
+            "percent_covered": 100,
+            "missing_lines": 0,
+            "missing_branches": 0,
+        }
+    }
+    result = orchestrator.validator.validate(task, [], report)
+    assert not result.valid
+    assert "independent review response is invalid" in result.errors
+
+
+def test_validator_rejects_bad_fresh_coverage_file(tmp_path):
+    _store, orchestrator = runtime(tmp_path)
+    task = specification()
+    task.coverage_command = ["coverage"]
+
+    def write_invalid_coverage(command, cwd=None):
+        (tmp_path / task.coverage_report).write_text("{")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    orchestrator.tools.executor.shell = write_invalid_coverage
+    assert orchestrator.validator.run_tests(task)["coverage"] is None
+
+
+@pytest.mark.parametrize(
+    ("threshold", "percent", "missing_lines", "missing_branches", "expected"),
+    [
+        (50, 100, 0, 0, True),
+        (100, 50, 0, 0, False),
+        (100, 100, 0, 1, False),
+    ],
+)
+def test_validator_coverage_threshold_and_branch_gate(
+    tmp_path, threshold, percent, missing_lines, missing_branches, expected
+):
+    _store, orchestrator = runtime(tmp_path)
+    task = specification()
+    task.plan = {"subtasks": [{"id": "planned"}]}
+    from harness.agents import ExecutorOutput
+
+    outputs = [ExecutorOutput(subtask_id="planned", success=True, output="done")]
+    task.test_commands = [["true"]]
+    task.acceptance_criteria = [AcceptanceCriterion(id="sum", description="review")]
+    task.coverage_threshold = threshold
+    report = {
+        "commands": [],
+        "coverage": {
+            "totals": {
+                "percent_covered": percent,
+                "missing_lines": missing_lines,
+                "missing_branches": missing_branches,
+            }
+        },
+    }
+    snapshot = {
+        "applicable": False,
+        "reason": "workspace is not a Git repository",
+        "filesystem": {},
+    }
+    assert (
+        orchestrator.validator.validate(
+            task,
+            outputs,
+            report,
+            workspace_before=snapshot,
+            workspace_after=snapshot,
+        ).valid
+        is expected
+    )
+
+
+def test_validator_blocks_open_required_questions(tmp_path):
+    store, orchestrator = runtime(tmp_path)
+    task = store.create(specification())
+    store.ask(task.id, "Resolve this ambiguity", "required")
+    report = {
+        "commands": [],
+        "coverage": {
+            "totals": {
+                "percent_covered": 100,
+                "missing_lines": 0,
+                "missing_branches": 0,
+            }
+        },
+    }
+
+    result = orchestrator.validator.validate(
+        task, [], report, open_required_questions=True
+    )
+    assert not result.valid
+    assert "open required human questions block completion" in result.errors
+
+
+def test_validator_shell_commands_use_audited_test_tools(tmp_path):
+    _store, orchestrator = runtime(tmp_path)
+    events = []
+    orchestrator.tools.event_sink = lambda kind, payload: events.append((kind, payload))
+    task = specification()
+    task.plan = {"subtasks": [{"id": "planned"}]}
+    task.test_commands = [["/usr/bin/true"]]
+    task.lint_commands = [["/usr/bin/true"]]
+    task.coverage_command = []
+    orchestrator.tools.executor.shell = lambda command, cwd=None: (
+        subprocess.CompletedProcess(command, 0, "ok", "")
+    )
+
+    result = orchestrator.validator.run_tests(task)
+
+    assert result["commands"][0]["returncode"] == 0
+    assert [
+        event[1]["tool"] for event in events if event[0] == "TOOL_CALL_STARTED"
+    ] == ["test.run_tests", "quality.lint"]
     task.acceptance_criteria = [
         AcceptanceCriterion(
             id="sum", description="command", kind="command", command=["/usr/bin/true"]
         )
     ]
-    assert orchestrator.validator.validate(task, [], report).valid
+    report = {
+        "commands": [],
+        "coverage": {
+            "totals": {
+                "percent_covered": 100,
+                "missing_lines": 0,
+                "missing_branches": 0,
+            }
+        },
+    }
+    from harness.agents import ExecutorOutput
+
+    snapshot = {
+        "applicable": False,
+        "reason": "workspace is not a Git repository",
+        "filesystem": {},
+    }
+    assert orchestrator.validator.validate(
+        task,
+        [ExecutorOutput(subtask_id="planned", success=True, output="done")],
+        report,
+        workspace_before=snapshot,
+        workspace_after=snapshot,
+    ).valid
+    assert [
+        event[1]["tool"] for event in events if event[0] == "TOOL_CALL_STARTED"
+    ] == ["test.run_tests", "quality.lint", "test.run_tests"]
 
 
 def test_dependency_failure_does_not_execute_dependent_step(tmp_path):

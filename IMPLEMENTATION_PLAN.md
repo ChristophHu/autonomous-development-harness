@@ -1,5 +1,37 @@
 # Weiterer Implementierungsplan zur GAP_MATRIX
 
+## Abgeschlossenes Paket E2 – Plan-/Diff-/Git-Abgleich
+
+Validator gleicht Plan und Executor-Ergebnisse ab, verifiziert Mutationsclaims gegen Tool-Evidenz und read-only Git-Statusdelta und bindet Pfade an Workspace sowie deklarierte `write_paths`. Git-Root/Branch/HEAD und relevante Statuspfade werden vor/nach Execute gelesen; unerwartete Änderungen und Identitätswechsel blockieren Completion. Native Abnahme: **863 Tests**, 100 % Statements/Branches/Funktionen (33 Module/414 Funktionen), Ruff und Formatcheck. Noch offen bleiben der semantische Diff-Hunk-/Requirementsabgleich sowie persistente Correction-Workitems.
+
+## Abgeschlossenes Paket E3 – Workspace-Mutationsnachweis
+
+Vorher-/Nachher-Snapshots erfassen Inhalte, Typen, Modi, Symlinkziele und Verzeichnisse des Workspace zwischen Executor und Testphase. Das schließt bereits dirty Pfade, Shell-Mutationen und Git-ignorierte Dateien ein. Symlinks werden nicht verfolgt; unlesbare, instabile oder spezielle Einträge sowie fehlende Snapshots blockieren Completion. Konfigurierte Datenbank-, Vault- und Logpfade sowie `.git` sind ausgeschlossen; Git-Identität/-Status laufen getrennt über den Broker. Native Abnahme: **876 Tests**, 100 % Statements/Branches/Funktionen (33 Module/416 Funktionen), Ruff und Formatcheck.
+
+## Abgeschlossenes Paket E4a – Persistenter Correction-Store
+
+SQLite-Schema v5 und `CorrectionRepository` persistieren Findings mit stabiler taskbezogener SHA-256-ID, Plan-/Subtaskbezug, Evidenz und Status. Wiederholte Findings sind dedupliziert; atomare Events begleiten echte Anlage/Änderung und Statuswechsel. Migration, FK-Verhalten, Parallelzugriffe und Rollbacks sind getestet. Native Abnahme: **886 Tests**, 100 % Statements/Branches/Funktionen (33 Module/426 Funktionen), Ruff und Formatcheck. Die Orchestrator-Synchronisierung bleibt absichtlich außen vor.
+
+## Abgeschlossenes Paket E4b – Correction-Loop-Anbindung
+
+1. `CorrectionFinding` als typisierten Vertrag ergänzt; EvidenceValidator erzeugt kategorisierte/rule-stabile Findings direkt aus Prüfpfaden. Legacy-`errors` bleibt für Anzeige/Kompatibilität erhalten; keine Freitextklassifikation.
+2. Findings werden mit Task-/Planbezug idempotent gespeichert. Vor Execute werden offene Items geladen und atomar auf `in_progress` gesetzt; deren Kategorie/Regel/Evidenz geht als JSON-Korrekturkontext an den Executor.
+3. Fehlerhafte Revalidierung setzt aktive Items zurück auf `open`; bei erfolgreicher Revalidierung werden sie geschlossen. Attempts und Audit-Events laufen über das bestehende Repository. Neustartlogik öffnet bei Prozessabbruch zurückgebliebene `in_progress`-Items wieder.
+4. `TaskRepository.transition(..., completed)` blockiert atomar bei offenen oder `in_progress`-Korrekturen.
+5. TDD deckt strukturiertes Finding, erfolgreichen Retry, ausgeschöpftes Retrybudget, Resume nach Abbruch, atomaren DoD-Gate und Ablehnung nachträglicher Findings nach Taskabschluss ab. Native `sh scripts/verify.sh`: **893 passed**, 100 % Statements/Branches (5586 Statements/1988 Branches) und Funktionen (33 Module/427 Funktionen), Ruff und Formatcheck bestanden.
+
+## Abgeschlossenes Paket E1 – unabhängige Validator- und Task-DoD-Absicherung
+
+Coverage-/Reviewbelege werden streng geprüft; Shellbasierte Test-, Lint- und Coverageverifikation läuft über auditiert registrierte ToolRegistry-Aktionen mit echten Exitcodes. Pflichtfragen blockieren den Validator sowie atomar den SQLite-Übergang zu `completed`. TDD und vollständige native Abnahme: **848 Tests bestanden**, 100 % Statements/Branches/Funktionen (33 Module/409 Funktionen), Ruff und Formatcheck. Noch offene Vertiefungen: Git-Diff-/Planabgleich und persistente, präzise Correction-Workitems; Matrixpunkte 50/51/99 bleiben teilweise.
+
+## D2 – Live-Smoke vom Nutzer bestätigt
+
+Der Nutzer meldete `Isolated Qdrant smoke test passed: healthy=True persisted_after_restart=True cleaned=True`. Damit sind Live-Health, Punktpersistenz über Service-Restart und Cleanup des isolierten Compose-Projekts bestätigt. Die Gap-Matrix bleibt bei 21/63/64 teilweise, weil Upgrade-/Backup-/Monitoring-/Langzeitbetriebsnachweise darüber hinausgehen.
+
+## Abgeschlossenes Paket PR1 – begrenzte Provider-Retries (Punkte 29/30/37 vertieft)
+
+Provider wiederholen konfigurierte transiente HTTP-Statuscodes begrenzt mit exponentiellem Backoff; numerisches `Retry-After` wird gedeckelt berücksichtigt. Mehrdeutige Transportfehler, normale 4xx-Antworten und ungültige Erfolgsantworten werden nicht wiederholt. Task-/Lease-Cancellation stoppt den Backoff und unterbindet weitere Versuche sowie Router-Fallback. TDD deckt Erfolg nach transientem Fehler, Budgetende, Statusfilter, ungültige Retry-After-Werte, Delay-Cap, Cancellation und Konfigurationsgrenzen ab. `sh scripts/verify.sh`: **826 Tests bestanden**, 100 % Statements/Branches/Funktionen, Ruff und Formatcheck bestanden.
+
 ## Abgeschlossenes Paket G3 – Embedding-Konfiguration und Batching
 
 Default-Dimensionen und konfigurierbare Batchgröße durch Config→Orchestrator→Provider→Qdrant vereinheitlicht; indexsortierte/validierte Embedding-Antworten, gebündelter Qdrant-Upsert und begrenzte MemoryService-Batches ergänzt. Alte Punkte werden bei einem Fehler weiterhin nicht bereinigt. Fokussierte Memory-Abdeckung: 100 % Statements/Branches. Der volle Testlauf bleibt wegen sandbox-exec-/native-Isolation-Fehlern unbestätigt; Live-Embedding/Qdrant-Abnahme ist offen. Details: [IMPLEMENTATION_REPORT.md](IMPLEMENTATION_REPORT.md).
@@ -8,9 +40,11 @@ Default-Dimensionen und konfigurierbare Batchgröße durch Config→Orchestrator
 
 Repositorybasierte, validierte Usage-Auswertung mit gemeinsamen REST-/CLI-Verträgen, Filterung und Pagination. Berichte erhalten fehlende Token-/Kostenwerte als unbekannt und aggregieren nur tatsächlich gemeldete Werte; Prompts und Secrets werden nicht ausgegeben. `usage.py` und die gesamte CLI erreichen im fokussierten Nachweis 100 % Statements/Branches; Details und Grenzen: [IMPLEMENTATION_REPORT.md](IMPLEMENTATION_REPORT.md).
 
-## Laufendes Paket D2 – read-only Docker-Daemon-/Compose-Diagnose
+## Umgesetzt: D2-Isolation für die Qdrant-Live-Abnahme (Live-Smoke bestätigt)
 
-`harness doctor` nutzt nun den `DockerComposeBroker`-Statuspfad, um Daemon und festes Qdrant-Compose-Manifest read-only zu prüfen. Der Compose-Client ist vorhanden, der Daemon am lokalen Socket jedoch nicht erreichbar; es wurde kein Container gestartet oder gestoppt. Fokussierte CLI-/Broker-Tests bestehen. Nächster Schritt nach ausdrücklicher Freigabe: nur bei isolierbarer, kurzlebiger Umgebung Qdrant starten, Health/Volume-Persistenz/Restart testen und danach ausschließlich den eigenen Testcontainer stoppen. Ohne Freigabe bleibt die Liveabnahme offen.
+Der rein interne `live_smoke_test` nutzt eine zufällig erzeugte Compose-Projekt-ID, ein damit namespacetes eigenes Named Volume und einen dynamischen Loopback-Port. Er prüft Health, legt eine einmalige Collection und einen Prüfpunkteintrag an, startet ausschließlich den isolierten Service neu, liest den Eintrag erneut und entfernt abschließend exakt das Testprojekt samt Volume. Der bestehende Produktions-/Agentpfad kann weder `restart` noch Cleanup aufrufen. Die CLI verlangt `harness qdrant-smoke --confirm`.
+
+Initial war der Docker-Daemon nicht verfügbar. Danach bestätigte der Nutzer die reale Ausgabe `healthy=True persisted_after_restart=True cleaned=True`; Health, Neustartpersistenz und Cleanup sind live verifiziert. Vollständige E1-Abnahme danach: **848 Tests bestanden**, 100 % Statements/Branches/Funktionen (33 Module/409 Funktionen), Ruff und Formatcheck.
 
 ## Aktuelle priorisierte Umsetzung und Fortsetzung
 
@@ -18,7 +52,7 @@ Implementiert: D1/I, G1, F1a/F1b, H1a–H1b4, H1c, lokaler Git-Broker, lokales P
 
 Aktuelle Runde abgeschlossen: **G2 – Qdrant-Index-Lifecycle und stale-chunk-Bereinigung** (Punkte 72/107 vertieft, weiterhin teilweise). Qdrant-Scroll paginiert mit exaktem Quellenfilter; Reindex lädt aktuelle Chunks vor jeder Bereinigung hoch, `unindex` entfernt nur die Note und `reconcile` synchronisiert den Vault und löscht nur Harness-markierte Obsidian-Punkte. Fremde/unmarkierte Quellen bleiben erhalten. Vollständige native Abnahme: **768 Tests bestanden**, 100 % Statements/Branches/Funktionen über 32 Module/388 Funktionen; Ruff und Formatcheck bestanden.
 
-Nächster D2-Schritt: **Docker-Live-Daemon-/Health-/Persistenzabnahme (Punkte 21/63/64)**, vorbehaltlich sicherer, isolierter lokaler Daemonverfügbarkeit und expliziter Zustimmung zum tatsächlichen Start.
+Der isolierte D2-Smoke ist live bestätigt. Nächster Ausbau für Punkte 21/63/64 wäre ein separat abgegrenzter Upgrade-/Backup-/Monitoring-Vertrag; kein solcher Betriebstest wird aus dem Smoke-Ergebnis abgeleitet.
 
 Vorige Runde abgeschlossen: M2 – SQLite→Obsidian-Entscheidungsprojektion (Punkte 18/107 vertieft, weiterhin teilweise). `harness memory sync` erzeugt atomar wiederaufbaubare YAML-Frontmatter-Notizen aus SQLite und fasst nur manifestgeführte Harness-Dateien an. Native Abnahme: 757 Tests, 100 % Coverage auf 32 Modulen/381 Funktionen.
 
