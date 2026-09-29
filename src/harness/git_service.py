@@ -4,6 +4,7 @@ import re
 from pathlib import Path
 
 from .approvals import ApprovalService, GitApprovalTarget
+from .domain import EventKind
 from .workflows import Workflow
 
 
@@ -19,7 +20,7 @@ class GitWorkflowService:
         task = self.store.get(task_id)
         task.git_state = state
         self.store.update(task)
-        self.store.event(task_id, "git.workflow", state)
+        self.store.event(task_id, EventKind.GIT_WORKFLOW, state)
 
     def blocked(self, task_id, error):
         self.store.ask(
@@ -98,7 +99,7 @@ class GitWorkflowService:
             self.save(task_id, state)
             self.store.event(
                 task_id,
-                "git.repair_requested",
+                EventKind.GIT_REPAIR_REQUESTED,
                 {
                     "question_id": question_id,
                     "branch": branch,
@@ -144,7 +145,9 @@ class GitWorkflowService:
                 state["repair"] = repair
                 self.save(task.id, state)
                 self.store.event(
-                    task.id, "git.repair_declined", {"question_id": question["id"]}
+                    task.id,
+                    EventKind.GIT_REPAIR_DECLINED,
+                    {"question_id": question["id"]},
                 )
                 return False
             if question["answer"] != "approve":
@@ -202,7 +205,7 @@ class GitWorkflowService:
             self.save(task.id, state)
             self.store.event(
                 task.id,
-                "git.repair_authorized",
+                EventKind.GIT_REPAIR_AUTHORIZED,
                 {"question_id": question["id"], "branch": repair["branch_name"]},
             )
             return True
@@ -285,7 +288,7 @@ class GitWorkflowService:
         workflow = decision.workflow
         self.store.event(
             task.id,
-            "git.workflow_classified",
+            EventKind.GIT_WORKFLOW_CLASSIFIED,
             {
                 "workflow": str(workflow),
                 "source": decision.source,
@@ -325,11 +328,13 @@ class GitWorkflowService:
                             self.workflow._git(
                                 ["switch", task.git_state["branch"]], cwd
                             )
-                            self.store.event(task.id, "git.reconciled", task.git_state)
+                            self.store.event(
+                                task.id, EventKind.GIT_RECONCILED, task.git_state
+                            )
                             return True
                     self.verify_source(task.git_state, cwd)
                     self.workflow._git(["switch", task.git_state["branch"]], cwd)
-                    self.store.event(task.id, "git.reconciled", task.git_state)
+                    self.store.event(task.id, EventKind.GIT_RECONCILED, task.git_state)
                     return True
                 except RuntimeError as error:
                     return self.blocked(task.id, error)

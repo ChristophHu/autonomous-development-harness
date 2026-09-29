@@ -9,6 +9,7 @@ from enum import StrEnum
 import httpx
 from pydantic import BaseModel, Field, model_validator
 
+from .process_control import TaskCancelled, current_run_control
 from .providers import (
     CostCalculator,
     ModelUsage,
@@ -135,6 +136,7 @@ class ModelRegistry:
                     config.data.get("secrets", {}).get(f"{name.upper()}_API_KEY"),
                     model=data.get("model")
                     or config.data.get("secrets", {}).get(f"{name.upper()}_MODEL"),
+                    timeout=data.get("timeout", 120),
                 )
 
     def register(self, name: str, provider: ModelProvider):
@@ -206,6 +208,9 @@ class ModelRouter:
     def complete(self, profile, prompt, tools=None):
         failures = []
         for fallback_index, name in enumerate(self.candidates(profile)):
+            control = current_run_control()
+            if control is not None:
+                control.check()
             try:
                 with (
                     self.audit.model(name, name, fallback_index)
@@ -225,6 +230,8 @@ class ModelRouter:
                     if model:
                         kwargs["model"] = model
                     result = provider.complete(prompt, **kwargs)
+                    if control is not None:
+                        control.check()
                     if isinstance(result, tuple):
                         text, usage = result[:2]
                         calls = result[2] if len(result) > 2 else []
@@ -234,6 +241,8 @@ class ModelRouter:
                             self.config.data.get("models", {}).get("rates", {})
                         ).calculate(usage)
                         span["usage"] = usage
+                        if control is not None:
+                            control.check()
                         self.usage.record(usage)
                         if self.usage_callback:
                             self.usage_callback(usage)
@@ -241,12 +250,16 @@ class ModelRouter:
                         text, calls = result, []
                     if not isinstance(text, str) or (not text.strip() and not calls):
                         raise ValueError("empty or invalid model response")
+                    if control is not None:
+                        control.check()
                     response = ModelResponse(text=text, tool_calls=calls)
                     if tools is not None:
                         return response
                     if calls:
                         raise ValueError("unexpected tool calls without tool contract")
                     return response.text
+            except TaskCancelled:
+                raise
             except (
                 RuntimeError,
                 OSError,
@@ -254,6 +267,8 @@ class ModelRouter:
                 ValueError,
                 TypeError,
             ) as exc:
+                if control is not None:
+                    control.check()
                 failures.append(f"{name}: {type(exc).__name__}")
         raise RuntimeError("all model providers failed: " + "; ".join(failures))
 
@@ -378,6 +393,8 @@ class Executor:
                             )
                         )
             raise RuntimeError("profile tool step limit exceeded")
+        except TaskCancelled:
+            raise
         except (RuntimeError, OSError, httpx.HTTPError, ValueError, KeyError) as exc:
             return ExecutorOutput(
                 subtask_id=subtask.id,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import platform
 import shutil
@@ -11,8 +12,10 @@ import socket
 
 import typer
 import uvicorn
+import yaml
 
 from .core import ROOT, Config, Task, build
+from .docker_broker import DockerComposeBroker
 from .security import SecretResolver
 
 app = typer.Typer(no_args_is_help=True)
@@ -20,10 +23,12 @@ tasks = typer.Typer(no_args_is_help=True)
 models = typer.Typer(no_args_is_help=True)
 config = typer.Typer(no_args_is_help=True)
 secrets = typer.Typer(no_args_is_help=True)
+memory = typer.Typer(no_args_is_help=True)
 app.add_typer(tasks, name="tasks")
 app.add_typer(models, name="models")
 app.add_typer(config, name="config")
 app.add_typer(secrets, name="secrets")
+app.add_typer(memory, name="memory")
 
 
 @app.command()
@@ -93,11 +98,18 @@ def status():
     )
     for name, count in counts.items():
         typer.echo(f"{name}: {count}")
+    for name, provider in orchestrator.models.providers.items():
+        try:
+            available = bool(provider.health())
+        except (OSError, RuntimeError, ValueError):
+            available = False
+        typer.echo(f"Provider {name}: {'available' if available else 'unavailable'}")
 
 
 @app.command()
 def doctor():
     conf, store, orchestrator = build()
+    docker_status = DockerComposeBroker().run("status")
     checks = {
         "macOS": platform.system() == "Darwin",
         "Apple Silicon": platform.machine() == "arm64",
@@ -107,6 +119,7 @@ def doctor():
         "Docker": shutil.which("docker") is not None,
         "Docker Compose": bool(shutil.which("docker"))
         and os.system("docker compose version >/dev/null 2>&1") == 0,
+        "Docker Daemon / Qdrant Compose": docker_status.returncode == 0,
         "Obsidian Vault": conf.path("obsidian_vault").is_dir(),
         "Workspace": conf.path("workspace").is_dir(),
         "Qdrant": not conf.data.get("memory", {}).get("qdrant", {}).get("enabled")
@@ -128,6 +141,21 @@ def doctor():
         typer.echo(f"{'✓' if ok else '✗'} {label}")
     if not all(checks.values()):
         raise typer.Exit(1)
+
+
+@memory.command("sync")
+def memory_sync():
+    """Rebuild the Obsidian decision-note projection from canonical SQLite."""
+    conf, store, _ = build()
+    from .memory_projection import DecisionProjection
+
+    result = DecisionProjection(conf.path("obsidian_vault")).sync(
+        store.decisions.list_all()
+    )
+    typer.echo(
+        "Obsidian decision projection: "
+        + ", ".join(f"{key}={value}" for key, value in result.items())
+    )
 
 
 @tasks.command("create")
@@ -176,7 +204,31 @@ def task_events(task_id: int):
 def model_list():
     _, _, orchestrator = build()
     for name, provider in orchestrator.models.providers.items():
-        typer.echo(f"{name}\t{'available' if provider.health() else 'unavailable'}")
+        try:
+            available = bool(provider.health())
+        except (OSError, RuntimeError, ValueError):
+            available = False
+        typer.echo(f"{name}\t{'available' if available else 'unavailable'}")
+        try:
+            discovered = provider.models()
+        except (OSError, RuntimeError, ValueError):
+            typer.echo(f"{name}\t<discovery failed>")
+            continue
+        aliases = {
+            alias: definition
+            for alias, definition in orchestrator.models.models.items()
+            if definition.get("provider") == name
+        }
+        for model_id in discovered:
+            if not isinstance(model_id, str) or not model_id:
+                continue
+            matching = [
+                alias
+                for alias, definition in aliases.items()
+                if definition.get("model") == model_id
+            ]
+            label = ",".join(matching) if matching else "-"
+            typer.echo(f"{model_id}\t{name}\t{label}")
 
 
 @models.command("status")
@@ -184,21 +236,66 @@ def model_status():
     model_list()
 
 
+@models.command("usage")
+def model_usage(
+    task_id: int | None = None,
+    provider: str | None = None,
+    model: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+):
+    """Show persisted model-call usage without exposing prompts or secrets."""
+    _, store, _ = build()
+    try:
+        report = store.model_usage.report(
+            task_id=task_id,
+            provider=provider,
+            model=model,
+            since=since,
+            until=until,
+            limit=limit,
+            offset=offset,
+        )
+    except ValueError as error:
+        typer.echo(f"Usage report failed: {error}")
+        raise typer.Exit(2) from error
+    typer.echo(json.dumps(report, indent=2, sort_keys=True))
+
+
+@models.command("test")
+def model_test(model_name: str):
+    """Send a minimal completion request through a configured model/provider."""
+    _, _, orchestrator = build()
+    try:
+        provider, model_id = orchestrator.models.resolve(model_name)
+        response = provider.complete(
+            "Reply with exactly: OK", **({"model": model_id} if model_id else {})
+        )
+        text = response[0] if isinstance(response, tuple) else response
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("empty model response")
+    except Exception as exc:
+        typer.echo(f"Model test failed ({type(exc).__name__})")
+        raise typer.Exit(1) from exc
+    typer.echo(f"Model test successful: {model_name}")
+
+
 def _safe_config():
-    data = Config().data
-    if "secrets" in data:
-        data["secrets"] = {key: "********" for key in data["secrets"]}
-    return data
+    return Config().redacted(resolved=True)
 
 
 @config.command("show")
 def config_show():
-    typer.echo(_safe_config())
+    typer.echo(yaml.safe_dump(Config().redacted(), sort_keys=False).rstrip())
 
 
 @config.command("resolved")
 def config_resolved():
-    config_show()
+    typer.echo(
+        yaml.safe_dump(Config().redacted(resolved=True), sort_keys=False).rstrip()
+    )
 
 
 @config.command("validate")

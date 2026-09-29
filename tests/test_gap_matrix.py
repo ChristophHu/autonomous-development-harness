@@ -16,7 +16,7 @@ def test_matrix_has_all_requirements_and_consistent_counts():
     for status in ("Erfüllt", "Teilweise", "Offen"):
         assert f"{status}: {statuses.count(status)}/109" in text
     by_id = {int(row[1]): row for row in rows}
-    for number in (14, 52, 53, 55, 57, 58, 59, 60, 61, 62, 90, 92, 98):
+    for number in (14, 16, 52, 53, 55, 57, 58, 59, 60, 61, 62, 90, 92, 98):
         assert by_id[number][3].strip() == "Erfüllt"
     for number in (44, 56, 63, 87, 108):
         assert by_id[number][3].strip() == "Teilweise"

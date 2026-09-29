@@ -100,7 +100,7 @@ def test_reconciliation_distrusts_history_and_inspects_commands(tmp_path):
         strict=True,
     ):
         store.subtasks.update(task.id, step.id, "completed", output, plan_id)
-    store.event(task.id, "old.completed", {"success": True})
+    store.event(task.id, "task.completed", {"success": True})
     calls = []
 
     def git(args):
@@ -112,7 +112,7 @@ def test_reconciliation_distrusts_history_and_inspects_commands(tmp_path):
         store, orchestrator.tools, orchestrator.validator
     ).inspect(task)
     assert report.previous_plan["summary"] == "old"
-    assert report.events[0]["kind"] == "old.completed"
+    assert report.events[0]["kind"] == "task.completed"
     assert report.confirmed_criteria == ["pass"]
     assert report.remaining_criteria == ["fail", "file"]
     assert report.uncertain_criteria == ["review"]

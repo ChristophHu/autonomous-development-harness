@@ -19,15 +19,25 @@ class GitApprovalTarget:
     arguments: tuple[str, ...]
     action: str = "branch.delete"
     remote_url: str = ""
+    remote_identity: tuple[int, int] | None = None
+    ref_updates: tuple[tuple[str, str, str], ...] = ()
 
     def __post_init__(self):
         if self.task_id < 1 or not self.arguments:
             raise ValueError("approval requires task and exact Git arguments")
         object.__setattr__(self, "repository", str(Path(self.repository).resolve()))
         object.__setattr__(self, "arguments", tuple(self.arguments))
+        object.__setattr__(
+            self, "ref_updates", tuple(tuple(update) for update in self.ref_updates)
+        )
 
     def reason(self):
-        payload = json.dumps(self.__dict__, sort_keys=True)
+        fields = dict(self.__dict__)
+        if self.remote_identity is None:
+            del fields["remote_identity"]  # Preserve existing branch/repair grants.
+        if not self.ref_updates:
+            del fields["ref_updates"]
+        payload = json.dumps(fields, sort_keys=True)
         return f"approval:{self.action}:" + hashlib.sha256(payload.encode()).hexdigest()
 
 

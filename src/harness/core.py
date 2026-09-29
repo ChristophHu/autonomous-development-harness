@@ -7,9 +7,11 @@ import json
 import logging
 import os
 from contextlib import nullcontext
+from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, ClassVar
+from urllib.parse import urlsplit
 
 import httpx
 import yaml
@@ -26,25 +28,90 @@ from .audit import AuditRecorder
 from .database import (
     AgentRunRepository,
     Database,
+    DecisionRepository,
     EventRepository,
     ModelRunRepository,
     PlanRepository,
     QuestionRepository,
     SubtaskRepository,
     TaskRepository,
+    ValidationRepository,
 )
-from .domain import Status, Task
-from .memory import ContextBuilder, EmbeddingProvider, ObsidianMemory, QdrantMemory
+from .domain import EventKind, Status, Task
+from .memory import (
+    EMBEDDING_BATCH_SIZE_DEFAULT,
+    EMBEDDING_DIMENSION_DEFAULT,
+    ContextBuilder,
+    EmbeddingProvider,
+    ObsidianMemory,
+    QdrantMemory,
+)
 from .memory_service import MemoryService
 from .security import SecretResolver
 from .tools import ToolRegistry
+from .usage import ModelUsageReportService
 from .workflows import GitWorkflow
 
 ROOT = Path(__file__).resolve().parents[2]
 LOGGER = logging.getLogger("harness")
 
+CONFIG_DEFAULTS = {
+    "harness": {"name": "autonomous-development-harness", "environment": "development"},
+    "paths": {
+        "workspace": "./workspace",
+        "obsidian_vault": "./vault",
+        "logs": "./logs",
+        "database": "./data/harness.db",
+    },
+    "database": {"type": "sqlite"},
+    "git": {"enabled": False, "main": "main", "dev": "dev", "remote": None},
+    "memory": {
+        "obsidian": {"enabled": True},
+        "qdrant": {
+            "enabled": False,
+            "url": "http://127.0.0.1:6333",
+            "collection": "harness-memory",
+        },
+        "embeddings": {
+            "provider": "lmstudio",
+            "base_url": "http://127.0.0.1:1234/v1",
+            "model": "text-embedding-model",
+            "dimensions": EMBEDDING_DIMENSION_DEFAULT,
+            "batch_size": EMBEDDING_BATCH_SIZE_DEFAULT,
+        },
+    },
+    "models": {
+        "defaults": {"provider": "lmstudio"},
+        "providers": {},
+        "registry": {},
+        "rates": {},
+    },
+    "profiles": {},
+    "api": {"host": "127.0.0.1", "port": 8080, "swagger": True},
+    "logging": {"level": "INFO", "file": "./logs/harness.log"},
+    "tools": {"permissions": {}},
+    "secrets": {},
+}
+
+
+_SECRET_FIELDS = ("secret", "password", "token", "api_key", "private_key", "credential")
+
 
 class Event(BaseModel):
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "id": 42,
+                    "task_id": 7,
+                    "kind": "TASK_COMPLETED",
+                    "payload": {"status": "completed"},
+                    "created_at": "2026-09-28T12:00:00+00:00",
+                }
+            ]
+        }
+    }
+
     id: int | None = None
     task_id: int | None = None
     kind: str
@@ -64,17 +131,53 @@ class TaskLifecycle:
 class Config:
     def __init__(self, path: Path = ROOT / "config.yaml"):
         data = yaml.safe_load(path.read_text()) if path.exists() else {}
-        self.data = data or {}
-        self.data.setdefault("paths", {})
+        if data is None:
+            data = {}
+        if not isinstance(data, dict):
+            raise ValueError("configuration root must be a mapping")  # noqa: TRY004
         env = self._env()
-        secrets = self.data.setdefault("secrets", {})
+        raw = deepcopy(data)
+        secrets = raw.setdefault("secrets", {})
+        if not isinstance(secrets, dict):
+            raise ValueError("secrets must be a mapping")  # noqa: TRY004
         secrets.update(env)
         resolver = SecretResolver()
         for name in ("OPENAI_API_KEY", "OPENROUTER_API_KEY", "LMSTUDIO_API_KEY"):
             keychain = resolver.get(name)
             if keychain:
                 secrets[name] = keychain
+        self.configured = raw
+        self.data = self._merge(CONFIG_DEFAULTS, raw)
         self.validate()
+
+    @classmethod
+    def _merge(cls, defaults, overrides):
+        result = deepcopy(defaults)
+        for key, value in overrides.items():
+            if isinstance(value, dict) and isinstance(result.get(key), dict):
+                result[key] = cls._merge(result[key], value)
+            else:
+                result[key] = deepcopy(value)
+        return result
+
+    @classmethod
+    def _redact(cls, value, key=""):
+        if isinstance(value, dict):
+            return {name: cls._redact(item, name) for name, item in value.items()}
+        if any(secret_field in key.lower() for secret_field in _SECRET_FIELDS):
+            return "********"
+        if isinstance(value, list):
+            return [cls._redact(item, key) for item in value]
+        return deepcopy(value)
+
+    def resolved(self):
+        """Return the effective configuration after defaults and source overrides."""
+        return deepcopy(self.data)
+
+    def redacted(self, resolved=False):
+        """Return a safe display copy; never mutate effective configuration."""
+        source = self.data if resolved else self.configured
+        return self._redact(source)
 
     def _env(self):
         result = {}
@@ -95,13 +198,164 @@ class Config:
         return p if p.is_absolute() else ROOT / p
 
     def validate(self):
-        api = self.data.get("api", {})
+        def mapping(value, name):
+            if not isinstance(value, dict):
+                raise ValueError(f"{name} must be a mapping")  # noqa: TRY004
+            return value
+
+        def text(value, name, *, optional=False):
+            if optional and value is None:
+                return
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{name} must be a non-empty string")
+
+        def boolean(value, name):
+            if not isinstance(value, bool):
+                raise ValueError(f"{name} must be a boolean")  # noqa: TRY004
+
+        def valid_url(value, name):
+            text(value, name)
+            parsed = urlsplit(value)
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+                raise ValueError(f"{name} must use http or https")
+
+        def timeout(value, name):
+            if isinstance(value, dict):
+                if "total" not in value or set(value) - {"total", "connect", "read"}:
+                    raise ValueError(f"{name} requires total and permits connect/read")
+                phases = value.items()
+            else:
+                phases = (("total", value),)
+            for phase, seconds in phases:
+                if (
+                    isinstance(seconds, bool)
+                    or not isinstance(seconds, (int, float))
+                    or not 0 < seconds <= 300
+                ):
+                    raise ValueError(
+                        f"{name}.{phase} must be between 0 and 300 seconds"
+                    )
+                if phase != "total" and seconds > value["total"]:
+                    raise ValueError(f"{name}.{phase} cannot exceed total")
+
+        root = mapping(self.data, "configuration root")
+        api = mapping(root.get("api", {}), "api")
         port = api.get("port", 8080)
-        if not isinstance(port, int) or not 1 <= port <= 65535:
+        if isinstance(port, bool) or not isinstance(port, int):
+            raise ValueError("api.port must be an integer")  # noqa: TRY004
+        if not 1 <= port <= 65535:
             raise ValueError("api.port must be between 1 and 65535")
-        for name, provider in self.data.get("models", {}).get("providers", {}).items():
-            if provider.get("enabled") and not provider.get("base_url"):
+        text(api.get("host", "127.0.0.1"), "api.host")
+        if api.get("host", "127.0.0.1") not in {"127.0.0.1", "localhost"}:
+            raise ValueError("api.host must remain local")
+        boolean(api.get("swagger", True), "api.swagger")
+
+        paths = mapping(root.get("paths", {}), "paths")
+        for name, value in paths.items():
+            text(value, f"paths.{name}")
+        database = mapping(root.get("database", {}), "database")
+        if database.get("type", "sqlite") != "sqlite":
+            raise ValueError("database.type must be sqlite")
+
+        git = mapping(root.get("git", {}), "git")
+        boolean(git.get("enabled", False), "git.enabled")
+        for name in ("main", "dev"):
+            text(git.get(name, name), f"git.{name}")
+        text(git.get("remote"), "git.remote", optional=True)
+
+        memory = mapping(root.get("memory", {}), "memory")
+        for section in ("obsidian", "qdrant"):
+            section_data = mapping(memory.get(section, {}), f"memory.{section}")
+            boolean(
+                section_data.get("enabled", section == "obsidian"),
+                f"memory.{section}.enabled",
+            )
+        qdrant = memory.get("qdrant", {})
+        valid_url(qdrant.get("url", "http://127.0.0.1:6333"), "memory.qdrant.url")
+        text(qdrant.get("collection", "harness-memory"), "memory.qdrant.collection")
+        timeout(qdrant.get("timeout", 5), "memory.qdrant.timeout")
+        embeddings = mapping(memory.get("embeddings", {}), "memory.embeddings")
+        text(embeddings.get("provider", "lmstudio"), "memory.embeddings.provider")
+        text(embeddings.get("model", "text-embedding-model"), "memory.embeddings.model")
+        valid_url(
+            embeddings.get("base_url", "http://127.0.0.1:1234/v1"),
+            "memory.embeddings.base_url",
+        )
+        dimensions = embeddings.get("dimensions", EMBEDDING_DIMENSION_DEFAULT)
+        batch_size = embeddings.get("batch_size", EMBEDDING_BATCH_SIZE_DEFAULT)
+        timeout(embeddings.get("timeout", 30), "memory.embeddings.timeout")
+        if (
+            isinstance(dimensions, bool)
+            or not isinstance(dimensions, int)
+            or dimensions < 1
+        ):
+            raise ValueError("memory.embeddings.dimensions must be a positive integer")
+        if (
+            isinstance(batch_size, bool)
+            or not isinstance(batch_size, int)
+            or not 1 <= batch_size <= 256
+        ):
+            raise ValueError("memory.embeddings.batch_size must be between 1 and 256")
+
+        models = mapping(root.get("models", {}), "models")
+        providers = mapping(models.get("providers", {}), "models.providers")
+        for name, provider in providers.items():
+            provider = mapping(provider, f"models.providers.{name}")
+            enabled = provider.get("enabled", False)
+            boolean(enabled, f"models.providers.{name}.enabled")
+            if enabled and not provider.get("base_url"):
                 raise ValueError(f"models.providers.{name}.base_url is required")
+            if provider.get("base_url"):
+                valid_url(provider["base_url"], f"models.providers.{name}.base_url")
+            if provider.get("model") is not None:
+                text(provider["model"], f"models.providers.{name}.model")
+            timeout(provider.get("timeout", 120), f"models.providers.{name}.timeout")
+        registry = mapping(models.get("registry", {}), "models.registry")
+        for name, definition in registry.items():
+            definition = mapping(definition, f"models.registry.{name}")
+            for required in ("provider", "model"):
+                text(definition.get(required), f"models.registry.{name}.{required}")
+            capabilities = definition.get("capabilities", [])
+            if not isinstance(capabilities, list) or any(
+                not isinstance(item, str) for item in capabilities
+            ):
+                raise ValueError(
+                    f"models.registry.{name}.capabilities must be a list of strings"
+                )
+
+        profiles = mapping(root.get("profiles", {}), "profiles")
+        for name, profile in profiles.items():
+            profile = mapping(profile, f"profiles.{name}")
+            model = mapping(profile.get("model", {}), f"profiles.{name}.model")
+            if "primary" in model:
+                text(model["primary"], f"profiles.{name}.model.primary")
+            fallback = model.get("fallback", [])
+            if not isinstance(fallback, list) or any(
+                not isinstance(item, str) for item in fallback
+            ):
+                raise ValueError(
+                    f"profiles.{name}.model.fallback must be a list of strings"
+                )
+            for field in ("tools", "permissions"):
+                values = profile.get(field, [])
+                if not isinstance(values, list) or any(
+                    not isinstance(item, str) for item in values
+                ):
+                    raise ValueError(
+                        f"profiles.{name}.{field} must be a list of strings"
+                    )
+
+        logging_config = mapping(root.get("logging", {}), "logging")
+        level = logging_config.get("level", "INFO")
+        if level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
+            raise ValueError(
+                "logging.level must be one of DEBUG, INFO, WARNING, ERROR, CRITICAL"
+            )
+        text(logging_config.get("file", "./logs/harness.log"), "logging.file")
+        tools = mapping(root.get("tools", {}), "tools")
+        http = mapping(tools.get("http", {}), "tools.http")
+        timeout(http.get("timeout", 30), "tools.http.timeout")
+        mapping(root.get("secrets", {}), "secrets")
         return True
 
 
@@ -113,10 +367,13 @@ class Store:
         self.tasks = TaskRepository(self.database)
         self.events = EventRepository(self.database)
         self.plans = PlanRepository(self.database)
+        self.validations = ValidationRepository(self.database)
         self.subtasks = SubtaskRepository(self.database)
         self.questions = QuestionRepository(self.database)
+        self.decisions = DecisionRepository(self.database)
         self.agent_runs = AgentRunRepository(self.database)
         self.model_runs = ModelRunRepository(self.database)
+        self.model_usage = ModelUsageReportService(self.model_runs)
         self.audit = AuditRecorder(self.database, config.data.get("secrets", {}))
         self.db.parent.mkdir(parents=True, exist_ok=True)
 
@@ -169,50 +426,21 @@ class Store:
             metadata=task.model_dump(mode="json"),
         )
 
-    def event(self, task_id: int | None, kind: str, payload: dict):
+    def event(self, task_id: int | None, kind: EventKind | str, payload: dict):
+        event_kind = EventKind(kind)
         now = datetime.now(UTC).isoformat()
         payload = self.audit.sanitize(payload)
-        self.events.append(task_id, kind, payload)
-        return Event(task_id=task_id, kind=kind, payload=payload, created_at=now)
+        self.events.append(task_id, event_kind, payload)
+        return Event(
+            task_id=task_id, kind=event_kind.value, payload=payload, created_at=now
+        )
 
     def ask(self, task_id, question, reason, options=None, required=True):
         if not question.strip():
             raise ValueError("question must not be blank")
-        with self.database.connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            task = connection.execute(
-                "SELECT status FROM tasks WHERE id=?", (task_id,)
-            ).fetchone()
-            if not task:
-                raise ValueError("task not found")
-            if required and task["status"] in {"completed", "cancelled"}:
-                raise ValueError("terminal task cannot be reopened by a question")
-            existing = connection.execute(
-                "SELECT id FROM questions WHERE task_id=? AND question=? AND reason=? AND status='open'",
-                (task_id, question, reason),
-            ).fetchone()
-            if existing:
-                return existing["id"]
-            question_id = connection.execute(
-                "INSERT INTO questions(task_id,question,reason,options,required,created_at) VALUES(?,?,?,?,?,?)",
-                (
-                    task_id,
-                    question,
-                    reason,
-                    json.dumps(options or []),
-                    int(required),
-                    self.database.now(),
-                ),
-            ).lastrowid
-            if required:
-                connection.execute(
-                    "UPDATE tasks SET status='waiting_human',updated_at=? WHERE id=?",
-                    (self.database.now(), task_id),
-                )
-        self.event(
-            task_id,
-            "QUESTION_ASKED",
-            {"question_id": question_id, "question": question, "required": required},
+        payload = self.audit.sanitize({"question": question, "required": required})
+        question_id = self.questions.ask(
+            task_id, question, reason, options, required, payload
         )
         return question_id
 
@@ -262,15 +490,23 @@ class Orchestrator:
         embedder = EmbeddingProvider(
             embeddings.get("base_url", "http://127.0.0.1:1234/v1"),
             embeddings.get("model", "text-embedding-model"),
+            timeout=embeddings.get("timeout", 30),
+            dimension=embeddings.get("dimensions", EMBEDDING_DIMENSION_DEFAULT),
+            batch_size=embeddings.get("batch_size", EMBEDDING_BATCH_SIZE_DEFAULT),
         )
         self.qdrant = QdrantMemory(
             qdrant.get("url", "http://127.0.0.1:6333"),
             qdrant.get("collection", "harness-memory"),
-            embeddings.get("dimensions", 32),
+            embeddings.get("dimensions", EMBEDDING_DIMENSION_DEFAULT),
             embedder,
+            timeout=qdrant.get("timeout", 5),
         )
         notes = ObsidianMemory(self.config.path("obsidian_vault"))
-        self.memory_service = MemoryService(notes, self.qdrant)
+        self.memory_service = MemoryService(
+            notes,
+            self.qdrant,
+            batch_size=embeddings.get("batch_size", EMBEDDING_BATCH_SIZE_DEFAULT),
+        )
         self.context = ContextBuilder(
             notes,
             self.tools,
@@ -329,8 +565,13 @@ class Orchestrator:
 
     async def _run(self, task_id, owner):
         from .domain import TERMINAL
+        from .process_control import TaskCancelled, current_run_control
+
+        run_control = current_run_control()
 
         def transition(status):
+            if run_control is not None:
+                run_control.check()
             self.store.tasks.transition(task_id, status, owner)
 
         try:
@@ -361,13 +602,13 @@ class Orchestrator:
                 )
                 self.store.event(
                     task_id,
-                    "recovery.reconciled",
+                    EventKind.RECOVERY_RECONCILED,
                     reconciliation.model_dump(mode="json"),
                 )
                 self.store.tasks.transition(task_id, Status.BLOCKED, owner)
                 self.store.event(
                     task_id,
-                    "recovery.inspected",
+                    EventKind.RECOVERY_INSPECTED,
                     {
                         "previous_state": str(task.status),
                         "action": "replan",
@@ -422,7 +663,7 @@ class Orchestrator:
                         transition(Status.BLOCKED)
                         self.store.event(
                             task_id,
-                            "task.blocked",
+                            EventKind.TASK_BLOCKED,
                             {
                                 "reason": "Git repair was declined or requires reconciliation."
                             },
@@ -448,7 +689,9 @@ class Orchestrator:
                     self.validator,
                 )
                 self.store.event(
-                    task_id, "recovery.scope", recovery_scope.model_dump(mode="json")
+                    task_id,
+                    EventKind.RECOVERY_SCOPE,
+                    recovery_scope.model_dump(mode="json"),
                 )
                 context += reconciliation.planner_context()
                 context += recovery_scope.planner_context()
@@ -481,7 +724,9 @@ class Orchestrator:
                     )
                 except (httpx.HTTPError, OSError) as exc:
                     self.store.event(
-                        task_id, "memory.index_failed", {"error": type(exc).__name__}
+                        task_id,
+                        EventKind.MEMORY_INDEX_FAILED,
+                        {"error": type(exc).__name__},
                     )
             self.store.tasks.update(
                 task_id,
@@ -535,7 +780,7 @@ class Orchestrator:
                     self.validator.run_tests,
                     task,
                 )
-                self.store.event(task_id, "tests.completed", tests)
+                self.store.event(task_id, EventKind.TESTS_COMPLETED, tests)
                 if recovery_scope is not None:
                     recovery_scope.verify_preserved()
                 transition(Status.VALIDATING)
@@ -549,16 +794,9 @@ class Orchestrator:
                     outputs,
                     tests,
                 )
-                with self.store.database.connect() as connection:
-                    connection.execute(
-                        "INSERT INTO validations(task_id,valid,report,created_at) VALUES(?,?,?,?)",
-                        (
-                            task_id,
-                            int(validation.valid),
-                            validation.model_dump_json(),
-                            self.store.database.now(),
-                        ),
-                    )
+                self.store.validations.record(
+                    task_id, validation.valid, validation.model_dump_json()
+                )
                 self.store.tasks.update(
                     task_id,
                     metadata=self.store.get(task_id).model_dump(mode="json")
@@ -582,7 +820,7 @@ class Orchestrator:
                             )
                             self.store.event(
                                 task_id,
-                                "git.target_tests",
+                                EventKind.GIT_TARGET_TESTS,
                                 {"branch": branch, "tests": target_tests},
                             )
                             target_validation = self._invoke(
@@ -594,16 +832,11 @@ class Orchestrator:
                                 step_outputs,
                                 target_tests,
                             )
-                            with self.store.database.connect() as connection:
-                                connection.execute(
-                                    "INSERT INTO validations(task_id,valid,report,created_at) VALUES(?,?,?,?)",
-                                    (
-                                        task_id,
-                                        int(target_validation.valid),
-                                        target_validation.model_dump_json(),
-                                        self.store.database.now(),
-                                    ),
-                                )
+                            self.store.validations.record(
+                                task_id,
+                                target_validation.valid,
+                                target_validation.model_dump_json(),
+                            )
                             current = self.store.get(task_id)
                             self.store.tasks.update(
                                 task_id,
@@ -617,7 +850,7 @@ class Orchestrator:
                             )
                             self.store.event(
                                 task_id,
-                                "git.target_validation",
+                                EventKind.GIT_TARGET_VALIDATION,
                                 {
                                     "branch": branch,
                                     "valid": target_validation.valid,
@@ -647,7 +880,9 @@ class Orchestrator:
                         task_id,
                         result="Tests, coverage and independent acceptance validation passed.",
                     )
-                    self.store.event(task_id, "task.completed", {"attempt": attempt})
+                    self.store.event(
+                        task_id, EventKind.TASK_COMPLETED, {"attempt": attempt}
+                    )
                     return self.store.get(task_id)
                 findings = validation.errors
                 if attempt == int(
@@ -660,15 +895,19 @@ class Orchestrator:
                 attempt += 1
                 self.store.event(
                     task_id,
-                    "correction.started",
+                    EventKind.CORRECTION_STARTED,
                     {"attempt": attempt, "findings": findings},
                 )
+        except TaskCancelled:
+            if run_control is not None and run_control.reason == "lease_lost":
+                self.store.event(task_id, EventKind.TASK_LEASE_LOST, {"owner": owner})
+            raise
         except Exception as exc:
             task = self.store.get(task_id)
             if task.status not in TERMINAL and task.status != Status.WAITING_HUMAN:
                 transition(Status.FAILED)
                 self.store.tasks.update(task_id, result=str(exc))
-                self.store.event(task_id, "task.failed", {"error": str(exc)})
+                self.store.event(task_id, EventKind.TASK_FAILED, {"error": str(exc)})
             raise
 
 

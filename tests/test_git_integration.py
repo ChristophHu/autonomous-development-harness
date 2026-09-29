@@ -200,9 +200,7 @@ def test_remote_branch_delete_is_bound_to_exact_remote_and_single_use(
             ["push", "origin", "--delete", "main"], approval=grant, task_id=task.id
         )
     result = harness.tools.git(args, approval=grant, task_id=task.id)
-    assert (
-        result.returncode != 0
-    )  # Local transport requires a shell helper: fail closed.
+    assert result.returncode == 0, result.stderr
     with pytest.raises(PermissionError, match="matching"):
         harness.tools.git(args, approval=grant, task_id=task.id)
     result = subprocess.run(
@@ -211,7 +209,7 @@ def test_remote_branch_delete_is_bound_to_exact_remote_and_single_use(
         text=True,
         check=False,
     )
-    assert result.returncode == 0  # The denied transport left the remote branch intact.
+    assert result.returncode == 1
 
 
 def test_merge_failure_never_completes_or_discards_committed_work(

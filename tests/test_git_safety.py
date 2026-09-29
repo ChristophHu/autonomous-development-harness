@@ -129,15 +129,31 @@ def test_push_target_rejects_unresolved_or_credential_urls(
     tmp_path, monkeypatch, stdout, code
 ):
     config = Config()
+
+    def run(args, **kwargs):
+        if "rev-parse" in args:
+            return subprocess.CompletedProcess(args, 0, "a" * 40, "")
+        return subprocess.CompletedProcess(args, code, stdout, "failed")
+
     monkeypatch.setattr(
         "harness.tools.subprocess.run",
-        lambda args, **kwargs: subprocess.CompletedProcess(
-            args, code, stdout, "failed"
-        ),
+        run,
     )
     with pytest.raises(PermissionError):
         ToolExecutor(Permissions(config)).git_target(
-            1, ["push", "origin", "topic"], tmp_path
+            1, ["push", "origin", "main:refs/heads/topic"], tmp_path
+        )
+
+
+def test_push_target_rejects_unavailable_approved_source(tmp_path, monkeypatch):
+    config = Config()
+    monkeypatch.setattr(
+        "harness.tools.subprocess.run",
+        lambda args, **kwargs: subprocess.CompletedProcess(args, 1, "", "missing"),
+    )
+    with pytest.raises(PermissionError, match="source branch is unavailable"):
+        ToolExecutor(Permissions(config)).git_target(
+            1, ["push", "origin", "main:refs/heads/topic"], tmp_path
         )
 
 

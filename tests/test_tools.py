@@ -67,15 +67,46 @@ def test_process_git_docker_http(monkeypatch, tmp_path):
         return subprocess.CompletedProcess(args, 0, "out", "")
 
     monkeypatch.setattr("harness.tools.subprocess.run", run)
+    monkeypatch.setattr(
+        "harness.docker_broker.DockerComposeBroker.run",
+        lambda _broker, action, tail=100: subprocess.CompletedProcess(
+            ["docker", action, str(tail)], 0, "out", ""
+        ),
+    )
     assert tool.shell(["echo", "hi"], tmp_path).stdout == "out"
     assert tool.git(["status"], tmp_path).returncode == 0
-    assert tool.docker(["ps"]).returncode == 0
+    assert tool.docker("status").returncode == 0
     monkeypatch.setattr("httpx.request", lambda *a, **k: "response")
     assert tool.http("GET", "http://localhost") == "response"
     with pytest.raises(PermissionError):
         tool.http("GET", "https://outside.test")
-    assert len(calls) == 3
+    assert len(calls) == 2
     assert "core.hooksPath=/dev/null" in calls[1]
+
+
+def test_docker_actions_require_correct_permissions_and_use_broker(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "harness.docker_broker.DockerComposeBroker.run",
+        lambda _broker, action, tail=100: (
+            calls.append((action, tail))
+            or subprocess.CompletedProcess(["docker", action], 0, "", "")
+        ),
+    )
+    writable = Config()
+    writable.data["tools"] = {"permissions": {"docker": "write"}}
+    executor = ToolExecutor(Permissions(writable))
+    for action in ("status", "logs", "start", "stop"):
+        assert executor.docker(action, tail=25).returncode == 0
+    assert calls == [(action, 25) for action in ("status", "logs", "start", "stop")]
+    with pytest.raises(PermissionError, match="not allowlisted"):
+        executor.docker("exec")
+
+    readonly = Config()
+    readonly.data["tools"] = {"permissions": {"docker": "read"}}
+    with pytest.raises(PermissionError, match="not permitted"):
+        ToolExecutor(Permissions(readonly)).docker("start")
+    assert ToolExecutor(Permissions(readonly)).docker("status").returncode == 0
 
 
 def test_registry_schema_events_and_failure(tmp_path):
@@ -142,6 +173,7 @@ def test_registry_confines_process_tools_to_workspace(tmp_path, monkeypatch):
     }
     registry = ToolRegistry(Permissions(config), workspace=workspace)
     observed = []
+    docker_actions = []
     monkeypatch.setattr(
         "harness.tools.subprocess.run",
         lambda *args, **kwargs: (
@@ -151,8 +183,16 @@ def test_registry_confines_process_tools_to_workspace(tmp_path, monkeypatch):
     )
     registry.execute("shell.execute", {"command": ["pwd"]})
     registry.execute("git.execute", {"args": ["status"]})
-    registry.execute("docker.execute", {"args": ["ps"]})
-    assert observed == [workspace.resolve()] * 3
+    monkeypatch.setattr(
+        "harness.docker_broker.DockerComposeBroker.run",
+        lambda _broker, action, tail=100: (
+            docker_actions.append((action, tail))
+            or subprocess.CompletedProcess(["docker", action], 0, "", "")
+        ),
+    )
+    registry.execute("docker.execute", {"action": "status"})
+    assert observed == [workspace.resolve()] * 2
+    assert docker_actions == [("status", 100)]
     with pytest.raises(PermissionError, match="escapes"):
         registry.execute("shell.execute", {"command": ["pwd"], "cwd": str(outside)})
     with pytest.raises(PermissionError, match="escapes"):

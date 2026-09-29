@@ -97,6 +97,21 @@ class Database:
                 ):
                     c.execute(f"ALTER TABLE model_runs ADD COLUMN {column} {kind}")
                 c.execute("INSERT INTO schema_versions VALUES(3,?)", (self.now(),))
+            if not c.execute(
+                "SELECT 1 FROM schema_versions WHERE version=4"
+            ).fetchone():
+                for column, kind in (
+                    ("category", "TEXT NOT NULL DEFAULT 'legacy'"),
+                    ("source", "TEXT NOT NULL DEFAULT 'legacy'"),
+                    ("evidence", "TEXT NOT NULL DEFAULT '[]'"),
+                    ("field_names", "TEXT NOT NULL DEFAULT '[]'"),
+                    (
+                        "question_id",
+                        "INTEGER REFERENCES questions(id) ON DELETE SET NULL",
+                    ),
+                ):
+                    c.execute(f"ALTER TABLE decisions ADD COLUMN {column} {kind}")
+                c.execute("INSERT INTO schema_versions VALUES(4,?)", (self.now(),))
 
     @staticmethod
     def now():
@@ -129,6 +144,41 @@ class TaskRepository:
         sql = ", ".join(f"{k}=?" for k in fields)
         with self.db.connect() as c:
             c.execute(f"UPDATE tasks SET {sql} WHERE id=?", (*fields.values(), task_id))
+
+    def update_if_idle(self, task_id, title, description, metadata):
+        with self.db.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if connection.execute(
+                "SELECT 1 FROM task_leases WHERE task_id=? AND expires_at>strftime('%s','now')",
+                (task_id,),
+            ).fetchone():
+                return False
+            return (
+                connection.execute(
+                    "UPDATE tasks SET title=?,description=?,metadata=?,updated_at=? WHERE id=?",
+                    (title, description, json.dumps(metadata), self.db.now(), task_id),
+                ).rowcount
+                == 1
+            )
+
+    def delete_if_idle(self, task_id):
+        with self.db.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if connection.execute(
+                "SELECT 1 FROM task_leases WHERE task_id=? AND expires_at>strftime('%s','now')",
+                (task_id,),
+            ).fetchone():
+                return False
+            connection.execute(
+                "DELETE FROM model_runs WHERE agent_run_id IN (SELECT id FROM agent_runs WHERE task_id=?)",
+                (task_id,),
+            )
+            connection.execute("DELETE FROM agent_runs WHERE task_id=?", (task_id,))
+            connection.execute("DELETE FROM tool_calls WHERE task_id=?", (task_id,))
+            return (
+                connection.execute("DELETE FROM tasks WHERE id=?", (task_id,)).rowcount
+                == 1
+            )
 
     def list(self, status=None):
         with self.db.connect() as c:
@@ -189,7 +239,7 @@ class TaskRepository:
             )
 
     def transition(self, task_id, target, owner=None):
-        from .domain import may_transition
+        from .domain import EventKind, may_transition
 
         with self.db.connect() as c:
             c.execute("BEGIN IMMEDIATE")
@@ -227,7 +277,7 @@ class TaskRepository:
                 "INSERT INTO events(task_id,kind,payload,created_at) VALUES(?,?,?,?)",
                 (
                     task_id,
-                    "task.status",
+                    EventKind.TASK_STATUS.value,
                     json.dumps({"from": row["status"], "status": str(target)}),
                     now,
                 ),
@@ -239,14 +289,17 @@ class EventRepository:
         self.db = db
 
     def append(self, task_id, kind, payload):
+        from .domain import EventKind
+
+        event_kind = EventKind(kind)
         with self.db.connect() as c:
             cur = c.execute(
                 "INSERT INTO events(task_id,kind,payload,created_at) VALUES(?,?,?,?)",
-                (task_id, kind, json.dumps(payload), self.db.now()),
+                (task_id, event_kind.value, json.dumps(payload), self.db.now()),
             )
             return cur.lastrowid
 
-    def list(self, task_id=None, event_type=None, since=None, until=None):
+    def list(self, task_id=None, event_type=None, since=None, until=None, actor=None):
         clauses = []
         args = []
         for column, value, operator in (
@@ -258,6 +311,12 @@ class EventRepository:
             if value is not None:
                 clauses.append(f"{column} {operator} ?")
                 args.append(value)
+        if actor is not None:
+            clauses.append(
+                "(json_extract(payload,'$.actor')=? OR "
+                "json_extract(payload,'$.agent')=? OR json_extract(payload,'$.profile')=?)"
+            )
+            args.extend((actor, actor, actor))
         sql = (
             "SELECT * FROM events"
             + (" WHERE " + " AND ".join(clauses) if clauses else "")
@@ -299,6 +358,33 @@ class PlanRepository:
             result = dict(row)
             result["payload"] = json.loads(result["payload"])
             return result
+
+
+class ValidationRepository:
+    def __init__(self, db):
+        self.db = db
+
+    def record(self, task_id, valid, report):
+        serialized = report if isinstance(report, str) else json.dumps(report)
+        with self.db.connect() as connection:
+            cursor = connection.execute(
+                "INSERT INTO validations(task_id,valid,report,created_at) VALUES(?,?,?,?)",
+                (task_id, int(valid), serialized, self.db.now()),
+            )
+            return cursor.lastrowid
+
+    def latest(self, task_id):
+        with self.db.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM validations WHERE task_id=? ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["valid"] = bool(result["valid"])
+        result["report"] = json.loads(result["report"])
+        return result
 
 
 class SubtaskRepository:
@@ -349,19 +435,97 @@ class DecisionRepository:
         self.db = db
 
     def save(self, task_id, decision, rationale):
+        return self.record(
+            task_id,
+            "legacy",
+            "legacy",
+            decision,
+            rationale,
+            (),
+            (),
+            None,
+        )
+
+    def record(
+        self,
+        task_id,
+        category,
+        source,
+        decision,
+        rationale,
+        evidence,
+        field_names,
+        question_id,
+    ):
+        from .domain import EventKind
+
+        event_kind = EventKind.DECISION_RECORDED
+        now = self.db.now()
         with self.db.connect() as c:
+            c.execute("BEGIN IMMEDIATE")
             cur = c.execute(
-                "INSERT INTO decisions(task_id,decision,rationale,created_at) VALUES(?,?,?,?)",
-                (task_id, decision, rationale, self.db.now()),
+                "INSERT INTO decisions(task_id,decision,rationale,created_at,category,source,evidence,field_names,question_id) VALUES(?,?,?,?,?,?,?,?,?)",
+                (
+                    task_id,
+                    decision,
+                    rationale,
+                    now,
+                    category,
+                    source,
+                    json.dumps(evidence),
+                    json.dumps(field_names),
+                    question_id,
+                ),
             )
-            return cur.lastrowid
+            decision_id = cur.lastrowid
+            c.execute(
+                "INSERT INTO events(task_id,kind,payload,created_at) VALUES(?,?,?,?)",
+                (
+                    task_id,
+                    event_kind.value,
+                    json.dumps(
+                        {
+                            "decision_id": decision_id,
+                            "category": category,
+                            "source": source,
+                            "question_id": question_id,
+                            "field_names": field_names,
+                            "evidence_refs": [item["ref"] for item in evidence],
+                        }
+                    ),
+                    now,
+                ),
+            )
+            return decision_id
+
+    @staticmethod
+    def _decode(row):
+        if row is None:
+            return None
+        result = dict(row)
+        result["evidence"] = json.loads(result["evidence"])
+        result["field_names"] = json.loads(result["field_names"])
+        return result
+
+    def get(self, decision_id):
+        with self.db.connect() as c:
+            row = c.execute(
+                "SELECT * FROM decisions WHERE id=?", (decision_id,)
+            ).fetchone()
+        return self._decode(row)
 
     def list(self, task_id):
         with self.db.connect() as c:
-            return c.execute(
+            rows = c.execute(
                 "SELECT * FROM decisions WHERE task_id IS ? OR task_id IS NULL ORDER BY id",
                 (task_id,),
             ).fetchall()
+        return [self._decode(row) for row in rows]
+
+    def list_all(self):
+        with self.db.connect() as c:
+            rows = c.execute("SELECT * FROM decisions ORDER BY id").fetchall()
+        return [self._decode(row) for row in rows]
 
 
 class QuestionRepository:
@@ -382,6 +546,53 @@ class QuestionRepository:
                 ),
             )
             return cur.lastrowid
+
+    def ask(
+        self, task_id, question, reason, options=None, required=True, event_payload=None
+    ):
+        from .domain import EventKind
+
+        with self.db.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            task = connection.execute(
+                "SELECT status FROM tasks WHERE id=?", (task_id,)
+            ).fetchone()
+            if task is None:
+                raise ValueError("task not found")
+            if required and task["status"] in {"completed", "cancelled"}:
+                raise ValueError("terminal task cannot be reopened by a question")
+            existing = connection.execute(
+                "SELECT id FROM questions WHERE task_id=? AND question=? AND reason=? AND status='open'",
+                (task_id, question, reason),
+            ).fetchone()
+            if existing is not None:
+                return existing["id"]
+            question_id = connection.execute(
+                "INSERT INTO questions(task_id,question,reason,options,required,created_at) VALUES(?,?,?,?,?,?)",
+                (
+                    task_id,
+                    question,
+                    reason,
+                    json.dumps(options or []),
+                    int(required),
+                    self.db.now(),
+                ),
+            ).lastrowid
+            if required:
+                connection.execute(
+                    "UPDATE tasks SET status='waiting_human',updated_at=? WHERE id=?",
+                    (self.db.now(), task_id),
+                )
+            connection.execute(
+                "INSERT INTO events(task_id,kind,payload,created_at) VALUES(?,?,?,?)",
+                (
+                    task_id,
+                    EventKind.QUESTION_ASKED.value,
+                    json.dumps({"question_id": question_id, **(event_payload or {})}),
+                    self.db.now(),
+                ),
+            )
+            return question_id
 
     def list(self, task_id):
         with self.db.connect() as c:
@@ -488,6 +699,67 @@ class ModelRunRepository:
             )
             return cur.lastrowid
 
+    def usage_report(
+        self,
+        *,
+        task_id=None,
+        provider=None,
+        model=None,
+        since=None,
+        until=None,
+        limit=50,
+        offset=0,
+    ):
+        clauses, parameters = [], []
+        for column, value in (
+            ("task_id", task_id),
+            ("provider", provider),
+            ("model", model),
+        ):
+            if value is not None:
+                clauses.append(f"{column}=?")
+                parameters.append(value)
+        if since is not None:
+            clauses.append("COALESCE(started_at,created_at)>=?")
+            parameters.append(since)
+        if until is not None:
+            clauses.append("COALESCE(started_at,created_at)<=?")
+            parameters.append(until)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        with self.db.connect() as connection:
+            totals_row = connection.execute(
+                "SELECT COUNT(*) AS runs, SUM(prompt_tokens) AS prompt_tokens, "
+                "COUNT(prompt_tokens) AS prompt_tokens_reported, "
+                "SUM(completion_tokens) AS completion_tokens, "
+                "COUNT(completion_tokens) AS completion_tokens_reported, "
+                "SUM(cost) AS cost, COUNT(cost) AS cost_reported "
+                f"FROM model_runs{where}",
+                parameters,
+            ).fetchone()
+            total = totals_row["runs"]
+            totals = {
+                "runs": total,
+                "prompt_tokens": totals_row["prompt_tokens"],
+                "prompt_tokens_reported": totals_row["prompt_tokens_reported"],
+                "prompt_tokens_missing": total - totals_row["prompt_tokens_reported"],
+                "completion_tokens": totals_row["completion_tokens"],
+                "completion_tokens_reported": totals_row["completion_tokens_reported"],
+                "completion_tokens_missing": total
+                - totals_row["completion_tokens_reported"],
+                "cost": totals_row["cost"],
+                "cost_reported": totals_row["cost_reported"],
+                "cost_missing": total - totals_row["cost_reported"],
+            }
+            rows = connection.execute(
+                "SELECT id,task_id,agent,profile,complexity,provider,model,status,"
+                "started_at,finished_at,latency_ms,fallback_index,prompt_tokens,"
+                "completion_tokens,cached_tokens,reasoning_tokens,cost,error_type "
+                f"FROM model_runs{where} "
+                "ORDER BY COALESCE(started_at,created_at) DESC,id DESC LIMIT ? OFFSET ?",
+                [*parameters, limit, offset],
+            ).fetchall()
+        return {"total": total, "totals": totals, "items": [dict(row) for row in rows]}
+
 
 class AuditRepository:
     """Atomic persistence of correlated tool events and model invocation spans."""
@@ -496,6 +768,16 @@ class AuditRepository:
         self.db = db
 
     def tool_event(self, task_id, kind, payload, context):
+        from .domain import EventKind
+
+        event_kind = EventKind(kind)
+        if event_kind not in {
+            EventKind.TOOL_CALL_STARTED,
+            EventKind.TOOL_CALL_COMPLETED,
+            EventKind.TOOL_CALL_FAILED,
+        }:
+            raise ValueError("unsupported tool event kind")
+        kind = event_kind.value
         with self.db.connect() as connection:
             now = self.db.now()
             if kind == "TOOL_CALL_STARTED":

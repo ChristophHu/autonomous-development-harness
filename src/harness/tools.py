@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fnmatch
 import os
+import re
 import shlex
 import subprocess
 import uuid
@@ -16,6 +17,7 @@ from urllib.parse import urlsplit
 from jsonschema import Draft202012Validator, ValidationError
 
 from .isolation import git_metadata, isolated_command
+from .process_control import current_run_control, run_cancellable
 
 
 @dataclass
@@ -34,9 +36,35 @@ class ToolExecutionError(RuntimeError):
 
 
 class ToolExecutor:
-    def __init__(self, permissions, *, http_allow_hosts=(), env_allowlist=()):
+    def __init__(
+        self,
+        permissions,
+        *,
+        http_allow_hosts=(),
+        http_timeout=30,
+        git_allow_hosts=(),
+        git_ca_bundle=None,
+        git_credentials=None,
+        git_ssh_allowed_hosts=(),
+        git_ssh_allowed_ports=(22,),
+        git_ssh_host_keys=None,
+        git_ssh_credentials=None,
+        docker_compose_file=None,
+        docker_socket_path=None,
+        env_allowlist=(),
+    ):
         self.permissions = permissions
         self.http_allow_hosts = set(http_allow_hosts)
+        self.http_timeout = http_timeout
+        self.git_allow_hosts = set(git_allow_hosts)
+        self.git_ca_bundle = git_ca_bundle
+        self.git_credentials = dict(git_credentials or {})
+        self.git_ssh_allowed_hosts = set(git_ssh_allowed_hosts)
+        self.git_ssh_allowed_ports = tuple(git_ssh_allowed_ports)
+        self.git_ssh_host_keys = dict(git_ssh_host_keys or {})
+        self.git_ssh_credentials = dict(git_ssh_credentials or {})
+        self.docker_compose_file = docker_compose_file
+        self.docker_socket_path = docker_socket_path
         self.env_allowlist = set(env_allowlist)
 
     def _environment(self):
@@ -57,7 +85,8 @@ class ToolExecutor:
             raise PermissionError(
                 "Git commands must use the policy-controlled Git tool"
             )
-        return subprocess.run(
+        return run_cancellable(
+            subprocess.run,
             isolated_command(args, cwd),
             shell=False,
             cwd=cwd,
@@ -68,46 +97,109 @@ class ToolExecutor:
             env=self._environment(),
         )
 
-    def git_target(self, task_id, args, cwd):
-        from urllib.parse import urlsplit
+    def _remote_url(self, destination, cwd, *, push=False):
+        result = run_cancellable(
+            subprocess.run,
+            isolated_command(
+                [
+                    "git",
+                    "remote",
+                    "get-url",
+                    *(["--push"] if push else []),
+                    "--all",
+                    destination,
+                ],
+                cwd,
+                git=True,
+            ),
+            cwd=cwd,
+            text=True,
+            capture_output=True,
+            timeout=120,
+            check=False,
+            env=self._environment(),
+        )
+        if result.returncode or not result.stdout.strip():
+            raise PermissionError("push remote cannot be resolved")
+        destinations = result.stdout.strip().splitlines()
+        if len(destinations) != 1:
+            raise PermissionError("push requires a single actual destination")
+        remote_url = destinations[0]
+        parsed = urlsplit(remote_url)
+        if parsed.password or (parsed.scheme in {"http", "https"} and parsed.username):
+            raise PermissionError("remote URL must not contain credentials")
+        return remote_url
 
+    def git_target(self, task_id, args, cwd):
         from .approvals import GitApprovalTarget
+        from .git_broker import local_path, push_targets, transport_index
         from .git_policy import git_operation
 
         _write, action, destination = git_operation(args)
         remote_url = ""
+        identity = None
+        ref_updates = ()
         if destination:
-            result = subprocess.run(
-                isolated_command(
-                    ["git", "remote", "get-url", "--push", "--all", destination],
-                    cwd,
-                    git=True,
-                ),
-                cwd=cwd,
-                text=True,
-                capture_output=True,
-                timeout=120,
-                check=False,
-                env=self._environment(),
-            )
-            if result.returncode or not result.stdout.strip():
-                raise PermissionError("push remote cannot be resolved")
-            destinations = result.stdout.strip().splitlines()
-            if len(destinations) != 1:
-                raise PermissionError("push requires a single actual destination")
-            remote_url = destinations[0]
+            targets = push_targets(args, transport_index(args))
+            updates = []
+            for source, target_branch in targets:
+                if source is None:
+                    continue
+                resolved = run_cancellable(
+                    subprocess.run,
+                    isolated_command(
+                        [
+                            "git",
+                            "rev-parse",
+                            "--verify",
+                            f"refs/heads/{source}^{{commit}}",
+                        ],
+                        cwd,
+                        git=True,
+                    ),
+                    cwd=cwd,
+                    env=self._environment(),
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                    check=False,
+                )
+                if resolved.returncode or not re.fullmatch(
+                    r"[0-9a-fA-F]{40,64}", resolved.stdout.strip()
+                ):
+                    raise PermissionError(
+                        f"push source branch is unavailable: {source}"
+                    )
+                updates.append((source, target_branch, resolved.stdout.strip()))
+            ref_updates = tuple(updates)
+            remote_url = self._remote_url(destination, cwd, push=True)
             parsed = urlsplit(remote_url)
-            if parsed.password or (
-                parsed.scheme in {"http", "https"} and parsed.username
-            ):
-                raise PermissionError("remote URL must not contain credentials")
+            if parsed.scheme == "file" or (not parsed.scheme and ":" not in remote_url):
+                path = local_path(remote_url, cwd)
+                remote_url = str(path)
+                if path.is_dir():
+                    info = path.stat()
+                    identity = (info.st_dev, info.st_ino)
         return GitApprovalTarget(
-            task_id, str(cwd), tuple(args), action or "git.push", remote_url
+            task_id,
+            str(cwd),
+            tuple(args),
+            action or "git.push",
+            remote_url,
+            identity,
+            ref_updates,
         )
 
     def git(self, args, cwd, approval=None, task_id=None):
         from .approvals import ApprovalGrant
         from .audit import CURRENT_RUN
+        from .git_broker import (
+            HttpsTransport,
+            LocalTransport,
+            SshTransport,
+            probe,
+            transport_index,
+        )
         from .git_policy import git_operation, validate_git_destination
 
         write, action, _destination = git_operation(args)
@@ -120,14 +212,80 @@ class ToolExecutor:
                     "Git action requires a recorded human approval and task"
                 )
             target = self.git_target(task_id, args, cwd)
+            if not approval.permits(action, target):
+                raise PermissionError(
+                    "Git action requires a matching recorded human approval"
+                )
+        transport = None
+        if args[0] in {"clone", "fetch", "pull", "push"}:
+            remote_url = target.remote_url if action else None
+            if args[0] in {"fetch", "pull"}:
+                remote_url = self._remote_url(args[transport_index(args)], cwd)
+            if urlsplit(remote_url or args[transport_index(args)]).scheme == "https":
+                transport = HttpsTransport.prepare(
+                    args,
+                    cwd,
+                    self._environment(),
+                    remote_url,
+                    self.git_allow_hosts,
+                    self.git_ca_bundle,
+                    self.git_credentials,
+                    target.ref_updates if action else (),
+                )
+            elif urlsplit(
+                remote_url or args[transport_index(args)]
+            ).scheme == "ssh" or (
+                urlsplit(remote_url or args[transport_index(args)]).scheme == ""
+                and ":" in (remote_url or args[transport_index(args)])
+                and not (remote_url or args[transport_index(args)]).startswith(
+                    ("/", "./", "../")
+                )
+            ):
+                transport = SshTransport.prepare(
+                    args,
+                    cwd,
+                    self._environment(),
+                    remote_url,
+                    self.git_ssh_allowed_hosts,
+                    self.git_ssh_allowed_ports,
+                    self.git_ssh_host_keys,
+                    self.git_ssh_credentials,
+                    os.environ.get("SSH_AUTH_SOCK"),
+                    target.ref_updates if action else (),
+                )
+            else:
+                transport = LocalTransport.prepare(
+                    args,
+                    cwd,
+                    self._environment(),
+                    remote_url,
+                    target.ref_updates if action else (),
+                )
+            if (
+                action
+                and isinstance(transport, LocalTransport)
+                and transport.identity != target.remote_identity
+            ):
+                raise PermissionError("local remote identity changed during preflight")
+        command = isolated_command(
+            ["git", "-c", "core.hooksPath=/dev/null", *args], cwd, git=True
+        )
+        if action:
+            if transport is None:
+                probe(
+                    isolated_command(["git", "--version"], cwd, git=True),
+                    cwd,
+                    self._environment(),
+                )
             if not approval.consume(action, target):
                 raise PermissionError(
                     "Git action requires a matching recorded human approval"
                 )
-        return subprocess.run(
-            isolated_command(
-                ["git", "-c", "core.hooksPath=/dev/null", *args], cwd, git=True
-            ),
+        if transport is not None:
+            return transport.run()
+        return run_cancellable(
+            subprocess.run,
+            command,
             cwd=cwd,
             text=True,
             capture_output=True,
@@ -136,16 +294,15 @@ class ToolExecutor:
             env=self._environment(),
         )
 
-    def docker(self, args, cwd=None):
-        self.permissions.require("docker")
-        return subprocess.run(
-            isolated_command(["docker", *args], cwd),
-            cwd=cwd,
-            text=True,
-            capture_output=True,
-            timeout=300,
-            check=False,
-        )
+    def docker(self, action, tail=100):
+        from .docker_broker import DockerComposeBroker
+
+        if action not in {"status", "logs", "start", "stop"}:
+            raise PermissionError("Docker broker action is not allowlisted")
+        self.permissions.require("docker", write=action in {"start", "stop"})
+        return DockerComposeBroker(
+            self.docker_compose_file, self.docker_socket_path
+        ).run(action, tail=tail)
 
     def test(self, command, cwd):
         return self.shell(command, cwd)
@@ -154,8 +311,6 @@ class ToolExecutor:
         return self.shell(command, cwd)
 
     def http(self, method, url, **kwargs):
-        import httpx
-
         self.permissions.require("http")
         parsed = urlsplit(url)
         if (
@@ -171,7 +326,9 @@ class ToolExecutor:
             if not secret:
                 raise PermissionError(f"secret '{secret_name}' is unavailable")
             kwargs.setdefault("headers", {})["Authorization"] = f"Bearer {secret}"
-        return httpx.request(method, url, timeout=30, **kwargs)
+        from .http_control import request
+
+        return request(method, url, timeout=self.http_timeout, **kwargs)
 
     def filesystem(
         self, action, path, *, workspace, content=None, destination=None, query=None
@@ -264,9 +421,21 @@ class ToolRegistry:
         self.permissions = permissions
         tool_config = permissions.config.data.get("tools", {})
         http = tool_config.get("http", {})
+        git = tool_config.get("git", {})
+        docker = tool_config.get("docker", {})
         self.executor = ToolExecutor(
             permissions,
             http_allow_hosts=http.get("allowed_hosts", []),
+            http_timeout=http.get("timeout", 30),
+            git_allow_hosts=git.get("allowed_hosts", []),
+            git_ca_bundle=git.get("ca_bundle"),
+            git_credentials=git.get("credentials", {}),
+            git_ssh_allowed_hosts=git.get("ssh", {}).get("allowed_hosts", []),
+            git_ssh_allowed_ports=git.get("ssh", {}).get("allowed_ports", [22]),
+            git_ssh_host_keys=git.get("ssh", {}).get("host_keys", {}),
+            git_ssh_credentials=git.get("ssh", {}).get("credentials", {}),
+            docker_compose_file=docker.get("compose_file"),
+            docker_socket_path=docker.get("socket_path"),
             env_allowlist=tool_config.get("env_allowlist", []),
         )
         self.event_sink = event_sink
@@ -307,6 +476,91 @@ class ToolRegistry:
                 "filesystem",
                 "READ",
                 self.search,
+            )
+        )
+        from .search import RepositorySearch
+
+        search = RepositorySearch(self.workspace)
+        for name, description, key, handler in (
+            ("search.text", "Search workspace text", "query", search.text_search),
+            (
+                "search.symbols",
+                "Search source declarations",
+                "query",
+                search.symbol_search,
+            ),
+            (
+                "search.files",
+                "Search workspace filenames",
+                "pattern",
+                search.file_search,
+            ),
+        ):
+            self.register(
+                ToolSpec(
+                    name,
+                    description,
+                    {
+                        "type": "object",
+                        "properties": {
+                            key: {"type": "string", "minLength": 1},
+                            "directory": {"type": "string"},
+                            "limit": {"type": "integer", "minimum": 1, "maximum": 500},
+                        },
+                        "required": [key],
+                        "additionalProperties": False,
+                    },
+                    "filesystem",
+                    "READ",
+                    handler,
+                )
+            )
+        process_schema = {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "array",
+                    "items": {"type": "string", "minLength": 1},
+                    "minItems": 1,
+                },
+                "cwd": {"type": "string"},
+            },
+            "required": ["command"],
+            "additionalProperties": False,
+        }
+        for name, description in (
+            ("test.run_tests", "Run workspace tests"),
+            ("test.run_coverage", "Run workspace coverage"),
+            ("quality.lint", "Run workspace lint"),
+            ("quality.format", "Format workspace code"),
+            ("quality.typecheck", "Run workspace typecheck"),
+        ):
+            self.register(
+                ToolSpec(
+                    name,
+                    description,
+                    process_schema,
+                    "shell",
+                    "WRITE",
+                    lambda command, cwd=None: self.shell(command, cwd),
+                )
+            )
+        self.register(
+            ToolSpec(
+                "test.run_file",
+                "Run a selected workspace test file",
+                {
+                    "type": "object",
+                    "properties": {
+                        **process_schema["properties"],
+                        "path": {"type": "string", "minLength": 1},
+                    },
+                    "required": ["command", "path"],
+                    "additionalProperties": False,
+                },
+                "shell",
+                "WRITE",
+                self.run_test_file,
             )
         )
         self.register(
@@ -385,14 +639,17 @@ class ToolRegistry:
         self.register(
             ToolSpec(
                 "docker.execute",
-                "Execute Docker CLI command",
+                "Manage the Harness Qdrant Compose service",
                 {
                     "type": "object",
                     "properties": {
-                        "args": {"type": "array", "items": {"type": "string"}},
-                        "cwd": {"type": "string"},
+                        "action": {
+                            "type": "string",
+                            "enum": ["status", "logs", "start", "stop"],
+                        },
+                        "tail": {"type": "integer", "minimum": 1, "maximum": 500},
                     },
-                    "required": ["args"],
+                    "required": ["action"],
                     "additionalProperties": False,
                 },
                 "docker",
@@ -448,6 +705,9 @@ class ToolRegistry:
         ]
 
     def execute(self, name, arguments, profile=None):
+        control = current_run_control()
+        if control is not None:
+            control.check()
         spec = self.specs.get(name)
         if not spec:
             raise KeyError(f"unknown tool: {name}")
@@ -490,6 +750,8 @@ class ToolRegistry:
             )
         try:
             result = spec.handler(**arguments)
+            if control is not None:
+                control.check()
             if hasattr(result, "raise_for_status"):
                 result.raise_for_status()
             if getattr(result, "returncode", 0):
@@ -540,6 +802,14 @@ class ToolRegistry:
     def shell(self, command, cwd=None):
         return self.executor.shell(command, cwd=self._workspace_cwd(cwd))
 
+    def run_test_file(self, command, path, cwd=None):
+        selected = (self.workspace / path).resolve()
+        if not selected.is_relative_to(self.workspace):
+            raise PermissionError("test file escapes configured workspace")
+        if not selected.is_file():
+            raise FileNotFoundError(selected)
+        return self.shell([*command, str(selected)], cwd)
+
     def git(self, args, cwd=None, approval=None, task_id=None, _audit=True):
         from .git_policy import describe_git_operation, validate_git_destination
 
@@ -588,8 +858,8 @@ class ToolRegistry:
         self.permissions.require("git")
         return self.executor.git_target(task_id, args, self._workspace_cwd(cwd))
 
-    def docker(self, args, cwd=None):
-        return self.executor.docker(args, cwd=self._workspace_cwd(cwd))
+    def docker(self, action, tail=100):
+        return self.executor.docker(action, tail=tail)
 
     def search(self, root, query):
         selected = (self.workspace / root).resolve()

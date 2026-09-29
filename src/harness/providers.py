@@ -7,6 +7,8 @@ from dataclasses import dataclass
 
 import httpx
 
+from .http_control import request
+
 
 @dataclass
 class ModelUsage:
@@ -31,27 +33,43 @@ class ProviderError(RuntimeError):
 
 
 class OpenAICompatibleProvider:
-    def __init__(self, name, base_url, api_key=None, model=None, transport=None):
+    def __init__(
+        self, name, base_url, api_key=None, model=None, transport=None, timeout=120
+    ):
         self.name = name
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.model = model
         self.client = httpx.Client(transport=transport)
+        self.transport = transport
+        self.timeout = timeout
 
     def headers(self):
         return {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
 
     def health(self):
         try:
-            return self.client.get(
-                f"{self.base_url}/models", headers=self.headers(), timeout=5
+            return request(
+                "GET",
+                f"{self.base_url}/models",
+                client=self.client,
+                transport=self.transport,
+                owned_client=True,
+                headers=self.headers(),
+                timeout=5,
             ).is_success
         except httpx.HTTPError:
             return False
 
     def models(self):
-        r = self.client.get(
-            f"{self.base_url}/models", headers=self.headers(), timeout=10
+        r = request(
+            "GET",
+            f"{self.base_url}/models",
+            client=self.client,
+            transport=self.transport,
+            owned_client=True,
+            headers=self.headers(),
+            timeout=10,
         )
         if not r.is_success:
             raise ProviderError(f"{self.name}: {r.status_code}")
@@ -72,11 +90,15 @@ class OpenAICompatibleProvider:
         }
         if tools:
             body["tools"] = [{"type": "function", "function": tool} for tool in tools]
-        r = self.client.post(
+        r = request(
+            "POST",
             f"{self.base_url}/chat/completions",
+            client=self.client,
+            transport=self.transport,
+            owned_client=True,
             headers={**self.headers(), "Content-Type": "application/json"},
             json=body,
-            timeout=120,
+            timeout=self.timeout,
         )
         if not r.is_success:
             raise ProviderError(f"{self.name}: HTTP {r.status_code}")

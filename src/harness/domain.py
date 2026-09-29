@@ -23,6 +23,40 @@ class Status(StrEnum):
     CANCELLED = "cancelled"
 
 
+class EventKind(StrEnum):
+    """Supported event names for new writes; historic database values stay readable."""
+
+    TASK_CREATED = "task.created"
+    TASK_STATUS = "task.status"
+    TASK_STARTED = "task.started"
+    TASK_COMPLETED = "task.completed"
+    TASK_BLOCKED = "task.blocked"
+    TASK_FAILED = "task.failed"
+    TASK_LEASE_LOST = "task.lease_lost"
+    REQUIREMENTS_INSPECTED = "requirements.inspected"
+    QUESTION_ASKED = "QUESTION_ASKED"
+    QUESTION_ANSWERED = "question.answered"
+    DECISION_RECORDED = "decision.recorded"
+    RECOVERY_RECONCILED = "recovery.reconciled"
+    RECOVERY_INSPECTED = "recovery.inspected"
+    RECOVERY_SCOPE = "recovery.scope"
+    MEMORY_INDEX_FAILED = "memory.index_failed"
+    TESTS_COMPLETED = "tests.completed"
+    CORRECTION_STARTED = "correction.started"
+    GIT_WORKFLOW = "git.workflow"
+    GIT_WORKFLOW_CLASSIFIED = "git.workflow_classified"
+    GIT_REPAIR_REQUESTED = "git.repair_requested"
+    GIT_REPAIR_DECLINED = "git.repair_declined"
+    GIT_REPAIR_AUTHORIZED = "git.repair_authorized"
+    GIT_RECONCILED = "git.reconciled"
+    GIT_TARGET_TESTS = "git.target_tests"
+    GIT_TARGET_VALIDATION = "git.target_validation"
+    AGENT_RUN = "agent.run"
+    TOOL_CALL_STARTED = "TOOL_CALL_STARTED"
+    TOOL_CALL_COMPLETED = "TOOL_CALL_COMPLETED"
+    TOOL_CALL_FAILED = "TOOL_CALL_FAILED"
+
+
 TERMINAL = {Status.COMPLETED, Status.CANCELLED}
 TRANSITIONS = {
     Status.PENDING: {Status.ANALYZING},
@@ -75,7 +109,19 @@ class AcceptanceCriterion(BaseModel):
 
 
 class Task(BaseModel):
-    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        validate_assignment=True,
+        json_schema_extra={
+            "examples": [
+                {
+                    "title": "Implement feature",
+                    "goal": "Add the requested feature",
+                    "requirements": ["Use the existing architecture"],
+                }
+            ]
+        },
+    )
     id: int | None = None
     parent_task_id: int | None = None
     title: str = Field(min_length=1)

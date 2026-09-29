@@ -10,14 +10,14 @@ database: {type: sqlite}
 git: {enabled: false, main: main, dev: dev, remote: null}
 memory:
   obsidian: {enabled: true}
-  qdrant: {enabled: false, url: http://127.0.0.1:6333, collection: harness-memory}
-  embeddings: {provider: lmstudio, base_url: http://127.0.0.1:1234/v1, model: text-embedding-model, dimensions: 1024}
+  qdrant: {enabled: false, url: http://127.0.0.1:6333, collection: harness-memory, timeout: {total: 5, connect: 2, read: 5}}
+  embeddings: {provider: lmstudio, base_url: http://127.0.0.1:1234/v1, model: text-embedding-model, dimensions: 1024, batch_size: 32, timeout: {total: 30, connect: 5, read: 30}}
 models:
   defaults: {provider: lmstudio}
   providers:
-    openai: {enabled: true, base_url: https://api.openai.com/v1}
-    openrouter: {enabled: true, base_url: https://openrouter.ai/api/v1}
-    lmstudio: {enabled: true, base_url: http://127.0.0.1:1234/v1}
+    openai: {enabled: true, base_url: https://api.openai.com/v1, timeout: {total: 120, connect: 5, read: 30}}
+    openrouter: {enabled: true, base_url: https://openrouter.ai/api/v1, timeout: {total: 120, connect: 5, read: 30}}
+    lmstudio: {enabled: true, base_url: http://127.0.0.1:1234/v1, timeout: {total: 120, connect: 5, read: 30}}
 profiles:
   planner:
     model: {primary: lmstudio, fallback: [openai]}
@@ -27,7 +27,7 @@ profiles:
   coding:
     model: {primary: lmstudio, fallback: [openai]}
     instructions: Implement the assigned step using workspace tools and report actual observations.
-    tools: [filesystem.read, filesystem.search, filesystem.write, filesystem.create, shell.execute]
+    tools: [filesystem.read, filesystem.search, filesystem.write, filesystem.create, search.text, search.symbols, search.files, test.run_tests, test.run_file, test.run_coverage, quality.lint, quality.format, quality.typecheck, shell.execute]
     permissions: [filesystem, shell]
     max_steps: 20
   validator:
@@ -38,4 +38,19 @@ profiles:
 api: {host: 127.0.0.1, port: 8080, swagger: true}
 logging: {level: INFO, file: ./logs/harness.log}
 tools:
-  permissions: {filesystem: write, shell: write, git: read, filesystem.delete: denied}
+  permissions: {filesystem: write, shell: write, git: read, docker: denied, filesystem.delete: denied}
+  http:
+    allowed_hosts: []
+    timeout: {total: 30, connect: 5, read: 30}
+  docker:
+    compose_file: ./docker-compose.yml
+    socket_path: null
+  git:
+    allowed_hosts: []
+    ca_bundle: null
+    credentials: {}
+    ssh:
+      allowed_hosts: []
+      allowed_ports: [22]
+      host_keys: {}
+      credentials: {}

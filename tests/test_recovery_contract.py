@@ -103,6 +103,13 @@ def test_recovery_assessment_keeps_unverified_requirements_open(tmp_path, proble
     runtime, task, report = assessed_runtime(
         tmp_path, "remaining" if problem == "remaining" else "completed"
     )
+    # This contract test exercises recovery assessment, not the nested test runner.
+    # Make its baseline evidence explicit so an environment-dependent coverage
+    # failure cannot silently change the expected recovery scope.
+    report.confirmed_criteria = ["sum"]
+    report.remaining_criteria = []
+    report.uncertain_criteria = []
+    report.test_findings = []
     if problem == "git":
         report.git["status"]["returncode"] = 1
     if problem == "tests":

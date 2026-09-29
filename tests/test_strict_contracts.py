@@ -187,7 +187,7 @@ def test_repository_lease_and_transition_failures(tmp_path):
     with pytest.raises(ValueError, match="question"):
         store.tasks.transition(task.id, "executing", "owner")
     assert store.plans.latest(task.id) is None
-    asyncio.run(orchestrator.emit(Event(task_id=task.id, kind="test")))
+    asyncio.run(orchestrator.emit(Event(task_id=task.id, kind="task.completed")))
     assert orchestrator.queue.qsize() == 1
 
 
@@ -232,28 +232,116 @@ def test_requirement_sources_answers_and_derivation(tmp_path):
         task, "repo"
     )
     assert completed.goal and "parent" in context
+    human_decision = store.decisions.list(task.id)[-1]
+    assert human_decision["source"] == "human"
+    assert human_decision["field_names"]
+    assert human_decision["evidence"][0]["ref"] == f"answer:{question}"
     task = store.create(Task(title="invalid answer"))
     question = store.ask(task.id, "details", "requirements:incomplete")
     store.answer(question, "not JSON", task.id)
-    orchestrator.models.register(
-        "fixture",
-        SimpleNamespace(
-            complete=lambda *a, **kw: json.dumps(
-                {"fields": {"goal": "derived"}, "rationale": "source"}
-            )
-        ),
+
+    def derive(prompt, **_kwargs):
+        payload = json.loads(prompt.split("\n", 1)[1])
+        context_ref = next(
+            item["ref"]
+            for item in payload["sources"]
+            if item["source"] == "memory_and_repository"
+        )
+        return json.dumps(
+            {
+                "fields": {"goal": "derived"},
+                "rationale": "source",
+                "evidence": {"goal": [{"source": "context", "ref": context_ref}]},
+            }
+        )
+
+    orchestrator.models.register("fixture", SimpleNamespace(complete=derive))
+    completed, _ = RequirementCompleter(store, orchestrator.router).complete(
+        task, "source"
     )
-    assert (
-        RequirementCompleter(store, orchestrator.router)
-        .complete(task, "source")[0]
-        .goal
-        == "derived"
-    )
+    assert completed.goal == "derived"
+    agent_decision = store.decisions.list(task.id)[-1]
+    assert agent_decision["source"] == "agent"
+    assert agent_decision["field_names"] == ["goal"]
+    assert agent_decision["evidence"] == [
+        {"source": "context", "ref": agent_decision["evidence"][0]["ref"]}
+    ]
+    # A second pass receives the previous decision in its provenance catalog.
+    RequirementCompleter(store, orchestrator.router).complete(task, "source")
     orphan = store.create(Task(title="orphan", parent_task_id=999))
     assert (
         RequirementCompleter(store, orchestrator.router).complete(orphan, "")[0].goal
         == "derived"
     )
+
+
+def test_requirement_completion_rejects_uncited_agent_fields(tmp_path):
+    store, orchestrator = runtime(tmp_path)
+    task = store.create(Task(title="uncited"))
+    orchestrator.models.register(
+        "fixture",
+        SimpleNamespace(
+            complete=lambda *_args, **_kwargs: json.dumps(
+                {
+                    "fields": {"goal": "unsupported"},
+                    "rationale": "No evidence was actually supplied.",
+                    "evidence": {
+                        "goal": [{"source": "context", "ref": "context:invented"}]
+                    },
+                }
+            )
+        ),
+    )
+    completed, _ = RequirementCompleter(store, orchestrator.router).complete(
+        task, "actual source"
+    )
+    assert completed.goal == ""
+    assert store.decisions.list(task.id) == []
+
+
+@pytest.mark.parametrize(
+    ("fields", "rationale", "expected_goal", "expected_decisions"),
+    [({"goal": "derived"}, "", "", 0), ({"goal": ""}, "grounded", "", 0)],
+)
+def test_requirement_completion_rejects_empty_or_unchanged_derivations(
+    tmp_path, fields, rationale, expected_goal, expected_decisions
+):
+    store, orchestrator = runtime(tmp_path)
+    task = store.create(Task(title="unchanged"))
+
+    def derive(prompt, **_kwargs):
+        payload = json.loads(prompt.split("\n", 1)[1])
+        context_ref = next(
+            item["ref"]
+            for item in payload["sources"]
+            if item["source"] == "memory_and_repository"
+        )
+        return json.dumps(
+            {
+                "fields": fields,
+                "rationale": rationale,
+                "evidence": {"goal": [{"source": "context", "ref": context_ref}]},
+            }
+        )
+
+    orchestrator.models.register("fixture", SimpleNamespace(complete=derive))
+    completed, _ = RequirementCompleter(store, orchestrator.router).complete(
+        task, "source"
+    )
+    assert completed.goal == expected_goal
+    assert store.decisions.list(task.id) == []
+
+
+def test_requirement_completion_ignores_noop_human_answer_and_invalid_fields(tmp_path):
+    store, orchestrator = runtime(tmp_path)
+    task = store.create(Task(title="noop"))
+    question = store.ask(task.id, "details", "requirements:incomplete")
+    store.answer(question, json.dumps({"requirements": []}), task.id)
+    completed, _ = RequirementCompleter(store, orchestrator.router).complete(
+        task, "source"
+    )
+    assert completed.requirements == []
+    assert store.decisions.list(task.id) == []
 
 
 def test_tool_validation_schema_exit_and_output(tmp_path):

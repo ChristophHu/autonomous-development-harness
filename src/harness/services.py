@@ -1,16 +1,19 @@
 """Shared application boundary for task creation, editing and execution."""
 
 import asyncio
-import json
+import threading
 import uuid
 
-from .domain import Status, Task
+from .domain import EventKind, Status, Task
+from .process_control import RunControl, TaskCancelled, use_run_control
 
 
 class TaskService:
     def __init__(self, store, orchestrator):
         self.store = store
         self.orchestrator = orchestrator
+        self.active_controls = {}
+        self._controls_lock = threading.Lock()
 
     def get(self, task_id):
         task = self.store.get(task_id)
@@ -44,38 +47,28 @@ class TaskService:
         }
         if not payload or protected.intersection(payload):
             raise ValueError("invalid editable task fields")
-        with self.store.database.connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            if connection.execute(
-                "SELECT 1 FROM task_leases WHERE task_id=? AND expires_at>strftime('%s','now')",
-                (task_id,),
-            ).fetchone():
-                raise ValueError("task is currently running")
-            updated = Task.model_validate(self.get(task_id).model_dump() | payload)
-            pending = updated.dependencies + (
-                [updated.parent_task_id] if updated.parent_task_id else []
-            )
-            visited = set()
-            while pending:
-                dependency = pending.pop()
-                if dependency == task_id:
-                    raise ValueError("task dependency cycle")
-                if dependency not in visited:
-                    visited.add(dependency)
-                    linked = self.get(dependency)
-                    pending.extend(linked.dependencies)
-                    if linked.parent_task_id:
-                        pending.append(linked.parent_task_id)
-            connection.execute(
-                "UPDATE tasks SET title=?,description=?,metadata=?,updated_at=? WHERE id=?",
-                (
-                    updated.title,
-                    updated.description,
-                    json.dumps(updated.model_dump(mode="json")),
-                    self.store.database.now(),
-                    task_id,
-                ),
-            )
+        updated = Task.model_validate(self.get(task_id).model_dump() | payload)
+        pending = updated.dependencies + (
+            [updated.parent_task_id] if updated.parent_task_id else []
+        )
+        visited = set()
+        while pending:
+            dependency = pending.pop()
+            if dependency == task_id:
+                raise ValueError("task dependency cycle")
+            if dependency not in visited:
+                visited.add(dependency)
+                linked = self.get(dependency)
+                pending.extend(linked.dependencies)
+                if linked.parent_task_id:
+                    pending.append(linked.parent_task_id)
+        if not self.store.tasks.update_if_idle(
+            task_id,
+            updated.title,
+            updated.description,
+            updated.model_dump(mode="json"),
+        ):
+            raise ValueError("task is currently running")
         return self.get(task_id)
 
     def list(self, status=None):
@@ -84,24 +77,16 @@ class TaskService:
     def abort(self, task_id):
         self.get(task_id)
         self.store.tasks.transition(task_id, Status.CANCELLED)
+        with self._controls_lock:
+            control = self.active_controls.get(task_id)
+        if control is not None:
+            control.request_stop("task_aborted")
         return self.get(task_id)
 
     def delete(self, task_id):
         self.get(task_id)
-        with self.store.database.connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            if connection.execute(
-                "SELECT 1 FROM task_leases WHERE task_id=? AND expires_at>strftime('%s','now')",
-                (task_id,),
-            ).fetchone():
-                raise ValueError("task is currently running")
-            connection.execute(
-                "DELETE FROM model_runs WHERE agent_run_id IN (SELECT id FROM agent_runs WHERE task_id=?)",
-                (task_id,),
-            )
-            connection.execute("DELETE FROM agent_runs WHERE task_id=?", (task_id,))
-            connection.execute("DELETE FROM tool_calls WHERE task_id=?", (task_id,))
-            connection.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+        if not self.store.tasks.delete_if_idle(task_id):
+            raise ValueError("task is currently running")
 
     async def start(self, task_id):
         task = self.get(task_id)
@@ -115,19 +100,30 @@ class TaskService:
             task_id, owner, exclusive=self.orchestrator.git_enabled
         ):
             raise ValueError("task is terminal or currently running")
+        control = RunControl()
+        with self._controls_lock:
+            self.active_controls[task_id] = control
 
         async def heartbeat():
             while True:
                 await asyncio.sleep(30)
                 if not self.store.tasks.renew(task_id, owner):
+                    control.request_stop("lease_lost")
                     return
 
         renewal = asyncio.create_task(heartbeat())
         try:
-            return await self.orchestrator._run(task_id, owner)
+            with use_run_control(control):
+                try:
+                    return await self.orchestrator._run(task_id, owner)
+                except TaskCancelled:
+                    return self.get(task_id)
         finally:
             renewal.cancel()
             await asyncio.gather(renewal, return_exceptions=True)
+            with self._controls_lock:
+                if self.active_controls.get(task_id) is control:
+                    del self.active_controls[task_id]
             self.store.tasks.release(task_id, owner)
 
     async def answer(self, task_id, question_id, answer):
@@ -136,7 +132,9 @@ class TaskService:
             raise ValueError("answer must not be blank")
         if not self.store.answer(question_id, answer, task_id):
             raise ValueError("open question not found or invalid answer")
-        self.store.event(task_id, "question.answered", {"question_id": question_id})
+        self.store.event(
+            task_id, EventKind.QUESTION_ANSWERED, {"question_id": question_id}
+        )
         if task.git_state.get("cleanup_question_id") == question_id:
             return await asyncio.to_thread(
                 self.orchestrator._invoke,

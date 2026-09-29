@@ -47,6 +47,9 @@ def test_context_builder_memory_retrieval(tmp_path):
     assert "Qdrant unavailable" in ContextBuilder(memory, None, offline).build(
         SimpleNamespace(title="x", description=""), "."
     )
+    assert "Qdrant unavailable" not in ContextBuilder(memory, None).build(
+        SimpleNamespace(title="x", description=""), "."
+    )
 
 
 def test_qdrant_http_operations(monkeypatch):
@@ -92,6 +95,8 @@ def test_qdrant_failed_responses_and_embedder(monkeypatch):
     assert QdrantMemory("http://q", "c").health() is False
     with pytest.raises(httpx.HTTPStatusError):
         QdrantMemory("http://q", "c").ensure_collection()
+    with pytest.raises(ValueError, match="embedding provider"):
+        QdrantMemory("http://q", "c")._vector("x")
     with pytest.raises(httpx.HTTPStatusError):
         QdrantMemory(
             "http://q",
@@ -108,7 +113,9 @@ def test_qdrant_failed_responses_and_embedder(monkeypatch):
 def test_embedding_provider(monkeypatch):
     def post(url, **kwargs):
         assert kwargs["headers"]["Authorization"] == "Bearer token"
-        return response(payload={"data": [{"embedding": [0.1]}]})
+        return response(payload={"data": [{"index": 0, "embedding": [0.1]}]})
 
     monkeypatch.setattr("harness.memory.httpx.post", post)
-    assert EmbeddingProvider("http://embed/v1", "model", "token").embed("text") == [0.1]
+    assert EmbeddingProvider("http://embed/v1", "model", "token", dimension=1).embed(
+        "text"
+    ) == [0.1]

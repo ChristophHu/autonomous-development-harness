@@ -120,7 +120,10 @@ def test_api_health_and_task(tmp_path, monkeypatch):
     assert client.delete(f"/api/tasks/{task_id}").status_code == 204
     assert client.delete("/api/tasks/999999").status_code == 404
     assert (
-        client.post("/api/tasks/999999/questions", json={"question": "x"}).status_code
+        client.post(
+            "/api/tasks/999999/questions",
+            json={"question": "x", "reason": "not specified"},
+        ).status_code
         == 404
     )
     assert client.get("/tasks/999999").status_code == 404
@@ -210,9 +213,11 @@ def test_git_deletion_requires_approval():
 def test_event_filters(tmp_path):
     db = Database(tmp_path / "events.db")
     repo = EventRepository(db)
-    repo.append(None, "A", {})
-    repo.append(None, "B", {})
-    assert [row["kind"] for row in repo.list(event_type="A")] == ["A"]
+    repo.append(None, "task.started", {})
+    repo.append(None, "task.completed", {})
+    assert [row["kind"] for row in repo.list(event_type="task.started")] == [
+        "task.started"
+    ]
 
 
 def test_config_validates_port(tmp_path):
@@ -236,6 +241,122 @@ def test_config_rejects_enabled_provider_without_url(tmp_path):
         yaml.safe_dump({"models": {"providers": {"broken": {"enabled": True}}}})
     )
     with pytest.raises(ValueError, match="base_url"):
+        Config(path)
+
+
+@pytest.mark.parametrize(
+    ("payload", "error"),
+    [
+        ({"api": []}, "api must be a mapping"),
+        ({"api": {"port": True}}, "api.port must be an integer"),
+        ({"api": {"host": "0.0.0.0"}}, "api.host must remain local"),
+        ({"paths": {"workspace": 7}}, "paths.workspace must be a non-empty string"),
+        ({"database": {"type": "postgres"}}, "database.type must be sqlite"),
+        (
+            {"memory": {"embeddings": {"dimensions": 0}}},
+            "memory.embeddings.dimensions must be a positive integer",
+        ),
+        (
+            {"models": {"providers": {"x": {"enabled": "yes"}}}},
+            "models.providers.x.enabled must be a boolean",
+        ),
+        (
+            {"models": {"providers": {"x": {"enabled": True, "base_url": "ftp://x"}}}},
+            "models.providers.x.base_url must use http or https",
+        ),
+        (
+            {"models": {"providers": {"x": {"enabled": False, "model": 3}}}},
+            "models.providers.x.model must be a non-empty string",
+        ),
+        (
+            {
+                "models": {
+                    "registry": {
+                        "x": {"provider": "p", "model": "m", "capabilities": [3]}
+                    }
+                }
+            },
+            "models.registry.x.capabilities must be a list of strings",
+        ),
+        (
+            {"profiles": {"coding": {"model": {"fallback": "x"}}}},
+            "fallback must be a list",
+        ),
+        (
+            {"profiles": {"coding": {"tools": [3]}}},
+            "profiles.coding.tools must be a list of strings",
+        ),
+        ({"logging": {"level": "VERBOSE"}}, "logging.level must be one of"),
+        ({"secrets": []}, "secrets must be a mapping"),
+        ([], "configuration root must be a mapping"),
+    ],
+)
+def test_config_rejects_invalid_known_schema(tmp_path, payload, error):
+    import yaml
+
+    path = tmp_path / "bad-schema.yaml"
+    path.write_text(yaml.safe_dump(payload))
+    with pytest.raises(ValueError, match=error):
+        Config(path)
+
+
+def test_config_resolves_defaults_without_mutating_or_exposing_secrets(
+    tmp_path, monkeypatch
+):
+    import yaml
+
+    from harness import core
+
+    monkeypatch.setattr(core, "ROOT", tmp_path)
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "harness": {"name": "fixture"},
+                "api": {"port": 9000},
+                "secrets": {
+                    "OPENAI_API_KEY": "yaml-secret",
+                    "nested": {"token": "inner"},
+                },
+            }
+        )
+    )
+    monkeypatch.setattr(
+        core, "SecretResolver", lambda: type("R", (), {"get": lambda *_: None})()
+    )
+    config = Config(path)
+    resolved = config.resolved()
+    assert resolved["harness"]["name"] == "fixture"
+    assert resolved["api"] == {"host": "127.0.0.1", "port": 9000, "swagger": True}
+    assert resolved["paths"]["database"] == "./data/harness.db"
+    redacted = config.redacted()
+    assert redacted["secrets"]["OPENAI_API_KEY"] == "********"
+    assert redacted["secrets"]["nested"]["token"] == "********"
+    assert config.data["secrets"]["OPENAI_API_KEY"] == "yaml-secret"
+
+
+def test_config_accepts_disabled_provider_without_endpoint(tmp_path):
+    import yaml
+
+    path = tmp_path / "disabled-provider.yaml"
+    path.write_text(
+        yaml.safe_dump({"models": {"providers": {"local": {"enabled": False}}}})
+    )
+    config = Config(path)
+    assert config.data["models"]["providers"]["local"]["enabled"] is False
+
+
+def test_config_empty_yaml_uses_all_defaults(tmp_path):
+    path = tmp_path / "empty.yaml"
+    path.write_text("")
+    config = Config(path)
+    assert config.resolved()["api"]["port"] == 8080
+
+
+def test_config_rejects_non_mapping_root(tmp_path):
+    path = tmp_path / "invalid-root.yaml"
+    path.write_text("- not-a-mapping")
+    with pytest.raises(ValueError, match="configuration root must be a mapping"):
         Config(path)
 
 
@@ -371,7 +492,8 @@ def test_orchestrator_qdrant_optional(tmp_path):
     orchestrator.qdrant_enabled = True
     seen = []
     orchestrator.qdrant.ensure_collection = lambda: True
-    orchestrator.qdrant.upsert = lambda *args: seen.append(args)
+    orchestrator.qdrant.upsert_many = lambda *args: seen.append(args)
+    orchestrator.qdrant.scroll_source = lambda *args: []
     assert asyncio.run(orchestrator.run(store.create(task).id)).status == "completed"
     assert seen
 

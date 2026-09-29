@@ -131,7 +131,9 @@ def test_tool_failure_redaction_and_atomic_events(tmp_path):
         "nested": ["[REDACTED]", 3],
         "name": "model-name",
     }
-    store.event(task.id, "redacted", {"token": "unknown", "body": "SENSITIVE-SECRET"})
+    store.event(
+        task.id, "task.completed", {"token": "unknown", "body": "SENSITIVE-SECRET"}
+    )
     assert "SENSITIVE-SECRET" not in store.events.list(task.id)[-1]["payload"]
 
 
@@ -233,9 +235,31 @@ def test_collection_contract_creation_and_wrong_dimensions():
 def test_source_truth_chunk_index_and_stale_retrieval(tmp_path):
     notes = ObsidianMemory(tmp_path / "vault")
     points = []
+
+    def upsert(point_id, text, payload):
+        point = {"id": point_id, "payload": payload, "text": text}
+        for index, existing in enumerate(points):
+            if existing.get("id") == point_id:
+                points[index] = point
+                return
+        points.append(point)
+
+    def scroll_source(source=None):
+        return [
+            point
+            for point in points
+            if source is None or point.get("payload", {}).get("source") == source
+        ]
+
+    def delete(point_ids):
+        points[:] = [point for point in points if point.get("id") not in point_ids]
+        return True
+
     vectors = SimpleNamespace(
         ensure_collection=lambda: True,
-        upsert=lambda id, text, payload: points.append({"id": id, "payload": payload}),
+        upsert=upsert,
+        scroll_source=scroll_source,
+        delete=delete,
         search=lambda *a, **kw: points,
     )
     service = MemoryService(notes, vectors, chunk_size=6, overlap=2)

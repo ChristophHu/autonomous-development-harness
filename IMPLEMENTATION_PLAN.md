@@ -1,10 +1,37 @@
 # Weiterer Implementierungsplan zur GAP_MATRIX
 
+## Abgeschlossenes Paket G3 – Embedding-Konfiguration und Batching
+
+Default-Dimensionen und konfigurierbare Batchgröße durch Config→Orchestrator→Provider→Qdrant vereinheitlicht; indexsortierte/validierte Embedding-Antworten, gebündelter Qdrant-Upsert und begrenzte MemoryService-Batches ergänzt. Alte Punkte werden bei einem Fehler weiterhin nicht bereinigt. Fokussierte Memory-Abdeckung: 100 % Statements/Branches. Der volle Testlauf bleibt wegen sandbox-exec-/native-Isolation-Fehlern unbestätigt; Live-Embedding/Qdrant-Abnahme ist offen. Details: [IMPLEMENTATION_REPORT.md](IMPLEMENTATION_REPORT.md).
+
+## Abgeschlossenes Paket U1 – Model-Usage-Read-Service und Reports
+
+Repositorybasierte, validierte Usage-Auswertung mit gemeinsamen REST-/CLI-Verträgen, Filterung und Pagination. Berichte erhalten fehlende Token-/Kostenwerte als unbekannt und aggregieren nur tatsächlich gemeldete Werte; Prompts und Secrets werden nicht ausgegeben. `usage.py` und die gesamte CLI erreichen im fokussierten Nachweis 100 % Statements/Branches; Details und Grenzen: [IMPLEMENTATION_REPORT.md](IMPLEMENTATION_REPORT.md).
+
+## Laufendes Paket D2 – read-only Docker-Daemon-/Compose-Diagnose
+
+`harness doctor` nutzt nun den `DockerComposeBroker`-Statuspfad, um Daemon und festes Qdrant-Compose-Manifest read-only zu prüfen. Der Compose-Client ist vorhanden, der Daemon am lokalen Socket jedoch nicht erreichbar; es wurde kein Container gestartet oder gestoppt. Fokussierte CLI-/Broker-Tests bestehen. Nächster Schritt nach ausdrücklicher Freigabe: nur bei isolierbarer, kurzlebiger Umgebung Qdrant starten, Health/Volume-Persistenz/Restart testen und danach ausschließlich den eigenen Testcontainer stoppen. Ohne Freigabe bleibt die Liveabnahme offen.
+
 ## Aktuelle priorisierte Umsetzung und Fortsetzung
 
-Implementiert: D1/I, G1, F1a/F1b, H1a–H1b4 und H1c. H1c ergänzt verbindliche macOS-Kernelisolation für Toolprozesse und deren Nachkommen; Punkt 62 ist erfüllt. Die Isolation schließt unsichere Transport-/Docker-Helfer und externe Worktree-Schreibpfade, deshalb ist Punkt 56 wieder teilweise. Ergebnisse und genaue Funktionsgrenzen: [IMPLEMENTATION_REPORT.md](IMPLEMENTATION_REPORT.md).
+Implementiert: D1/I, G1, F1a/F1b, H1a–H1b4, H1c, lokaler Git-Broker, lokales Push-Tracking, HTTPS-/SSH-Transporte, native SSH-Server-E2E, hostgebundene SSH-Identität und HTTPS Basic/Bearer-Credentials mit Secretauflösung/Redaktion, genehmigter Einzel-/Multi-Ref-Push, `push -u`-Upstreamabgleich sowie H1d-Fetch-Verträge für Multi-Branch-Refs, Tags und begrenztes Prune. Außerdem: Qdrant-spezifischer Docker-Compose-Broker, aktive RunControl-Prozessgruppenunterbrechung bei Task-Abort/Leaseverlust (Punkt 66 erfüllt) sowie kooperativer HTTP-Abbruch für Provider, Tool, Embedding und Qdrant mit konfigurierbaren Gesamt-/Connect-/Read-Grenzen. Such-/Test-/Qualitätswerkzeuge 67–69, typisierte REST-/Task-/Event-/SSE-/OpenAPI-Verträge 73–77 und Config-CLI mit tiefer Defaultauflösung, Quellpriorität, rekursiver Secret-Redaction und Schema-Validierung (86 erfüllt) sind vorhanden. Dockeraktionen sind status/log/start/stop für ein exakt validiertes Compose-Manifest; keine beliebigen Daemonbefehle. Punkt 62 bleibt erfüllt; Punkt 56 bleibt wegen OAuth-Erneuerung und weiterer Git-Optionen teilweise; Punkt 63/64 bleiben bis zu Live-Daemon-, Health- und Betriebsabnahme teilweise. Punkte 5/108 bleiben wegen weiterer Kontroll-/Betriebsanforderungen teilweise. Ergebnisse: [IMPLEMENTATION_REPORT.md](IMPLEMENTATION_REPORT.md).
 
-Nächster Vorrang: sichere Broker für Git-Remote-/Worktree- und Dockeroperationen (56/63), danach G2/I – Memorylifecycle, vollständige Services und Betrieb. Aktive Prozessgruppen-Unterbrechung bei Abort/Leaseverlust bleibt separat offen (5/108). Jeder Block benötigt RED/GREEN und `sh scripts/verify.sh` mit unveränderter 100-%-Schwelle. Die H1c-Abnahme muss außerhalb einer verschachtelten Sandbox erfolgen, die macOS `sandbox_apply` verbietet; im Harness gibt es keinen unisolierten Fallback.
+Aktuelle Runde abgeschlossen: **G2 – Qdrant-Index-Lifecycle und stale-chunk-Bereinigung** (Punkte 72/107 vertieft, weiterhin teilweise). Qdrant-Scroll paginiert mit exaktem Quellenfilter; Reindex lädt aktuelle Chunks vor jeder Bereinigung hoch, `unindex` entfernt nur die Note und `reconcile` synchronisiert den Vault und löscht nur Harness-markierte Obsidian-Punkte. Fremde/unmarkierte Quellen bleiben erhalten. Vollständige native Abnahme: **768 Tests bestanden**, 100 % Statements/Branches/Funktionen über 32 Module/388 Funktionen; Ruff und Formatcheck bestanden.
+
+Nächster D2-Schritt: **Docker-Live-Daemon-/Health-/Persistenzabnahme (Punkte 21/63/64)**, vorbehaltlich sicherer, isolierter lokaler Daemonverfügbarkeit und expliziter Zustimmung zum tatsächlichen Start.
+
+Vorige Runde abgeschlossen: M2 – SQLite→Obsidian-Entscheidungsprojektion (Punkte 18/107 vertieft, weiterhin teilweise). `harness memory sync` erzeugt atomar wiederaufbaubare YAML-Frontmatter-Notizen aus SQLite und fasst nur manifestgeführte Harness-Dateien an. Native Abnahme: 757 Tests, 100 % Coverage auf 32 Modulen/381 Funktionen.
+
+Abgeschlossenes G2-Paket:
+1. Qdrant bietet validiertes, paginiertes Scrollen mit exakt gefilterter Quellenabfrage und Wiederholungsschutz für Cursor.
+2. Reindex liest bestehende Quellpunkte, upsertet alle aktuellen Chunks inklusive Source-Marker und entfernt veraltete IDs erst nach erfolgreichem Upload; Embedding-/Upsertfehler lösen keine vorzeitige Bereinigung aus.
+3. `unindex` entfernt markierte Punkte einer validierten Quelle. `reconcile` indexiert sichere Markdown-Dateien, bereinigt nicht mehr vorhandene Harness-Quellen und lässt fremde, unmarkierte oder unsichere Quellen unangetastet.
+4. TDD deckt Kürzung, Failure-before-prune, gelöschte Dateien, Pagination, Cursorfehler, Fremdpunkte, Symlinks und Idempotenz ab; Memory-Module erreichen separat 100 % Statements/Branches.
+5. Punkte 72/107 wurden vertieft, nicht pauschal geschlossen; Live-Dienst, Monitoring/Backup und Betriebsintegration bleiben ausstehend.
+
+D2 – Docker-Live-Daemon-/Health-/Persistenzabnahme (Punkte 21/63/64): zuerst Read-only Doctor-Prüfung von lokalem Unix-Socket, Daemonversion, Compose-Plugin und exakt erwartetem Qdrant-Service; isolierter kurzlebiger Daemon und temporäres Volume, keine bestehende Instanz, keine Volume-Löschung und kein Start ohne explizite Zustimmung. Bei fehlendem isoliertem Daemon wird der Live-Betriebsteil nicht durch Mocks ersetzt. Anschließend verbleibende Memory-Health-/Betriebsintegration.
+
+Danach G2/I – Memorylifecycle, vollständige Services und Betrieb. Jeder Block benötigt RED/GREEN und `sh scripts/verify.sh` mit unveränderter 100-%-Schwelle; kein unisolierter Git-Fallback.
 
 Die folgenden Abschnitte dokumentieren den ursprünglichen Gesamtfahrplan und dessen frühere Befunde; für aktuelle Statuswerte gilt die Gap-Matrix.
 
