@@ -11,6 +11,7 @@ import socket
 import sqlite3
 import subprocess
 import threading
+from concurrent.futures import ThreadPoolExecutor, wait
 
 import httpx
 import typer
@@ -92,8 +93,11 @@ def _sqlite_health(store):
         return "missing"
     try:
         uri = f"file:{store.db.resolve()}?mode=ro"
-        with sqlite3.connect(uri, uri=True, timeout=1) as connection:
+        connection = sqlite3.connect(uri, uri=True, timeout=1)
+        try:
             result = connection.execute("PRAGMA quick_check").fetchone()
+        finally:
+            connection.close()
         return "available" if result and result[0] == "ok" else "unhealthy"
     except (OSError, sqlite3.Error, ValueError, TypeError):
         return "unavailable"
@@ -113,9 +117,114 @@ def _config_health(conf):
         return False
 
 
+def _provider_roles(conf):
+    roles = {}
+    models = conf.data.get("models", {})
+    registry = models.get("registry", {})
+    for profile in conf.data.get("profiles", {}).values():
+        model = profile.get("model", {})
+        for role in ("primary", "fallback"):
+            references = (
+                model.get(role, []) if role == "fallback" else [model.get(role)]
+            )
+            for reference in references:
+                if not reference:
+                    continue
+                provider = registry.get(reference, {}).get("provider", reference)
+                previous = roles.get(provider)
+                if previous != "primary":
+                    roles[provider] = role
+    return roles
+
+
+def _start_preflight(conf, store, orchestrator, *, provider_timeout=5.0):
+    """Check mandatory local startup dependencies and report optional services."""
+    checks = [
+        {
+            "name": "Configuration",
+            "status": "available" if _config_health(conf) else "unavailable",
+            "critical": True,
+        },
+        {
+            "name": "SQLite",
+            "status": "available"
+            if _sqlite_health(store) == "available"
+            else "unavailable",
+            "critical": True,
+        },
+    ]
+    provider_config = conf.data.get("models", {}).get("providers", {})
+    providers = orchestrator.models.providers
+    roles = _provider_roles(conf)
+    enabled = {name for name, value in provider_config.items() if value.get("enabled")}
+    probes = {name: providers[name] for name in roles.keys() & providers.keys()}
+    results = {}
+    executor = ThreadPoolExecutor(max_workers=max(1, min(len(probes), 8)))
+    futures = {
+        executor.submit(_component_health, item.health): name
+        for name, item in probes.items()
+    }
+    try:
+        completed, pending = wait(futures, timeout=provider_timeout)
+        results.update({futures[future]: future.result() for future in completed})
+        for future in pending:
+            future.cancel()
+            results[futures[future]] = "unavailable"
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+    for name in sorted(provider_config.keys() | roles.keys()):
+        role = roles.get(name, "unused")
+        if name in provider_config and name not in enabled:
+            state = "disabled"
+        elif name not in provider_config:
+            state = "not_configured"
+        elif name not in roles:
+            state = "unused"
+        elif name not in providers:
+            state = "unavailable"
+        else:
+            state = results.get(name, "unavailable")
+        checks.append(
+            {
+                "name": f"Provider {name}",
+                "status": state,
+                "critical": False,
+                "role": role,
+            }
+        )
+
+    qdrant_enabled = conf.data.get("memory", {}).get("qdrant", {}).get("enabled", False)
+    qdrant_state = _component_health(orchestrator.qdrant.health, enabled=qdrant_enabled)
+    checks.append({"name": "Qdrant", "status": qdrant_state, "critical": False})
+    return checks
+
+
+def _print_preflight(checks):
+    for check in checks:
+        state = check["status"]
+        critical = check["critical"]
+        symbol = "✓" if state == "available" else ("✗" if critical else "⚠")
+        classification = "required" if critical else "optional"
+        role = f" [{check['role']}]" if "role" in check else ""
+        typer.echo(f"{symbol} {check['name']}{role}: {state} ({classification})")
+
+
 @app.command()
 def start(host: str | None = None, port: int | None = None):
-    settings = Config().data.get("api", {})
+    try:
+        conf, store, orchestrator = build()
+    except (OSError, RuntimeError, ValueError, sqlite3.Error, yaml.YAMLError):
+        typer.echo(
+            "Start preflight failed: configuration or local database unavailable"
+        )
+        raise typer.Exit(1) from None
+    checks = _start_preflight(conf, store, orchestrator)
+    _print_preflight(checks)
+    if any(check["critical"] and check["status"] != "available" for check in checks):
+        typer.echo("Harness start blocked by a required preflight check")
+        raise typer.Exit(1)
+    settings = conf.data.get("api", {})
     host = host or settings.get("host", "127.0.0.1")
     port = settings.get("port", 8080) if port is None else port
     lifecycle = _lifecycle()

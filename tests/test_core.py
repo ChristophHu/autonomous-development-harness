@@ -1,11 +1,20 @@
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
 from test_evidence_workflow import ready_runtime
 
 from harness.api import app
-from harness.core import Config, Orchestrator, Permissions, Store, Task, ToolRegistry
+from harness.core import (
+    Config,
+    ConfigurationService,
+    Orchestrator,
+    Permissions,
+    Store,
+    Task,
+    ToolRegistry,
+)
 from harness.database import (
     Database,
     DecisionRepository,
@@ -535,7 +544,7 @@ def test_config_environment_keychain_and_paths(tmp_path, monkeypatch):
     from harness import core
 
     core.ROOT = tmp_path
-    (tmp_path / ".env").write_text("LOCAL_API_KEY=dotenv\n# skipped\nINVALID\n")
+    (tmp_path / ".env").write_text("LOCAL_API_KEY=dotenv\n# skipped\n\n")
     monkeypatch.setenv("LOCAL_API_KEY", "environment")
     monkeypatch.setattr(
         core,
@@ -552,6 +561,320 @@ def test_config_environment_keychain_and_paths(tmp_path, monkeypatch):
         and config.data["secrets"]["OPENAI_API_KEY"] == "keychain"
     )
     assert config.path("database").is_absolute()
+
+
+def test_configuration_service_layers_general_settings_and_secret_sources(
+    tmp_path, monkeypatch
+):
+    import yaml
+
+    from harness import core
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "api": {"port": 7000},
+                "memory": {"qdrant": {"url": "http://yaml.test:6333"}},
+                "secrets": {"OPENAI_API_KEY": "yaml-secret"},
+            }
+        )
+    )
+    (tmp_path / ".env").write_text(
+        "API_PORT=7100\nQDRANT_URL=http://dotenv.test:6333\n"
+        "OPENAI_API_KEY=dotenv-secret\n"
+    )
+    monkeypatch.setattr(core, "ROOT", tmp_path)
+    monkeypatch.setenv("API_PORT", "7200")
+    monkeypatch.setenv("OPENAI_API_KEY", "environment-secret")
+    monkeypatch.setattr(
+        core,
+        "SecretResolver",
+        lambda: type(
+            "Resolver",
+            (),
+            {
+                "get": lambda _self, key: (
+                    "keychain-secret" if key == "OPENAI_API_KEY" else None
+                )
+            },
+        )(),
+    )
+
+    config = ConfigurationService(config_path)
+
+    assert config.resolved()["api"]["port"] == 7200
+    assert config.resolved()["memory"]["qdrant"]["url"] == "http://dotenv.test:6333"
+    assert config.resolved()["secrets"]["OPENAI_API_KEY"] == "keychain-secret"
+    assert config.redacted(resolved=True)["secrets"]["OPENAI_API_KEY"] == "********"
+
+
+@pytest.mark.parametrize(
+    ("dotenv", "expected"),
+    [
+        ('export API_HOST="127.0.0.1" # local', "127.0.0.1"),
+        ("API_HOST=localhost # local", "localhost"),
+        ("API_HOST='127.0.0.1'", "127.0.0.1"),
+    ],
+)
+def test_configuration_service_parses_dotenv_assignments(
+    tmp_path, monkeypatch, dotenv, expected
+):
+    from harness import core
+
+    monkeypatch.setattr(core, "ROOT", tmp_path)
+    (tmp_path / ".env").write_text(dotenv + "\n")
+
+    assert (
+        ConfigurationService(tmp_path / "absent.yaml").resolved()["api"]["host"]
+        == expected
+    )
+
+
+def test_configuration_service_maps_documented_dotenv_names(tmp_path, monkeypatch):
+    from harness import core
+
+    monkeypatch.setattr(core, "ROOT", tmp_path)
+    (tmp_path / ".env").write_text(
+        "HARNESS_WORKSPACE=./work\nOBSIDIAN_VAULT_PATH=./notes\n"
+        "QDRANT_URL=http://qdrant.test:6333\nQDRANT_COLLECTION=dev-memory\n"
+        "LLM_PROVIDER=openai\nLLM_MODEL=fixture-v1\n"
+        "LLM_API_URL=https://api.example.test/v1\nGIT_REMOTE_URL=https://git.test/repo\n"
+        "API_HOST=localhost\nAPI_PORT=8090\nOPENAI_MODEL=another-model\n"
+    )
+    monkeypatch.setattr(
+        core, "SecretResolver", lambda: SimpleNamespace(get=lambda _key: None)
+    )
+
+    resolved = ConfigurationService(tmp_path / "missing.yaml").resolved()
+
+    assert resolved["paths"]["workspace"] == "./work"
+    assert resolved["paths"]["obsidian_vault"] == "./notes"
+    assert resolved["memory"]["qdrant"] == {
+        "enabled": False,
+        "url": "http://qdrant.test:6333",
+        "collection": "dev-memory",
+    }
+    assert resolved["models"]["defaults"] == {
+        "provider": "openai",
+        "model": "fixture-v1",
+    }
+    assert "llm" not in resolved["models"]["providers"]
+    assert resolved["models"]["providers"]["openai"]["base_url"] == (
+        "https://api.example.test/v1"
+    )
+    assert resolved["models"]["providers"]["openai"]["model"] == "another-model"
+    assert resolved["git"]["remote"] == "https://git.test/repo"
+    assert resolved["api"] == {"host": "localhost", "port": 8090, "swagger": True}
+
+
+def test_env_example_is_loadable(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    from harness import core
+
+    project_root = Path(__file__).resolve().parents[1]
+    monkeypatch.setattr(core, "ROOT", tmp_path)
+    (tmp_path / ".env").write_text((project_root / ".env.example").read_text())
+    monkeypatch.setattr(
+        core, "SecretResolver", lambda: SimpleNamespace(get=lambda _key: None)
+    )
+
+    config = ConfigurationService(tmp_path / "absent.yaml")
+
+    assert config.data["paths"]["workspace"] == "./workspace"
+    assert config.data["api"]["port"] == 8080
+
+
+def test_llm_api_url_environment_override_uses_yaml_selected_provider(
+    tmp_path, monkeypatch
+):
+    import yaml
+
+    from harness import core
+
+    monkeypatch.setattr(core, "ROOT", tmp_path)
+    (tmp_path / ".env").write_text("LLM_API_URL=https://override.test/v1\n")
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump({"models": {"defaults": {"provider": "openai"}}})
+    )
+    monkeypatch.setattr(
+        core, "SecretResolver", lambda: SimpleNamespace(get=lambda _key: None)
+    )
+
+    providers = ConfigurationService(config_path).resolved()["models"]["providers"]
+
+    assert providers["openai"]["base_url"] == "https://override.test/v1"
+    assert "lmstudio" not in providers
+
+
+def test_configuration_service_rejects_non_numeric_environment_port(
+    tmp_path, monkeypatch
+):
+    from harness import core
+
+    monkeypatch.setattr(core, "ROOT", tmp_path)
+    monkeypatch.setenv("API_PORT", "not-a-port")
+    with pytest.raises(ValueError, match="api.port must be an integer"):
+        ConfigurationService(tmp_path / "absent.yaml")
+
+
+def test_configuration_service_rejects_malformed_dotenv_without_echoing_values(
+    tmp_path, monkeypatch
+):
+    from harness import core
+
+    monkeypatch.setattr(core, "ROOT", tmp_path)
+    (tmp_path / ".env").write_text("BROKEN_LINE=secret\nINVALID KEY=do-not-leak\n")
+
+    with pytest.raises(
+        ValueError, match=r"\.env line 2 has an invalid variable name"
+    ) as error:
+        ConfigurationService(tmp_path / "absent.yaml")
+
+    assert "do-not-leak" not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    ("dotenv", "error"),
+    [
+        ("BROKEN", r"\.env line 1 must be KEY=VALUE"),
+        ('API_HOST="unterminated', r"\.env contains an unterminated quoted value"),
+        (
+            'API_HOST="localhost" trailing',
+            r"\.env contains invalid text after a quoted value",
+        ),
+    ],
+)
+def test_configuration_service_rejects_malformed_dotenv(
+    tmp_path, monkeypatch, dotenv, error
+):
+    from harness import core
+
+    monkeypatch.setattr(core, "ROOT", tmp_path)
+    (tmp_path / ".env").write_text(dotenv + "\n")
+
+    with pytest.raises(ValueError, match=error):
+        ConfigurationService(tmp_path / "absent.yaml")
+
+
+def test_configuration_service_yaml_errors_do_not_echo_secret_lines(tmp_path):
+    path = tmp_path / "broken.yaml"
+    path.write_text("api: [\n  api_key: do-not-leak\n")
+
+    with pytest.raises(ValueError, match="invalid YAML in broken.yaml") as error:
+        ConfigurationService(path)
+
+    assert "do-not-leak" not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    ("payload", "error"),
+    [
+        ({"docker": {"enabled": "yes"}}, "docker.enabled must be a boolean"),
+        ({"testing": {"tdd": 1}}, "testing.tdd must be a boolean"),
+        (
+            {"testing": {"coverage": {"branches": 101}}},
+            "testing.coverage.branches must be between 0 and 100",
+        ),
+        ({"git": {"workflow": []}}, "git.workflow must be a mapping"),
+        (
+            {"tools": {"http": {"allowed_hosts": "example.com"}}},
+            "tools.http.allowed_hosts must be a list of strings",
+        ),
+        ({"api": {"enabled": 1}}, "api.enabled must be a boolean"),
+        (
+            {"docker": {"compose_preferred": "yes"}},
+            "docker.compose_preferred must be a boolean",
+        ),
+        (
+            {"profiles": {"coding": {"max_steps": 0}}},
+            "profiles.coding.max_steps must be a positive integer",
+        ),
+        (
+            {"tools": {"git": {"ssh": {"allowed_ports": [70000]}}}},
+            "tools.git.ssh.allowed_ports must contain valid ports",
+        ),
+        ({"secrets": {"TOKEN": 3}}, "secrets.TOKEN must be a non-empty string"),
+        ({"models": {"strategies": []}}, "models.strategies must be a mapping"),
+        ({"models": []}, "models must be a mapping"),
+        ({"models": {"defaults": []}}, "models.defaults must be a mapping"),
+        ({"api": {"port": "invalid"}}, "api.port must be an integer"),
+        (
+            {"git": {"branches": {"main": 3}}},
+            "git.branches.main must be a non-empty string",
+        ),
+        (
+            {"docker": {"compose_file": 3}},
+            "docker.compose_file must be a non-empty string",
+        ),
+        (
+            {"models": {"strategies": {"fast": {"model": 3}}}},
+            "models.strategies.fast.model must be a non-empty string",
+        ),
+        (
+            {"tools": {"git": {"allowed_hosts": [3]}}},
+            "tools.git.allowed_hosts must be a list of strings",
+        ),
+        (
+            {"tools": {"git": {"ssh": {"allowed_hosts": [3]}}}},
+            "tools.git.ssh.allowed_hosts must be a list of strings",
+        ),
+    ],
+)
+def test_config_validates_remaining_typed_sections(tmp_path, payload, error):
+    import yaml
+
+    path = tmp_path / "typed.yaml"
+    path.write_text(yaml.safe_dump(payload))
+
+    with pytest.raises(ValueError, match=error):
+        Config(path)
+
+
+def test_config_accepts_full_example_sections(tmp_path):
+    import yaml
+
+    path = tmp_path / "full-sections.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "api": {"enabled": True},
+                "docker": {
+                    "enabled": True,
+                    "compose_preferred": True,
+                    "compose_file": "./compose.yaml",
+                },
+                "git": {
+                    "branches": {"main": "main", "development": "dev"},
+                    "workflow": {"feature": "feature/"},
+                },
+                "models": {
+                    "strategies": {
+                        "fast": {"provider": "local", "model": "m", "profile": "coding"}
+                    }
+                },
+                "profiles": {
+                    "coding": {"instructions": "Implement safely", "max_steps": 3}
+                },
+                "testing": {"tdd": True, "coverage": {"branches": 100}},
+                "tools": {
+                    "git": {
+                        "allowed_hosts": ["git.example.test"],
+                        "ssh": {
+                            "allowed_hosts": ["ssh.example.test"],
+                            "allowed_ports": [22],
+                        },
+                    }
+                },
+            }
+        )
+    )
+    config = Config(path)
+
+    assert config.data["testing"]["coverage"]["branches"] == 100
+    assert config.data["models"]["strategies"]["fast"]["model"] == "m"
 
 
 def test_core_missing_config_branches_and_agent_usage(tmp_path):

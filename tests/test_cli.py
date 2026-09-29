@@ -54,6 +54,20 @@ def test_start_stop_paths(harness_context, monkeypatch, capsys):
         ),
     )
     monkeypatch.setattr(cli, "_lifecycle", lambda: lifecycle)
+    monkeypatch.setattr(
+        cli,
+        "_start_preflight",
+        lambda *_args: [
+            {"name": "Configuration", "status": "available", "critical": True},
+            {"name": "SQLite", "status": "available", "critical": True},
+            {
+                "name": "Provider primary",
+                "status": "unavailable",
+                "critical": False,
+                "role": "primary",
+            },
+        ],
+    )
     monkeypatch.setattr(cli, "_serve_api", lambda *args: calls.append(args) or True)
     monkeypatch.setattr(cli.os, "kill", lambda *_args: None)
     cli.start()
@@ -73,7 +87,9 @@ def test_start_stop_paths(harness_context, monkeypatch, capsys):
     )
     cli.start()
     cli.stop()
-    assert "not running" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "not running" in output
+    assert "Provider primary [primary]: unavailable (optional)" in output
 
 
 def test_stop_stale_and_active(harness_context, monkeypatch, capsys):
@@ -130,6 +146,163 @@ def test_start_converts_registration_errors(harness_context, monkeypatch):
     monkeypatch.setattr(cli, "_lifecycle", FailingLifecycle)
     with pytest.raises(cli.typer.BadParameter, match="unsafe pid file"):
         cli.start()
+
+
+def test_start_reports_build_failure_without_sensitive_details(monkeypatch, capsys):
+    for exception in (
+        ValueError("secret config detail"),
+        cli.yaml.YAMLError("secret yaml detail"),
+        cli.sqlite3.OperationalError("secret database detail"),
+    ):
+        monkeypatch.setattr(
+            cli, "build", lambda error=exception: (_ for _ in ()).throw(error)
+        )
+        with pytest.raises(cli.typer.Exit) as error:
+            cli.start()
+        output = capsys.readouterr().out
+        assert error.value.exit_code == 1
+        assert "configuration or local database unavailable" in output
+        assert "secret" not in output
+
+
+def test_start_blocks_critical_preflight_before_pid_or_server(
+    harness_context, monkeypatch, capsys
+):
+    _, _, _, root = harness_context
+    lifecycle = ServiceLifecycle(root / "data" / "harness.pid")
+    monkeypatch.setattr(cli, "_lifecycle", lambda: lifecycle)
+    monkeypatch.setattr(
+        cli,
+        "_start_preflight",
+        lambda *_args: [
+            {"name": "Configuration", "status": "unavailable", "critical": True},
+            {"name": "Provider local", "status": "unavailable", "critical": False},
+        ],
+    )
+    served = []
+    monkeypatch.setattr(cli, "_serve_api", lambda *_args: served.append(True))
+
+    with pytest.raises(cli.typer.Exit) as error:
+        cli.start()
+
+    assert error.value.exit_code == 1
+    assert not served
+    assert not lifecycle.pidfile.exists()
+    output = capsys.readouterr().out
+    assert "Configuration: unavailable (required)" in output
+    assert "Provider local: unavailable (optional)" in output
+
+
+def test_start_preflight_reports_roles_without_secrets(harness_context, monkeypatch):
+    cfg, store, orchestrator, _ = harness_context
+    cfg.data["models"]["registry"] = {
+        "primary-alias": {"provider": "alpha", "model": "private-model"},
+        "fallback-alias": {"provider": "beta", "model": "fallback-model"},
+    }
+    cfg.data["profiles"] = {
+        "planner": {
+            "model": {
+                "primary": "primary-alias",
+                "fallback": ["", "fallback-alias", "ghost"],
+            }
+        }
+    }
+    cfg.data["models"]["providers"] = {
+        "alpha": {"enabled": True, "api_key": "DO-NOT-PRINT"},
+        "beta": {"enabled": True},
+        "unused": {"enabled": True},
+        "disabled": {"enabled": False},
+        "ghost": {"enabled": True},
+    }
+    providers = {
+        "alpha": SimpleNamespace(health=lambda: False),
+        "beta": SimpleNamespace(health=lambda: True),
+        "unused": SimpleNamespace(health=lambda: pytest.fail("unused provider probed")),
+    }
+    orchestrator.models.providers = providers
+    orchestrator.qdrant.health = lambda: pytest.fail("disabled qdrant probed")
+    monkeypatch.setattr(cli, "_config_health", lambda _conf: True)
+    monkeypatch.setattr(cli, "_sqlite_health", lambda _store: "available")
+
+    checks = cli._start_preflight(cfg, store, orchestrator)
+    by_name = {check["name"]: check for check in checks}
+
+    assert by_name["Provider alpha"]["role"] == "primary"
+    assert by_name["Provider alpha"]["status"] == "unavailable"
+    assert by_name["Provider alpha"]["critical"] is False
+    assert by_name["Provider beta"]["role"] == "fallback"
+    assert by_name["Provider beta"]["status"] == "available"
+    assert by_name["Provider unused"]["status"] == "unused"
+    assert by_name["Provider disabled"]["status"] == "disabled"
+    assert by_name["Provider ghost"]["status"] == "unavailable"
+    assert by_name["Qdrant"]["status"] == "disabled"
+    assert all("DO-NOT-PRINT" not in str(check) for check in checks)
+
+
+def test_start_preflight_handles_invalid_critical_and_optional_failures(
+    harness_context, monkeypatch
+):
+    cfg, store, orchestrator, _ = harness_context
+    cfg.data["profiles"] = {"planner": {"model": {"primary": "alpha"}}}
+    cfg.data["models"]["providers"] = {"alpha": {"enabled": True}}
+    orchestrator.models.providers = {
+        "alpha": SimpleNamespace(
+            health=lambda: (_ for _ in ()).throw(RuntimeError("secret detail"))
+        )
+    }
+    cfg.data["memory"]["qdrant"]["enabled"] = True
+    orchestrator.qdrant.health = lambda: False
+    monkeypatch.setattr(cli, "_config_health", lambda _conf: False)
+    monkeypatch.setattr(cli, "_sqlite_health", lambda _store: "unhealthy")
+
+    checks = cli._start_preflight(cfg, store, orchestrator)
+    by_name = {check["name"]: check for check in checks}
+
+    assert by_name["Configuration"]["critical"] is True
+    assert by_name["Configuration"]["status"] == "unavailable"
+    assert by_name["SQLite"]["critical"] is True
+    assert by_name["Provider alpha"]["status"] == "unavailable"
+    assert by_name["Qdrant"]["critical"] is False
+    assert "secret detail" not in str(checks)
+
+
+def test_start_preflight_marks_provider_probe_timeout(harness_context, monkeypatch):
+    cfg, store, orchestrator, _ = harness_context
+    cfg.data["profiles"] = {"planner": {"model": {"primary": "alpha"}}}
+    cfg.data["models"]["providers"] = {"alpha": {"enabled": True}}
+    orchestrator.models.providers = {"alpha": SimpleNamespace(health=lambda: True)}
+    monkeypatch.setattr(cli, "_config_health", lambda _conf: True)
+    monkeypatch.setattr(cli, "_sqlite_health", lambda _store: "available")
+
+    class PendingFuture:
+        cancelled = False
+
+        def cancel(self):
+            self.cancelled = True
+
+    class Executor:
+        def __init__(self, **_kwargs):
+            self.future = PendingFuture()
+            self.shutdown_called = False
+
+        def submit(self, *_args):
+            return self.future
+
+        def shutdown(self, **_kwargs):
+            self.shutdown_called = True
+
+    executor = Executor()
+    monkeypatch.setattr(cli, "ThreadPoolExecutor", lambda **_kwargs: executor)
+    monkeypatch.setattr(cli, "wait", lambda futures, **_kwargs: (set(), set(futures)))
+
+    checks = cli._start_preflight(cfg, store, orchestrator)
+
+    assert (
+        next(item for item in checks if item["name"] == "Provider alpha")["status"]
+        == "unavailable"
+    )
+    assert executor.future.cancelled
+    assert executor.shutdown_called
 
 
 def test_stop_reports_shutdown_failure(monkeypatch, capsys):
@@ -218,6 +391,9 @@ def test_health_helpers_are_fail_safe_and_sqlite_check_is_read_only(
         def execute(self, _query):
             return SimpleNamespace(fetchone=lambda: ("corrupt",))
 
+        def close(self):
+            return None
+
     monkeypatch.setattr(cli.sqlite3, "connect", lambda *_args, **_kwargs: Connection())
     assert cli._sqlite_health(store) == "unhealthy"
     assert cli._config_health(SimpleNamespace(validate=lambda: True)) is True
@@ -230,6 +406,49 @@ def test_health_helpers_are_fail_safe_and_sqlite_check_is_read_only(
     assert cli._provider_health({"z": SimpleNamespace(health=lambda: True)}) == {
         "z": "available"
     }
+
+
+@pytest.mark.parametrize(
+    ("result", "raise_error", "expected"),
+    [
+        ("ok", False, "available"),
+        ("corrupt", False, "unhealthy"),
+        (None, True, "unavailable"),
+    ],
+)
+def test_sqlite_health_always_closes_read_only_connection(
+    tmp_path, monkeypatch, result, raise_error, expected
+):
+    database = tmp_path / "health.db"
+    database.touch()
+    close_calls = []
+
+    class Connection:
+        def execute(self, statement):
+            assert statement == "PRAGMA quick_check"
+            if raise_error:
+                raise cli.sqlite3.OperationalError("database detail")
+            return SimpleNamespace(fetchone=lambda: (result,))
+
+        def close(self):
+            close_calls.append(True)
+
+    connection = Connection()
+    calls = []
+
+    def connect(database_uri, **kwargs):
+        calls.append((database_uri, kwargs))
+        return connection
+
+    monkeypatch.setattr(cli.sqlite3, "connect", connect)
+
+    status = cli._sqlite_health(SimpleNamespace(db=database))
+
+    assert calls
+    assert status == expected
+    assert close_calls == [True]
+    assert calls[0][0].endswith("?mode=ro")
+    assert calls[0][1] == {"uri": True, "timeout": 1}
 
 
 def test_status_and_doctor(harness_context, monkeypatch, capsys):

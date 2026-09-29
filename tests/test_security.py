@@ -5,12 +5,22 @@ import pytest
 from harness.security import SecretResolver
 
 
-def test_secret_env_precedes_keychain(monkeypatch):
+def test_secret_keychain_precedes_environment(monkeypatch):
     resolver = SecretResolver()
     monkeypatch.setenv("KEY", "environment")
     monkeypatch.setattr(
         "harness.security.subprocess.run",
-        lambda *a, **k: pytest.fail("keychain should not be read"),
+        lambda *a, **k: subprocess.CompletedProcess([], 0, "keychain\n", ""),
+    )
+    assert resolver.get("KEY") == "keychain"
+
+
+def test_secret_environment_is_fallback_when_keychain_has_no_value(monkeypatch):
+    resolver = SecretResolver()
+    monkeypatch.setenv("KEY", "environment")
+    monkeypatch.setattr(
+        "harness.security.subprocess.run",
+        lambda *a, **k: subprocess.CompletedProcess([], 1, "", "missing"),
     )
     assert resolver.get("KEY") == "environment"
 

@@ -9,8 +9,6 @@ class SecretResolver:
         self.service = service
 
     def get(self, name):
-        if os.getenv(name):
-            return os.getenv(name)
         try:
             result = subprocess.run(
                 [
@@ -26,9 +24,11 @@ class SecretResolver:
                 text=True,
                 check=False,
             )
-            return result.stdout.strip() if result.returncode == 0 else None
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
         except OSError:
-            return None
+            pass
+        return os.getenv(name) or None
 
     def set(self, name, value):
         subprocess.run(

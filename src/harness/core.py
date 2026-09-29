@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from contextlib import nullcontext
 from copy import deepcopy
 from datetime import UTC, datetime
@@ -15,7 +16,7 @@ from urllib.parse import urlsplit
 
 import httpx
 import yaml
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from .agents import (
     Executor,
@@ -25,6 +26,7 @@ from .agents import (
 )
 from .approvals import ApprovalService
 from .audit import AuditRecorder
+from .configuration import HarnessConfig
 from .database import (
     AgentRunRepository,
     CorrectionRepository,
@@ -129,27 +131,61 @@ class TaskLifecycle:
         return not has_open_question and state in cls.STARTABLE | {Status.WAITING_HUMAN}
 
 
-class Config:
+class ConfigurationService:
     def __init__(self, path: Path = ROOT / "config.yaml"):
-        data = yaml.safe_load(path.read_text()) if path.exists() else {}
+        self._path = Path(path)
+        self.reload()
+
+    def reload(self):
+        """Reload all sources atomically, retaining the previous valid snapshot on failure."""
+        previous_configured = getattr(self, "configured", None)
+        previous_data = getattr(self, "data", None)
+        path = self._path
+        try:
+            data = yaml.safe_load(path.read_text()) if path.exists() else {}
+        except yaml.YAMLError:
+            raise ValueError(f"invalid YAML in {path.name}") from None
         if data is None:
             data = {}
         if not isinstance(data, dict):
             raise ValueError("configuration root must be a mapping")  # noqa: TRY004
-        env = self._env()
-        raw = deepcopy(data)
+        if "secrets" in data and not isinstance(data["secrets"], dict):
+            raise ValueError("secrets must be a mapping")
+        environment = self._env()
+        source_models = data.get("models", {})
+        source_model_defaults = (
+            source_models.get("defaults", {}) if isinstance(source_models, dict) else {}
+        )
+        default_provider = (
+            source_model_defaults.get("provider", "lmstudio")
+            if isinstance(source_model_defaults, dict)
+            else "lmstudio"
+        )
+        raw = self._merge(
+            data,
+            self._environment_overrides(environment, default_provider=default_provider),
+        )
         secrets = raw.setdefault("secrets", {})
-        if not isinstance(secrets, dict):
-            raise ValueError("secrets must be a mapping")  # noqa: TRY004
-        secrets.update(env)
         resolver = SecretResolver()
-        for name in ("OPENAI_API_KEY", "OPENROUTER_API_KEY", "LMSTUDIO_API_KEY"):
+        secret_names = set(secrets) | {
+            "OPENAI_API_KEY",
+            "OPENROUTER_API_KEY",
+            "LMSTUDIO_API_KEY",
+        }
+        for name in sorted(secret_names):
             keychain = resolver.get(name)
             if keychain:
                 secrets[name] = keychain
         self.configured = raw
         self.data = self._merge(CONFIG_DEFAULTS, raw)
-        self.validate()
+        try:
+            self.validate()
+        except Exception:
+            if previous_configured is not None and previous_data is not None:
+                self.configured = previous_configured
+                self.data = previous_data
+            raise
+        return self
 
     @classmethod
     def _merge(cls, defaults, overrides):
@@ -184,19 +220,116 @@ class Config:
         result = {}
         p = ROOT / ".env"
         if p.exists():
-            for line in p.read_text().splitlines():
-                if line.strip() and not line.lstrip().startswith("#") and "=" in line:
-                    k, v = line.split("=", 1)
-                    result[k.strip()] = v.strip().strip("'\"")
-        result.update(
-            {k: v for k, v in os.environ.items() if k.endswith(("_API_KEY", "_MODEL"))}
+            for line_number, line in enumerate(p.read_text().splitlines(), start=1):
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                if stripped.startswith("export "):
+                    stripped = stripped[7:].lstrip()
+                if "=" not in stripped:
+                    raise ValueError(f".env line {line_number} must be KEY=VALUE")
+                key, value = stripped.split("=", 1)
+                key = key.strip()
+                if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+                    raise ValueError(
+                        f".env line {line_number} has an invalid variable name"
+                    )
+                result[key] = self._dotenv_value(value)
+        result.update(os.environ)
+        return result
+
+    @staticmethod
+    def _dotenv_value(value):
+        value = value.strip()
+        if value[:1] in {"'", '"'}:
+            quote = value[0]
+            end = value.find(quote, 1)
+            if end < 0:
+                raise ValueError(".env contains an unterminated quoted value")
+            if value[end + 1 :].strip() and not value[end + 1 :].lstrip().startswith(
+                "#"
+            ):
+                raise ValueError(".env contains invalid text after a quoted value")
+            return value[1:end]
+        return value.split(" #", 1)[0].rstrip()
+
+    @classmethod
+    def _environment_overrides(cls, environment, *, default_provider="lmstudio"):
+        result = {}
+        paths = {
+            "HARNESS_NAME": ("harness", "name"),
+            "HARNESS_ENVIRONMENT": ("harness", "environment"),
+            "HARNESS_WORKSPACE": ("paths", "workspace"),
+            "OBSIDIAN_VAULT_PATH": ("paths", "obsidian_vault"),
+            "HARNESS_LOGS_PATH": ("paths", "logs"),
+            "HARNESS_DATABASE_PATH": ("paths", "database"),
+            "QDRANT_URL": ("memory", "qdrant", "url"),
+            "QDRANT_COLLECTION": ("memory", "qdrant", "collection"),
+            "GIT_REMOTE_URL": ("git", "remote"),
+            "API_HOST": ("api", "host"),
+            "API_PORT": ("api", "port"),
+        }
+        selected = {key: value for key, value in environment.items() if key in paths}
+        selected.update(
+            {
+                key: value
+                for key, value in environment.items()
+                if key.endswith("_API_KEY")
+                or (key != "LLM_MODEL" and re.fullmatch(r"[A-Z][A-Z0-9_]*_MODEL", key))
+            }
         )
+        for key, value in selected.items():
+            if key in paths:
+                target = result
+                for part in paths[key][:-1]:
+                    target = target.setdefault(part, {})
+                if key == "API_PORT":
+                    try:
+                        value = int(value)
+                    except (TypeError, ValueError):
+                        pass
+                target[paths[key][-1]] = value
+            elif key.endswith("_API_KEY"):
+                result.setdefault("secrets", {})[key] = value
+            else:
+                provider = key[:-6].lower()
+                result.setdefault("models", {}).setdefault("providers", {}).setdefault(
+                    provider, {}
+                )["model"] = value
+        if "LLM_PROVIDER" in environment:
+            result.setdefault("models", {}).setdefault("defaults", {})["provider"] = (
+                environment["LLM_PROVIDER"]
+            )
+        if "LLM_MODEL" in environment:
+            result.setdefault("models", {}).setdefault("defaults", {})["model"] = (
+                environment["LLM_MODEL"]
+            )
+        if "LLM_API_URL" in environment:
+            provider = str(environment.get("LLM_PROVIDER", default_provider)).lower()
+            result.setdefault("models", {}).setdefault("providers", {}).setdefault(
+                provider, {}
+            )["base_url"] = environment["LLM_API_URL"]
         return result
 
     def path(self, key: str) -> Path:
-        value = self.data.get("paths", {}).get(key, f"./{key}")
+        paths = self.settings.paths
+        value = getattr(paths, key, None)
+        if value is None:
+            value = (paths.model_extra or {}).get(key, f"./{key}")
         p = Path(value)
         return p if p.is_absolute() else ROOT / p
+
+    @property
+    def settings(self) -> HarnessConfig:
+        """Return a fresh typed view, so legacy data mutations cannot stale it."""
+        try:
+            return HarnessConfig.model_validate(self.data)
+        except ValidationError as exc:
+            location = exc.errors(include_input=False)[0]["loc"]
+            path = ".".join(str(part) for part in location)
+            raise ValueError(
+                f"{path} has an invalid configuration type or value"
+            ) from None
 
     def validate(self):
         def mapping(value, name):
@@ -213,6 +346,13 @@ class Config:
         def boolean(value, name):
             if not isinstance(value, bool):
                 raise ValueError(f"{name} must be a boolean")  # noqa: TRY004
+
+        def secret_value(value, name):
+            if isinstance(value, dict):
+                for child, item in value.items():
+                    secret_value(item, f"{name}.{child}")
+            elif not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{name} must be a non-empty string")
 
         def valid_url(value, name):
             text(value, name)
@@ -263,6 +403,9 @@ class Config:
                 raise ValueError(f"{name}.base_delay cannot exceed max_delay")
 
         root = mapping(self.data, "configuration root")
+        harness = mapping(root.get("harness", {}), "harness")
+        text(harness.get("name", "autonomous-development-harness"), "harness.name")
+        text(harness.get("environment", "development"), "harness.environment")
         api = mapping(root.get("api", {}), "api")
         port = api.get("port", 8080)
         if isinstance(port, bool) or not isinstance(port, int):
@@ -286,6 +429,24 @@ class Config:
         for name in ("main", "dev"):
             text(git.get(name, name), f"git.{name}")
         text(git.get("remote"), "git.remote", optional=True)
+        branches = mapping(git.get("branches", {}), "git.branches")
+        for name, value in branches.items():
+            text(value, f"git.branches.{name}")
+        workflow = mapping(git.get("workflow", {}), "git.workflow")
+        for name, value in workflow.items():
+            text(value, f"git.workflow.{name}")
+
+        docker = mapping(root.get("docker", {}), "docker")
+        if "enabled" in docker:
+            boolean(docker["enabled"], "docker.enabled")
+        if "compose_preferred" in docker:
+            boolean(docker["compose_preferred"], "docker.compose_preferred")
+        if "compose_file" in docker:
+            text(docker["compose_file"], "docker.compose_file")
+
+        api_enabled = root.get("api", {}).get("enabled")
+        if api_enabled is not None:
+            boolean(api_enabled, "api.enabled")
 
         memory = mapping(root.get("memory", {}), "memory")
         for section in ("obsidian", "qdrant"):
@@ -347,6 +508,17 @@ class Config:
                 raise ValueError(
                     f"models.registry.{name}.capabilities must be a list of strings"
                 )
+        defaults = mapping(models.get("defaults", {}), "models.defaults")
+        for field in ("provider", "model"):
+            if field in defaults:
+                text(defaults[field], f"models.defaults.{field}")
+        mapping(models.get("rates", {}), "models.rates")
+        strategies = mapping(models.get("strategies", {}), "models.strategies")
+        for name, strategy in strategies.items():
+            strategy = mapping(strategy, f"models.strategies.{name}")
+            for field in ("provider", "model", "profile"):
+                if field in strategy:
+                    text(strategy[field], f"models.strategies.{name}.{field}")
 
         profiles = mapping(root.get("profiles", {}), "profiles")
         for name, profile in profiles.items():
@@ -369,6 +541,16 @@ class Config:
                     raise ValueError(
                         f"profiles.{name}.{field} must be a list of strings"
                     )
+            if "instructions" in profile:
+                text(profile["instructions"], f"profiles.{name}.instructions")
+            if "max_steps" in profile and (
+                isinstance(profile["max_steps"], bool)
+                or not isinstance(profile["max_steps"], int)
+                or profile["max_steps"] < 1
+            ):
+                raise ValueError(
+                    f"profiles.{name}.max_steps must be a positive integer"
+                )
 
         logging_config = mapping(root.get("logging", {}), "logging")
         level = logging_config.get("level", "INFO")
@@ -377,11 +559,66 @@ class Config:
                 "logging.level must be one of DEBUG, INFO, WARNING, ERROR, CRITICAL"
             )
         text(logging_config.get("file", "./logs/harness.log"), "logging.file")
+        testing = mapping(root.get("testing", {}), "testing")
+        if "tdd" in testing:
+            boolean(testing["tdd"], "testing.tdd")
+        coverage = mapping(testing.get("coverage", {}), "testing.coverage")
+        for name, value in coverage.items():
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not 0 <= value <= 100
+            ):
+                raise ValueError(f"testing.coverage.{name} must be between 0 and 100")
         tools = mapping(root.get("tools", {}), "tools")
+        permissions = mapping(tools.get("permissions", {}), "tools.permissions")
+        for name, value in permissions.items():
+            text(value, f"tools.permissions.{name}")
         http = mapping(tools.get("http", {}), "tools.http")
         timeout(http.get("timeout", 30), "tools.http.timeout")
-        mapping(root.get("secrets", {}), "secrets")
+        allowed_hosts = http.get("allowed_hosts", [])
+        if not isinstance(allowed_hosts, list) or any(
+            not isinstance(host, str) or not host.strip() for host in allowed_hosts
+        ):
+            raise ValueError("tools.http.allowed_hosts must be a list of strings")
+        docker_tools = mapping(tools.get("docker", {}), "tools.docker")
+        if "compose_file" in docker_tools:
+            text(docker_tools["compose_file"], "tools.docker.compose_file")
+        if "socket_path" in docker_tools:
+            text(docker_tools["socket_path"], "tools.docker.socket_path", optional=True)
+        git_tools = mapping(tools.get("git", {}), "tools.git")
+        for hosts_key in ("allowed_hosts",):
+            hosts = git_tools.get(hosts_key, [])
+            if not isinstance(hosts, list) or any(
+                not isinstance(host, str) or not host.strip() for host in hosts
+            ):
+                raise ValueError(f"tools.git.{hosts_key} must be a list of strings")
+        mapping(git_tools.get("credentials", {}), "tools.git.credentials")
+        ssh = mapping(git_tools.get("ssh", {}), "tools.git.ssh")
+        hosts = ssh.get("allowed_hosts", [])
+        if not isinstance(hosts, list) or any(
+            not isinstance(host, str) or not host.strip() for host in hosts
+        ):
+            raise ValueError("tools.git.ssh.allowed_hosts must be a list of strings")
+        ports = ssh.get("allowed_ports", [22])
+        if not isinstance(ports, list) or any(
+            isinstance(port, bool)
+            or not isinstance(port, int)
+            or not 1 <= port <= 65535
+            for port in ports
+        ):
+            raise ValueError("tools.git.ssh.allowed_ports must contain valid ports")
+        mapping(ssh.get("host_keys", {}), "tools.git.ssh.host_keys")
+        mapping(ssh.get("credentials", {}), "tools.git.ssh.credentials")
+        secrets_config = mapping(root.get("secrets", {}), "secrets")
+        for name, value in secrets_config.items():
+            secret_value(value, f"secrets.{name}")
+        _typed_settings = self.settings
         return True
+
+
+# Backwards-compatible public name used throughout the runtime.
+Config = ConfigurationService
 
 
 class Store:
@@ -1024,7 +1261,7 @@ def build():
     config = Config()
     config.path("logs").mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
-        level=config.data.get("logging", {}).get("level", "INFO"),
+        level=config.settings.logging.level,
         format="%(asctime)s %(levelname)s %(message)s",
         handlers=[
             logging.FileHandler(config.path("logs") / "harness.log"),
