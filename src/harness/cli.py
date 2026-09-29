@@ -7,9 +7,12 @@ import json
 import os
 import platform
 import shutil
-import signal
 import socket
+import sqlite3
+import subprocess
+import threading
 
+import httpx
 import typer
 import uvicorn
 import yaml
@@ -17,6 +20,7 @@ import yaml
 from .core import ROOT, Config, Task, build
 from .docker_broker import DockerComposeBroker
 from .security import SecretResolver
+from .service_lifecycle import ServiceLifecycle
 
 app = typer.Typer(no_args_is_help=True)
 tasks = typer.Typer(no_args_is_help=True)
@@ -31,112 +35,241 @@ app.add_typer(secrets, name="secrets")
 app.add_typer(memory, name="memory")
 
 
+def _lifecycle():
+    return ServiceLifecycle(ROOT / "data" / "harness.pid")
+
+
+def _serve_api(host, port, lifecycle, timeout=10.0):
+    startup_finished = threading.Event()
+    startup_succeeded = threading.Event()
+    readiness_confirmed = threading.Event()
+
+    class ReadyServer(uvicorn.Server):
+        async def startup(self, sockets=None):
+            try:
+                await super().startup(sockets)
+                if self.started:
+                    startup_succeeded.set()
+            finally:
+                startup_finished.set()
+
+    server = ReadyServer(
+        uvicorn.Config("harness.api:app", host=host, port=port, reload=False)
+    )
+
+    def announce_readiness():
+        if not startup_finished.wait(timeout):
+            server.should_exit = True
+            return
+        if startup_succeeded.is_set() and lifecycle.wait_until_ready(
+            host, port, timeout
+        ):
+            readiness_confirmed.set()
+            typer.echo(
+                f"Harness ready at http://{host}:{port}; Swagger: http://{host}:{port}/docs"
+            )
+        else:
+            server.should_exit = True
+
+    monitor = threading.Thread(target=announce_readiness, daemon=True)
+    monitor.start()
+    server.run()
+    monitor.join(timeout + 0.2)
+    return readiness_confirmed.is_set()
+
+
+def _component_health(call, *, enabled=True):
+    if not enabled:
+        return "disabled"
+    try:
+        return "available" if bool(call()) else "unavailable"
+    except (OSError, RuntimeError, ValueError, TypeError, httpx.HTTPError):
+        return "unavailable"
+
+
+def _sqlite_health(store):
+    if not store.db.is_file():
+        return "missing"
+    try:
+        uri = f"file:{store.db.resolve()}?mode=ro"
+        with sqlite3.connect(uri, uri=True, timeout=1) as connection:
+            result = connection.execute("PRAGMA quick_check").fetchone()
+        return "available" if result and result[0] == "ok" else "unhealthy"
+    except (OSError, sqlite3.Error, ValueError, TypeError):
+        return "unavailable"
+
+
+def _provider_health(providers):
+    return {
+        name: _component_health(provider.health)
+        for name, provider in sorted(providers.items())
+    }
+
+
+def _config_health(conf):
+    try:
+        return conf.validate()
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return False
+
+
 @app.command()
 def start(host: str | None = None, port: int | None = None):
     settings = Config().data.get("api", {})
     host = host or settings.get("host", "127.0.0.1")
-    port = port or settings.get("port", 8080)
-    if host not in {"127.0.0.1", "localhost"}:
-        raise typer.BadParameter("API host must remain local")
-    pidfile = ROOT / "data" / "harness.pid"
-    pidfile.parent.mkdir(parents=True, exist_ok=True)
-    if pidfile.exists():
-        try:
-            os.kill(int(pidfile.read_text()), 0)
-            raise typer.BadParameter("Harness already appears to be running")
-        except ProcessLookupError:
-            pidfile.unlink(missing_ok=True)
-    pidfile.write_text(str(os.getpid()))
-    typer.echo(
-        f"Harness started at http://{host}:{port}; Swagger: http://{host}:{port}/docs"
-    )
+    port = settings.get("port", 8080) if port is None else port
+    lifecycle = _lifecycle()
     try:
-        uvicorn.run("harness.api:app", host=host, port=port, reload=False)
+        record = lifecycle.register_current(host, port)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise typer.BadParameter(str(error)) from error
+    try:
+        if not _serve_api(host, port, lifecycle):
+            raise typer.Exit(1)
     finally:
-        pidfile.unlink(missing_ok=True)
+        lifecycle.remove_record(record)
 
 
 @app.command()
 def stop():
-    pidfile = ROOT / "data" / "harness.pid"
-    if not pidfile.exists():
-        typer.echo("Harness is not running")
-        return
-    pid = int(pidfile.read_text())
+    lifecycle = _lifecycle()
     try:
-        os.kill(pid, signal.SIGTERM)
-        typer.echo("Graceful shutdown requested")
-    except ProcessLookupError:
-        pidfile.unlink(missing_ok=True)
-        typer.echo("Removed stale process record")
+        state = lifecycle.stop()
+    except (OSError, RuntimeError, TimeoutError) as error:
+        typer.echo(f"Harness shutdown failed: {error}")
+        raise typer.Exit(1) from error
+    messages = {
+        "not_running": "Harness is not running",
+        "stale": "Removed stale process record",
+        "stopped": "Harness stopped gracefully",
+    }
+    typer.echo(messages.get(state, "Harness stopped gracefully"))
 
 
 @app.command()
 def status():
     conf, store, orchestrator = build()
-    pidfile = ROOT / "data" / "harness.pid"
-    running = False
-    if pidfile.exists():
-        try:
-            os.kill(int(pidfile.read_text()), 0)
-            running = True
-        except (ValueError, ProcessLookupError):
-            pidfile.unlink(missing_ok=True)
+    try:
+        service = _lifecycle().inspect()
+    except (OSError, RuntimeError, ValueError):
+        service = {"state": "unknown", "record": None, "ready": False}
+    running = service["state"] == "running"
     counts = {
         name: len(store.tasks.list(name))
         for name in (
             "pending",
+            "analyzing",
             "planning",
+            "ready",
             "executing",
+            "testing",
             "validating",
+            "correcting",
+            "recovering",
             "waiting_human",
             "failed",
+            "blocked",
+            "cancelled",
+            "completed",
         )
     }
+    service_description = service["state"]
+    if running:
+        record = service.get("record") or {}
+        readiness = "ready" if service.get("ready") else "not ready"
+        service_description = (
+            f"running ({readiness}) pid={record.get('pid', 'unknown')}"
+        )
+    typer.echo(f"Harness: {service_description}")
+    typer.echo(f"SQLite: {_sqlite_health(store)}")
+    vault = conf.path("obsidian_vault")
     typer.echo(
-        f"Harness: {'running' if running else 'stopped'}\nSQLite: connected\nObsidian: {'available' if conf.path('obsidian_vault').is_dir() else 'missing'}\nQdrant: {'available' if orchestrator.qdrant.health() else 'unavailable'}"
+        f"Obsidian: {_component_health(lambda: vault.is_dir() and os.access(vault, os.R_OK | os.W_OK))}"
+    )
+    qdrant_enabled = conf.data.get("memory", {}).get("qdrant", {}).get("enabled", False)
+    typer.echo(
+        f"Qdrant: {_component_health(orchestrator.qdrant.health, enabled=qdrant_enabled)}"
     )
     for name, count in counts.items():
         typer.echo(f"{name}: {count}")
     for name, provider in orchestrator.models.providers.items():
-        try:
-            available = bool(provider.health())
-        except (OSError, RuntimeError, ValueError):
-            available = False
-        typer.echo(f"Provider {name}: {'available' if available else 'unavailable'}")
+        typer.echo(f"Provider {name}: {_component_health(provider.health)}")
 
 
 @app.command()
 def doctor():
     conf, store, orchestrator = build()
-    docker_status = DockerComposeBroker().run("status")
+    qdrant_enabled = conf.data.get("memory", {}).get("qdrant", {}).get("enabled", False)
+    docker_available = shutil.which("docker") is not None
+    compose_available = False
+    if docker_available and qdrant_enabled:
+        try:
+            compose_available = (
+                subprocess.run(
+                    ["docker", "compose", "version"],
+                    capture_output=True,
+                    timeout=3,
+                    check=False,
+                ).returncode
+                == 0
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            compose_available = False
+    docker_daemon_available = True
+    if qdrant_enabled and docker_available and compose_available:
+        try:
+            docker_daemon_available = (
+                DockerComposeBroker().run("status").returncode == 0
+            )
+        except (OSError, RuntimeError, ValueError):
+            docker_daemon_available = False
+    elif qdrant_enabled:
+        docker_daemon_available = False
+    try:
+        service = _lifecycle().inspect()
+    except (OSError, RuntimeError, ValueError):
+        service = {"state": "unknown", "record": None, "ready": False}
+    workspace = conf.path("workspace")
+    vault = conf.path("obsidian_vault")
+    log_dir = conf.path("logs")
+    providers = _provider_health(orchestrator.models.providers)
     checks = {
         "macOS": platform.system() == "Darwin",
         "Apple Silicon": platform.machine() == "arm64",
-        "Configuration": conf.validate(),
-        "SQLite": store.db.exists(),
+        "Configuration": _config_health(conf),
+        "SQLite": _sqlite_health(store) == "available",
         "Git": shutil.which("git") is not None,
-        "Docker": shutil.which("docker") is not None,
-        "Docker Compose": bool(shutil.which("docker"))
-        and os.system("docker compose version >/dev/null 2>&1") == 0,
-        "Docker Daemon / Qdrant Compose": docker_status.returncode == 0,
-        "Obsidian Vault": conf.path("obsidian_vault").is_dir(),
-        "Workspace": conf.path("workspace").is_dir(),
-        "Qdrant": not conf.data.get("memory", {}).get("qdrant", {}).get("enabled")
-        or orchestrator.qdrant.health(),
+        "Docker": docker_available or not qdrant_enabled,
+        "Docker Compose": compose_available or not qdrant_enabled,
+        "Docker Daemon / Qdrant Compose": docker_daemon_available,
+        "Obsidian Vault": vault.is_dir() and os.access(vault, os.R_OK | os.W_OK),
+        "Workspace": workspace.is_dir() and os.access(workspace, os.R_OK | os.W_OK),
+        "Logs Directory": log_dir.is_dir() and os.access(log_dir, os.W_OK),
+        "Qdrant": _component_health(orchestrator.qdrant.health, enabled=qdrant_enabled)
+        in {"available", "disabled"},
+        "API Service": service["state"] == "running" and service["ready"],
     }
-    try:
-        with socket.create_connection(
-            (
-                conf.data.get("api", {}).get("host", "127.0.0.1"),
-                conf.data.get("api", {}).get("port", 8080),
-            ),
-            timeout=0.2,
-        ):
-            port_free = False
-    except OSError:
-        port_free = True
-    checks["API Port Available"] = port_free
+    checks.update(
+        {f"Provider {name}": state == "available" for name, state in providers.items()}
+    )
+    if service["state"] == "running" and service["ready"]:
+        port_available = True
+    else:
+        try:
+            with socket.create_connection(
+                (
+                    conf.data.get("api", {}).get("host", "127.0.0.1"),
+                    conf.data.get("api", {}).get("port", 8080),
+                ),
+                timeout=0.2,
+            ):
+                port_available = False
+        except OSError:
+            port_available = True
+    checks["API Port Available"] = port_available
+    checks["API Service"] = service["state"] in {"stopped", "stale"} or (
+        service["state"] == "running" and service["ready"]
+    )
     for label, ok in checks.items():
         typer.echo(f"{'✓' if ok else '✗'} {label}")
     if not all(checks.values()):

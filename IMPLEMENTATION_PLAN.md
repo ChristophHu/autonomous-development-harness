@@ -1,5 +1,11 @@
 # Weiterer Implementierungsplan zur GAP_MATRIX
 
+## Abgeschlossenes Paket OPS1 – CLI-Service-Lifecycle und Diagnostik (Punkte 80–83)
+
+Der CLI-Lifecycle ist auf `ServiceLifecycle` vereinheitlicht. PID-Datensätze sind schema-validiert, atomar geschrieben und enthalten nur einen SHA-256-Fingerprint aus Prozessstartzeit/Kommando statt Klartext-Prozessdaten. Ein exklusiver Lock verhindert parallele Starts. `start` meldet READY erst nach Uvicorn-Startup und erfolgreichem Harness-Healthcheck und entfernt seinen PID-Eintrag beim Ende oder Startfehler. `stop` verifiziert vor SIGTERM die Prozessidentität, wartet begrenzt auf Ende und löscht keine zwischenzeitlich ersetzte PID-Datei. `status` liest SQLite ausschließlich über `mode=ro` und meldet Task-/Provider-/Servicezustände. `doctor` liefert fail-safe Prüfungen für Runtime, Konfiguration, lokale Verzeichnisrechte, optionale Docker-/Qdrant-Voraussetzungen, Port und Provider. TDD deckt PID-Reuse, ungültige/stale Einträge, Lock, atomare Dateirechte, Readiness, Timeout und Diagnosefehler ab. Native `sh scripts/verify.sh`: **922 passed**, 100 % Statements/Branches/Funktionen (5792 Statements/2048 Branches, 34 Module/445 Funktionen), Ruff und Formatcheck.
+
+Matrixstatus: 81–83 erfüllt; 80 teilweise, da eine explizite Provider-/Abhängigkeitsübersicht als `start`-Preflight fehlt. Punkt 79 (restliche CLI-Funktionsbreite) bleibt teilweise.
+
 ## Abgeschlossenes Paket E2 – Plan-/Diff-/Git-Abgleich
 
 Validator gleicht Plan und Executor-Ergebnisse ab, verifiziert Mutationsclaims gegen Tool-Evidenz und read-only Git-Statusdelta und bindet Pfade an Workspace sowie deklarierte `write_paths`. Git-Root/Branch/HEAD und relevante Statuspfade werden vor/nach Execute gelesen; unerwartete Änderungen und Identitätswechsel blockieren Completion. Native Abnahme: **863 Tests**, 100 % Statements/Branches/Funktionen (33 Module/414 Funktionen), Ruff und Formatcheck. Noch offen bleiben der semantische Diff-Hunk-/Requirementsabgleich sowie persistente Correction-Workitems.

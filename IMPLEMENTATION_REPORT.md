@@ -1,5 +1,13 @@
 # Implementierungsstand und Nachweise
 
+## Aktuelle Runde – OPS1 CLI-Service-Lifecycle und Diagnostik (Punkte 80–83)
+
+`ServiceLifecycle` validiert PID-Dateien strikt und verhindert parallele Starts per exklusivem Lock. Ein Eintrag enthält PID, lokale API-Adresse, Startzeit und einen SHA-256-Prozessfingerprint; Prozess-Kommandozeilen werden nicht persistiert. Die PID-Datei wird atomar angelegt und auf Modus 0600 gesetzt. `start` bestätigt READY erst, wenn Uvicorn gestartet ist und `/health` die erwartete Harness-Antwort liefert; beim Ende sowie bei einem Fehler wird ausschließlich der eigene unveränderte Eintrag entfernt.
+
+`stop` sendet SIGTERM erst nach erneutem Fingerprintvergleich und wartet innerhalb eines Zeitlimits auf das Ende desselben Prozesses. Ein stale Datensatz darf entfernt werden; eine wiederverwendete PID oder ein veränderter Datensatz wird nicht signalisiert/gelöscht. `status` zeigt Lifecycle-/Readinesszustand, SQLite-`quick_check` über eine Read-only-Verbindung, Obsidian-Vault, optionales Qdrant, 14 Taskzustände und Provider-Health. `doctor` prüft Plattform, Config, SQLite, Git, optional Docker/Compose/Daemon/Qdrant, Rechte von Workspace/Vault/Logs, API-Port/-Service und Provider. Provider- und externe Diagnosen sind fail-safe.
+
+TDD umfasst Prozessidentität, tote/nicht prüfbare Prozesse, fehlerhafte/stale/PID-reused Records, atomare Dateirechte, Start-Lock, unveränderte Record-Bereinigung, Readiness-Healthpayload und Größenlimit, graceful Stop, Timeout sowie Doctor-/Provider-/Docker-/Portfehler. Die beiden OPS1-Produktionsmodule sind gezielt mit 100 % Statements und Branches geprüft. Native `sh scripts/verify.sh`: **922 passed**, 100 % Statements und Branches (5792 Statements/2048 Branches), 100 % Funktionen (34 Module/445 Funktionen), Ruff und Formatcheck bestanden. Matrix: Punkte 81–83 erfüllt; Punkt 80 teilweise, da `start` noch keinen vollständigen Provider-/Abhängigkeits-Preflight ausgibt; Punkt 79 unverändert teilweise.
+
 ## Aktuelle Runde – E4b Correction-Loop-Anbindung (Punkte 17/47/51/99 vertieft)
 
 `CorrectionFinding` ist der typisierte Validatorvertrag mit Kategorie, Quelle, stabiler Regel-ID, Meldung, optionalem Subtask/Pfaden sowie Evidenz/Erwartung. `EvidenceValidator` erzeugt Befunde an den jeweiligen Prüfpfaden (Execution, Plan, Workspace, Tests, Coverage, Acceptance, Human-Input und unabhängiger Review); die Kompatibilitätsfelder `errors`/`required_corrections` bleiben erhalten. Die Zuordnung beruht nicht auf Freitext-Parsing.
