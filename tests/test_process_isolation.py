@@ -18,6 +18,55 @@ def test_profile_confines_descendants_and_metadata(tmp_path):
     assert command[3:] == [sys.executable, "-c", "pass"]
 
 
+def test_restricted_mcp_profile_lists_read_roots_without_global_read(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    command = isolated_command(
+        [sys.executable, "-c", "pass"],
+        workspace,
+        read_only=True,
+        read_roots=(workspace,),
+    )
+    assert '(deny file-read-data (subpath "/Users"))' in command[2]
+    assert '(deny file-read-data (subpath "/private/var/folders"))' in command[2]
+    assert "(allow file-read-data (subpath " in command[2]
+    assert str(workspace) in command[2]
+    with pytest.raises(PermissionError):
+        isolated_command(
+            [sys.executable], workspace, read_roots=(tmp_path / "missing",)
+        )
+    with pytest.raises(PermissionError):
+        isolated_command([sys.executable], workspace, read_roots=("relative",))
+
+
+def test_native_restricted_mcp_profile_denies_outside_read(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "allowed.txt").write_text("allowed")
+    outside = tmp_path / "private.txt"
+    outside.write_text("secret")
+    code = (
+        "from pathlib import Path; "
+        "print(Path('allowed.txt').read_text()); "
+        f"Path({str(outside)!r}).read_text()"
+    )
+    result = subprocess.run(
+        isolated_command(
+            [sys.executable, "-c", code],
+            workspace,
+            read_only=True,
+            read_roots=(workspace, sys.prefix),
+        ),
+        cwd=workspace,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert result.stdout.strip() == "allowed"
+    assert "secret" not in result.stdout
+
+
 def test_unsupported_host_fails_closed(tmp_path, monkeypatch):
     monkeypatch.setattr("harness.isolation.sys.platform", "linux")
     with pytest.raises(PermissionError, match="macOS"):

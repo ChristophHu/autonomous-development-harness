@@ -88,6 +88,7 @@ class MemorySettings(ExtensibleSettings):
 
 class ProviderSettings(ExtensibleSettings):
     enabled: StrictBool = False
+    kind: Literal["openai_compatible", "lmstudio"] = "openai_compatible"
     base_url: StrictStr | None = None
     model: StrictStr | None = None
     timeout: TimeoutValue = 120
@@ -238,11 +239,12 @@ class MCPServerSettings(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     enabled: StrictBool = True
-    builtin: Literal["filesystem"] | None = None
+    builtin: Literal["filesystem", "obsidian"] | None = None
     command: list[StrictStr] = Field(default_factory=list)
     allow_tools: list[StrictStr] = Field(default_factory=list)
     read_only: StrictBool = True
     allow_delete: StrictBool = False
+    trusted_local: StrictBool = False
     timeout: Annotated[Number, Field(gt=0, le=30)] = 10
 
     @model_validator(mode="after")
@@ -253,8 +255,16 @@ class MCPServerSettings(BaseModel):
             raise ValueError("builtin MCP tools are fixed")
         if not self.builtin and not self.allow_tools:
             raise ValueError("external MCP server needs an explicit tool allowlist")
+        if self.builtin is None and not self.trusted_local:
+            raise ValueError(
+                "external MCP server needs explicit trusted_local acknowledgement"
+            )
+        if self.builtin and self.trusted_local:
+            raise ValueError("builtin MCP server must not use trusted_local")
         if self.read_only and self.allow_delete:
             raise ValueError("read-only MCP server cannot delete")
+        if self.builtin == "obsidian" and not self.read_only:
+            raise ValueError("Obsidian MCP server is read-only")
         return self
 
 

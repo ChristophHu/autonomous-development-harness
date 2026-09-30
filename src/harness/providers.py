@@ -34,6 +34,37 @@ class ProviderError(RuntimeError):
     pass
 
 
+@dataclass(frozen=True)
+class ProviderHealth:
+    kind: str
+    reachable: bool
+    api_available: bool
+    models: tuple[str, ...] = ()
+    loaded_models: tuple[str, ...] | None = None
+    configured_model: str | None = None
+
+    @property
+    def status(self):
+        if not self.reachable:
+            return "unreachable"
+        if not self.api_available:
+            return "api_unavailable"
+        if not self.models:
+            return "no_models"
+        if self.kind == "lmstudio":
+            if self.loaded_models is None:
+                return "loaded_state_unknown"
+            if not self.loaded_models:
+                return "not_loaded"
+        if self.configured_model and not self.model_available(self.configured_model):
+            return "configured_model_unavailable"
+        return "available"
+
+    def model_available(self, model_id):
+        available = self.loaded_models if self.kind == "lmstudio" else self.models
+        return model_id in available if available is not None else False
+
+
 class OpenAICompatibleProvider:
     def __init__(
         self,
@@ -44,9 +75,15 @@ class OpenAICompatibleProvider:
         transport=None,
         timeout=120,
         retry=None,
+        kind="openai_compatible",
     ):
+        if kind not in {"openai_compatible", "lmstudio"}:
+            raise ValueError("unsupported provider kind")
+        if kind == "lmstudio" and not base_url.rstrip("/").endswith("/v1"):
+            raise ValueError("LM Studio base URL must end in /v1")
         self.name = name
         self.base_url = base_url.rstrip("/")
+        self.kind = kind
         self.api_key = api_key
         self.model = model
         self.client = httpx.Client(transport=transport)
@@ -63,18 +100,93 @@ class OpenAICompatibleProvider:
         return {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
 
     def health(self):
+        return self.health_report().status == "available"
+
+    @staticmethod
+    def _model_ids(response):
         try:
-            return request(
+            entries = response.json()["data"]
+            if not isinstance(entries, list) or not all(
+                isinstance(item, dict)
+                and isinstance(item.get("id"), str)
+                and item["id"].strip()
+                and not any(char in item["id"] for char in "\r\n\t")
+                for item in entries
+            ):
+                raise ValueError("invalid inventory")
+            return tuple(item["id"] for item in entries)
+        except (KeyError, TypeError, ValueError) as error:
+            raise ProviderError("invalid model inventory") from error
+
+    @staticmethod
+    def _loaded_ids(response):
+        try:
+            entries = response.json()["models"]
+            if not isinstance(entries, list):
+                raise ValueError("invalid native inventory")  # noqa: TRY004
+            loaded = set()
+            for item in entries:
+                if (
+                    not isinstance(item, dict)
+                    or not isinstance(item.get("key"), str)
+                    or item.get("type") not in {"llm", "embedding"}
+                    or not isinstance(item.get("loaded_instances"), list)
+                ):
+                    raise ValueError("invalid native inventory")
+                instances = item["loaded_instances"]
+                if not all(
+                    isinstance(instance, dict) and isinstance(instance.get("id"), str)
+                    for instance in instances
+                ):
+                    raise ValueError("invalid native inventory")
+                if item["type"] == "llm" and instances:
+                    loaded.add(item["key"])
+            return tuple(sorted(loaded))
+        except (KeyError, TypeError, ValueError) as error:
+            raise ProviderError("invalid native model inventory") from error
+
+    def health_report(self):
+        report = ProviderHealth(self.kind, False, False, configured_model=self.model)
+        try:
+            response = request(
                 "GET",
                 f"{self.base_url}/models",
                 client=self.client,
                 transport=self.transport,
                 owned_client=True,
                 headers=self.headers(),
-                timeout=5,
-            ).is_success
+                timeout=2.5 if self.kind == "lmstudio" else 5,
+            )
         except httpx.HTTPError:
-            return False
+            return report
+        if not response.is_success:
+            return ProviderHealth(self.kind, True, False, configured_model=self.model)
+        try:
+            models = self._model_ids(response)
+        except ProviderError:
+            return ProviderHealth(self.kind, True, False, configured_model=self.model)
+        if self.kind != "lmstudio" or not models:
+            return ProviderHealth(
+                self.kind, True, True, models, configured_model=self.model
+            )
+        try:
+            native = request(
+                "GET",
+                f"{self.base_url[:-3]}/api/v1/models",
+                client=self.client,
+                transport=self.transport,
+                owned_client=True,
+                headers=self.headers(),
+                timeout=2.5,
+            )
+            loaded = (
+                tuple(sorted(set(self._loaded_ids(native)) & set(models)))
+                if native.is_success
+                else None
+            )
+        except (httpx.HTTPError, ProviderError):
+            loaded = None
+        return ProviderHealth(self.kind, True, True, models, loaded, self.model)
 
     def models(self):
         r = request(
@@ -88,7 +200,7 @@ class OpenAICompatibleProvider:
         )
         if not r.is_success:
             raise ProviderError(f"{self.name}: {r.status_code}")
-        return [x.get("id") for x in r.json().get("data", [])]
+        return list(self._model_ids(r))
 
     def complete(self, prompt, model=None, tools=None):
         selected = model or self.model

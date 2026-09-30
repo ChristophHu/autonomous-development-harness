@@ -142,6 +142,7 @@ class ModelRegistry:
         self.config = config
         self.providers = {}
         self.models = config.data.get("models", {}).get("registry", {})
+        self.discovered = {}
         for name, data in config.data.get("models", {}).get("providers", {}).items():
             if data.get("enabled"):
                 self.providers[name] = OpenAICompatibleProvider(
@@ -152,15 +153,38 @@ class ModelRegistry:
                     or config.data.get("secrets", {}).get(f"{name.upper()}_MODEL"),
                     timeout=data.get("timeout", 120),
                     retry=data.get("retry"),
+                    kind=data.get("kind", "openai_compatible"),
                 )
 
     def register(self, name: str, provider: ModelProvider):
         self.providers[name] = provider
+        self.discovered.pop(name, None)
 
     def get(self, name: str):
         if name not in self.providers:
             raise ValueError(f"unknown or disabled provider: {name}")
         return self.providers[name]
+
+    def discover(self, name: str):
+        provider = self.get(name)
+        self.discovered[name] = ()
+        if not hasattr(provider, "models"):
+            return ()
+        inventory = provider.models()
+        if not isinstance(inventory, (list, tuple)):
+            raise ValueError("invalid model inventory")  # noqa: TRY004
+        names = set()
+        for item in inventory:
+            if item is None or item == "":
+                continue
+            if not isinstance(item, str) or any(char in item for char in "\r\n\t"):
+                raise ValueError("invalid model inventory")
+            model_id = item.strip()
+            if model_id:
+                names.add(model_id)
+        snapshot = tuple(sorted(names))
+        self.discovered[name] = snapshot
+        return snapshot
 
     def resolve(self, name, needs_tools=False):
         definition = self.models.get(name)
@@ -171,7 +195,17 @@ class ModelRegistry:
             if not model:
                 raise ValueError(f"model {name} has no model ID")
             return self.get(definition["provider"]), model
-        return self.get(name), None
+        provider = self.get(name)
+        if getattr(provider, "model", None):
+            return provider, None
+        discovered = self.discovered.get(name)
+        if discovered is None:
+            discovered = self.discover(name)
+        if len(discovered) > 1:
+            raise ValueError("multiple discovered models need explicit configuration")
+        if discovered and needs_tools:
+            raise ValueError("discovered model capabilities are unknown")
+        return provider, discovered[0] if discovered else None
 
 
 class AgentProfile(BaseModel):

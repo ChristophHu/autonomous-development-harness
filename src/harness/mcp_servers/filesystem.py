@@ -308,7 +308,16 @@ class FilesystemServer:
         return {"deleted": True}
 
 
-def _response(server, message):
+def _response(
+    server,
+    message,
+    *,
+    tools=TOOLS,
+    outputs=OUTPUTS,
+    server_name="harness-filesystem",
+    description_prefix="Workspace",
+    error_text="filesystem operation failed",
+):
     if not isinstance(message, dict):
         return None
     method = message.get("method")
@@ -334,18 +343,18 @@ def _response(server, message):
             "result": {
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "harness-filesystem", "version": "0.1.0"},
+                "serverInfo": {"name": server_name, "version": "0.1.0"},
             },
         }
     if method == "tools/list":
         tools = [
             {
                 "name": name,
-                "description": f"Workspace {name}",
+                "description": f"{description_prefix} {name}",
                 "inputSchema": schema,
-                "outputSchema": OUTPUTS[name],
+                "outputSchema": outputs[name],
             }
-            for name, schema in TOOLS.items()
+            for name, schema in tools.items()
         ]
         return {"jsonrpc": "2.0", "id": identifier, "result": {"tools": tools}}
     if method == "tools/call":
@@ -359,9 +368,7 @@ def _response(server, message):
                 "jsonrpc": "2.0",
                 "id": identifier,
                 "result": {
-                    "content": [
-                        {"type": "text", "text": "filesystem operation failed"}
-                    ],
+                    "content": [{"type": "text", "text": error_text}],
                     "isError": True,
                 },
             }
@@ -381,6 +388,19 @@ def _response(server, message):
     }
 
 
+def serve_stdio(server, responder=_response):
+    for line in sys.stdin.buffer:
+        if len(line) > MAX_MESSAGE:
+            break
+        try:
+            response = responder(server, json.loads(line))
+        except (ValueError, TypeError):
+            response = None
+        if response is not None:
+            sys.stdout.write(json.dumps(response, separators=(",", ":")) + "\n")
+            sys.stdout.flush()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("workspace")
@@ -390,16 +410,7 @@ def main():
     server = FilesystemServer(
         args.workspace, read_only=args.read_only, allow_delete=args.allow_delete
     )
-    for line in sys.stdin.buffer:
-        if len(line) > MAX_MESSAGE:
-            break
-        try:
-            response = _response(server, json.loads(line))
-        except (ValueError, TypeError):
-            response = None
-        if response is not None:
-            sys.stdout.write(json.dumps(response, separators=(",", ":")) + "\n")
-            sys.stdout.flush()
+    serve_stdio(server)
 
 
 if __name__ == "__main__":

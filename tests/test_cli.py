@@ -5,6 +5,7 @@ import pytest
 
 from harness import cli
 from harness.core import Config, Orchestrator, Store, Task
+from harness.providers import ProviderHealth
 from harness.service_lifecycle import ServiceLifecycle
 
 
@@ -758,6 +759,7 @@ def test_model_discovery_and_status_use_provider_contracts(harness_context, caps
     assert "local\tavailable" in output
     assert "fixture-v2" in output
     assert "fixture-v1\tlocal\tcoding-model" in output
+    assert orchestrator.models.discovered["local"] == ("fixture-v1", "fixture-v2")
     cli.status()
     assert "Provider local: available" in capsys.readouterr().out
 
@@ -838,6 +840,82 @@ def test_model_inventory_reports_unknown_provider_without_secret_or_prompt(
     cli.model_list()
     output = capsys.readouterr().out
     assert "vendor-v1\tabsent\tremote-model\tpremium\tunavailable" in output
+
+
+def test_lmstudio_health_report_drives_inventory_status_and_preflight(
+    harness_context, capsys, monkeypatch
+):
+    cfg, store, orchestrator, _ = harness_context
+    cfg.data["models"]["providers"] = {"local": {"enabled": True}}
+    orchestrator.models.providers.clear()
+    report = ProviderHealth(
+        "lmstudio", True, True, ("loaded", "downloaded"), ("loaded",)
+    )
+    probes = []
+    orchestrator.models.register(
+        "local",
+        SimpleNamespace(
+            health_report=lambda: probes.append(True) or report,
+            health=lambda: pytest.fail("legacy health called"),
+            models=lambda: pytest.fail("duplicate discovery called"),
+        ),
+    )
+    orchestrator.models.models = {
+        "chosen": {"provider": "local", "model": "loaded", "tier": "local"},
+        "cold": {"provider": "local", "model": "downloaded", "tier": "local"},
+    }
+    cfg.data["models"]["registry"] = orchestrator.models.models
+    cfg.data["profiles"] = {"planner": {"model": {"primary": "chosen"}}}
+    cli.model_list()
+    output = capsys.readouterr().out
+    assert "local\tavailable" in output
+    assert "loaded\tlocal\tchosen\tlocal\tavailable" in output
+    assert "downloaded\tlocal\tcold\tlocal\tunavailable" in output
+    assert orchestrator.models.discovered["local"] == ("downloaded", "loaded")
+    assert cli._provider_health(orchestrator.models.providers) == {"local": "available"}
+    monkeypatch.setattr(cli, "_config_health", lambda _conf: True)
+    monkeypatch.setattr(cli, "_sqlite_health", lambda _store: "available")
+    checks = cli._start_preflight(cfg, store, orchestrator)
+    assert (
+        next(c for c in checks if c["name"] == "Provider local")["status"]
+        == "available"
+    )
+    cli.status()
+    assert "Provider local: available" in capsys.readouterr().out
+    assert len(probes) == 4
+    report = ProviderHealth("lmstudio", True, True, ("loaded",), ())
+    assert cli._provider_health(orchestrator.models.providers) == {
+        "local": "not_loaded"
+    }
+    checks = cli._start_preflight(cfg, store, orchestrator)
+    assert (
+        next(c for c in checks if c["name"] == "Provider local")["status"]
+        == "not_loaded"
+    )
+    cli.model_status()
+    assert "loaded\tlocal\tchosen\tlocal\tunavailable" in capsys.readouterr().out
+    with pytest.raises(cli.typer.Exit):
+        cli.doctor()
+    assert "Provider local status: not_loaded" in capsys.readouterr().out
+    report = ProviderHealth("lmstudio", True, False)
+    cli.model_list()
+    assert "local\t<discovery failed>" in capsys.readouterr().out
+
+
+def test_failed_health_report_is_redacted(harness_context, capsys):
+    _cfg, _store, orchestrator, _ = harness_context
+    orchestrator.models.providers.clear()
+    orchestrator.models.register(
+        "local",
+        SimpleNamespace(
+            health_report=lambda: (_ for _ in ()).throw(RuntimeError("private")),
+            models=lambda: ["downloaded"],
+        ),
+    )
+    cli.model_list()
+    output = capsys.readouterr().out
+    assert "local\tunavailable" in output
+    assert "private" not in output
 
 
 def test_cli_command_groups_match_prompt_contract():

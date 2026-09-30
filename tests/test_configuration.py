@@ -43,6 +43,17 @@ def test_complete_example_config_is_valid_and_has_specified_sections(tmp_path):
     assert ConfigurationService(sample).validate()
 
 
+def test_provider_kind_is_explicit_and_validated():
+    settings = HarnessConfig.model_validate(
+        {"models": {"providers": {"local": {"kind": "lmstudio"}}}}
+    )
+    assert settings.models.providers["local"].kind == "lmstudio"
+    with pytest.raises(ValidationError):
+        HarnessConfig.model_validate(
+            {"models": {"providers": {"local": {"kind": "unknown"}}}}
+        )
+
+
 @pytest.mark.parametrize(
     "payload,path",
     [

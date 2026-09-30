@@ -23,6 +23,7 @@ from pydantic import ValidationError as PydanticValidationError
 
 from .core import ROOT, Config, Task, build
 from .docker_broker import DockerComposeBroker
+from .providers import ProviderHealth
 from .security import SecretResolver
 from .service_lifecycle import ServiceLifecycle
 
@@ -108,9 +109,28 @@ def _sqlite_health(store):
 
 def _provider_health(providers):
     return {
-        name: _component_health(provider.health)
+        name: _provider_status(_provider_probe(provider))
         for name, provider in sorted(providers.items())
     }
+
+
+def _provider_probe(provider):
+    if hasattr(provider, "health_report"):
+        try:
+            return provider.health_report()
+        except (OSError, RuntimeError, ValueError, TypeError, httpx.HTTPError):
+            return "unavailable"
+    return _component_health(provider.health)
+
+
+def _provider_status(report):
+    return report.status if isinstance(report, ProviderHealth) else report
+
+
+def _model_available(report, model_id, discovered):
+    if isinstance(report, ProviderHealth):
+        return report.model_available(model_id)
+    return report == "available" and model_id in discovered
 
 
 def _config_health(conf):
@@ -164,12 +184,13 @@ def _start_preflight(conf, store, orchestrator, *, provider_timeout=5.0):
     results = {}
     executor = ThreadPoolExecutor(max_workers=max(1, min(len(probes), 8)))
     futures = {
-        executor.submit(_component_health, item.health): name
-        for name, item in probes.items()
+        executor.submit(_provider_probe, item): name for name, item in probes.items()
     }
     try:
         completed, pending = wait(futures, timeout=provider_timeout)
-        results.update({futures[future]: future.result() for future in completed})
+        for future in completed:
+            result = future.result()
+            results[futures[future]] = _provider_status(result)
         for future in pending:
             future.cancel()
             results[futures[future]] = "unavailable"
@@ -305,7 +326,8 @@ def status():
     for name, count in counts.items():
         typer.echo(f"{name}: {count}")
     for name, provider in orchestrator.models.providers.items():
-        typer.echo(f"Provider {name}: {_component_health(provider.health)}")
+        report = _provider_probe(provider)
+        typer.echo(f"Provider {name}: {_provider_status(report)}")
 
 
 @app.command()
@@ -384,6 +406,8 @@ def doctor():
     )
     for label, ok in checks.items():
         typer.echo(f"{'✓' if ok else '✗'} {label}")
+    for name, state in providers.items():
+        typer.echo(f"Provider {name} status: {state}")
     if not all(checks.values()):
         raise typer.Exit(1)
 
@@ -594,23 +618,25 @@ def _watch_task_events(conf, task_id: int):
 @models.command("list")
 def model_list():
     _, _, orchestrator = build()
-    providers = orchestrator.models.providers
-    definitions = orchestrator.models.models
+    registry = orchestrator.models
+    providers = registry.providers
+    definitions = registry.models
     names = set(providers) | {item.get("provider") for item in definitions.values()}
     for name in sorted(item for item in names if isinstance(item, str)):
         provider = providers.get(name)
-        try:
-            available = bool(provider and provider.health())
-        except (OSError, RuntimeError, ValueError):
-            available = False
-        typer.echo(f"{name}\t{'available' if available else 'unavailable'}")
+        report = _provider_probe(provider) if provider is not None else "unavailable"
+        state = _provider_status(report)
+        typer.echo(f"{name}\t{state}")
         discovered = []
-        if provider is not None:
+        if isinstance(report, ProviderHealth):
+            discovered = report.models
+            registry.discovered[name] = tuple(sorted(set(discovered)))
+            if not report.api_available:
+                typer.echo(f"{name}\t<discovery failed>")
+        elif provider is not None:
             try:
-                discovered = [
-                    item for item in provider.models() if isinstance(item, str) and item
-                ]
-            except (OSError, RuntimeError, ValueError):
+                discovered = registry.discover(name)
+            except (OSError, RuntimeError, ValueError, httpx.HTTPError):
                 typer.echo(f"{name}\t<discovery failed>")
         configured = {
             alias: item
@@ -620,16 +646,21 @@ def model_list():
         for alias, item in sorted(configured.items()):
             model_id = item.get("model") or "-"
             tier = item.get("tier") or "-"
-            state = (
-                "available" if available and model_id in discovered else "unavailable"
+            model_state = (
+                "available"
+                if _model_available(report, model_id, discovered)
+                else "unavailable"
             )
-            typer.echo(f"{model_id}\t{name}\t{alias}\t{tier}\t{state}")
+            typer.echo(f"{model_id}\t{name}\t{alias}\t{tier}\t{model_state}")
         for model_id in sorted(
             set(discovered) - {item.get("model") for item in configured.values()}
         ):
-            typer.echo(
-                f"{model_id}\t{name}\t-\t-\t{'available' if available else 'unavailable'}"
+            model_state = (
+                "available"
+                if _model_available(report, model_id, discovered)
+                else "unavailable"
             )
+            typer.echo(f"{model_id}\t{name}\t-\t-\t{model_state}")
 
 
 @models.command("status")

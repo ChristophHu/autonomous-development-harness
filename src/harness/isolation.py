@@ -96,6 +96,7 @@ def isolated_command(
     network_remotes=(),
     unix_sockets=(),
     git_shell=False,
+    read_roots=None,
 ):
     if sys.platform != "darwin":
         raise PermissionError("process isolation requires macOS sandbox-exec")
@@ -111,6 +112,20 @@ def isolated_command(
         "(allow file-read*)",
         '(allow file-write* (literal "/dev/null"))',
     ]
+    if read_roots is not None:
+        for protected in ("/Users", "/private/var/folders", "/private/tmp", "/Volumes"):
+            rules.append(f"(deny file-read-data (subpath {json.dumps(protected)}))")
+        for path in read_roots:
+            candidate = Path(path)
+            if not candidate.is_absolute():
+                raise PermissionError("MCP read root must be absolute")
+            try:
+                candidate = candidate.resolve(strict=True)
+            except OSError as error:
+                raise PermissionError("MCP read root is unavailable") from error
+            rules.append(
+                f"(allow file-read-data (subpath {json.dumps(str(candidate))}))"
+            )
     if not read_only:
         rules.append(f"(allow file-write* (subpath {json.dumps(str(root))}))")
     if git:

@@ -34,6 +34,233 @@ def test_builtin_server_lives_in_dedicated_installable_package(tmp_path):
     assert builtin_filesystem_command(tmp_path)[2] == ("harness.mcp_servers.filesystem")
 
 
+def test_external_server_requires_explicit_trusted_local_acknowledgement():
+    with pytest.raises(ValidationError):
+        HarnessConfig.model_validate(
+            {
+                "tools": {
+                    "mcp": {
+                        "servers": {
+                            "external": {
+                                "command": ["/bin/echo"],
+                                "allow_tools": ["echo"],
+                            }
+                        }
+                    }
+                }
+            }
+        )
+    settings = HarnessConfig.model_validate(
+        {
+            "tools": {
+                "mcp": {
+                    "servers": {
+                        "external": {
+                            "command": ["/bin/echo"],
+                            "allow_tools": ["echo"],
+                            "trusted_local": True,
+                        }
+                    }
+                }
+            }
+        }
+    )
+    assert settings.tools.mcp.servers["external"].trusted_local
+
+
+def test_obsidian_server_reads_only_visible_markdown_in_vault(tmp_path):
+    from harness.mcp_servers.obsidian import ObsidianServer
+
+    vault = tmp_path / "vault"
+    (vault / "notes").mkdir(parents=True)
+    (vault / "notes" / "a.md").write_text("alpha decision")
+    (vault / "notes" / "b.md").write_text("beta decision")
+    (vault / "notes" / "raw.txt").write_text("private")
+    (vault / ".obsidian").mkdir()
+    (vault / ".obsidian" / "hidden.md").write_text("private")
+    (vault / "notes" / "link.md").symlink_to(tmp_path / "outside.md")
+    server = ObsidianServer(vault)
+    assert server.call("list_notes", {"limit": 1}) == {"notes": ["notes/a.md"]}
+    assert server.call("read_note", {"path": "notes/a.md"}) == {
+        "content": "alpha decision"
+    }
+    assert server.call("search_notes", {"query": "decision"}) == {
+        "matches": ["notes/a.md", "notes/b.md"]
+    }
+    for path in (
+        "../outside.md",
+        ".obsidian/hidden.md",
+        "notes/raw.txt",
+        "notes/link.md",
+    ):
+        with pytest.raises((ValueError, PermissionError, OSError)):
+            server.call("read_note", {"path": path})
+    with pytest.raises(ValueError):
+        server.call("read_note", {"path": "."})
+    with pytest.raises(ValueError):
+        server.call("write_note", {"path": "notes/a.md", "content": "bad"})
+
+
+def test_obsidian_server_protocol_limits_and_binary_skip(tmp_path, monkeypatch):
+    from harness.mcp_servers import obsidian
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "a.md").write_text("needle")
+    (vault / "b.md").write_bytes(b"\xff")
+    (vault / "hidden").mkdir()
+    (vault / "hidden" / "c.md").write_text("needle")
+    (vault / "alias").symlink_to(vault / "hidden", target_is_directory=True)
+    server = obsidian.ObsidianServer(vault)
+    assert server.call("search_notes", {"query": "needle", "limit": 1}) == {
+        "matches": ["a.md"]
+    }
+    assert server.call("search_notes", {"query": "other"}) == {"matches": []}
+    assert server.call("list_notes", {}) == {"notes": ["a.md", "b.md", "hidden/c.md"]}
+    with pytest.raises(JsonSchemaValidationError):
+        server.call("search_notes", {"query": "x", "limit": 101})
+    with pytest.raises(ValueError):
+        obsidian.ObsidianServer(tmp_path.anchor)
+    initialized = obsidian._response(
+        server,
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"protocolVersion": "2025-11-25"},
+        },
+    )
+    assert initialized["result"]["serverInfo"]["name"] == "harness-obsidian"
+    tools = obsidian._response(
+        server, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}
+    )
+    assert {item["name"] for item in tools["result"]["tools"]} == obsidian.READ_TOOLS
+    failed = obsidian._response(
+        server,
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {"name": "read_note", "arguments": {"path": "b.md"}},
+        },
+    )
+    assert failed["result"]["isError"]
+    assert "needle" not in str(failed)
+    monkeypatch.setattr(obsidian, "MAX_SCAN", 1)
+    with pytest.raises(ValueError, match="scan limit"):
+        server.call("list_notes", {})
+
+
+def test_obsidian_stdio_entrypoint(tmp_path, monkeypatch):
+    from harness.mcp_servers import obsidian
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "note.md").write_text("hello")
+    message = json.dumps({"jsonrpc": "2.0", "id": 4, "method": "tools/list"}).encode()
+    output = StringIO()
+    monkeypatch.setattr(sys, "argv", ["harness-obsidian-mcp", str(vault)])
+    monkeypatch.setattr(sys, "stdin", SimpleNamespace(buffer=BytesIO(message + b"\n")))
+    monkeypatch.setattr(sys, "stdout", output)
+    obsidian.main()
+    assert len(json.loads(output.getvalue())["result"]["tools"]) == 3
+    monkeypatch.setattr(sys, "stdin", SimpleNamespace(buffer=BytesIO(message + b"\n")))
+    second = StringIO()
+    monkeypatch.setattr(sys, "stdout", second)
+    monkeypatch.delitem(sys.modules, "harness.mcp_servers.obsidian")
+    runpy.run_module("harness.mcp_servers.obsidian", run_name="__main__")
+    assert len(json.loads(second.getvalue())["result"]["tools"]) == 3
+
+
+def test_obsidian_registry_rejects_unexpected_builtin_tool(tmp_path, monkeypatch):
+    from harness import mcp
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    config = Config()
+    config.data["paths"]["obsidian_vault"] = str(vault)
+    config.data["tools"] = {"mcp": {"servers": {"vault": {"builtin": "obsidian"}}}}
+    monkeypatch.setattr(
+        mcp,
+        "MCPClient",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            discover=lambda: [{"name": "rogue", "inputSchema": {}}]
+        ),
+    )
+    with pytest.raises(ValueError, match="unknown tool"):
+        ToolRegistry(Permissions(config), workspace=workspace)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS sandbox-exec acceptance")
+def test_native_obsidian_builtin_uses_read_only_vault_profile(tmp_path):
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "note.md").write_text("hello vault")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = Config()
+    config.data["paths"]["obsidian_vault"] = str(vault)
+    config.data["tools"] = {
+        "permissions": {"obsidian": "read"},
+        "mcp": {"servers": {"vault": {"builtin": "obsidian"}}},
+    }
+    registry = ToolRegistry(Permissions(config), workspace=workspace)
+    assert registry.execute("mcp.vault.read_note", {"path": "note.md"}) == {
+        "content": "hello vault"
+    }
+    assert registry.execute("mcp.vault.search_notes", {"query": "hello"}) == {
+        "matches": ["note.md"]
+    }
+
+
+def test_obsidian_builtin_is_read_only_and_profile_gated(tmp_path, monkeypatch):
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "note.md").write_text("memory")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = Config()
+    config.data["paths"]["obsidian_vault"] = str(vault)
+    config.data["tools"] = {
+        "permissions": {"obsidian": "read"},
+        "mcp": {"servers": {"vault": {"builtin": "obsidian"}}},
+    }
+    monkeypatch.setattr(
+        "harness.mcp.isolated_command", lambda command, *_args, **_kwargs: command
+    )
+    registry = ToolRegistry(Permissions(config), workspace=workspace)
+    assert registry.execute("mcp.vault.read_note", {"path": "note.md"}) == {
+        "content": "memory"
+    }
+    assert registry.execute("mcp.vault.list_notes", {}) == {"notes": ["note.md"]}
+    profile = SimpleNamespace(tools=[], permissions=[])
+    with pytest.raises(PermissionError):
+        registry.execute("mcp.vault.read_note", {"path": "note.md"}, profile=profile)
+    with pytest.raises(ValidationError):
+        HarnessConfig.model_validate(
+            {
+                "tools": {
+                    "mcp": {
+                        "servers": {
+                            "vault": {"builtin": "obsidian", "read_only": False}
+                        }
+                    }
+                }
+            }
+        )
+    for unsafe in ({"allow_delete": True}, {"trusted_local": True}):
+        with pytest.raises(ValidationError):
+            HarnessConfig.model_validate(
+                {
+                    "tools": {
+                        "mcp": {"servers": {"vault": {"builtin": "obsidian", **unsafe}}}
+                    }
+                }
+            )
+
+
 def test_filesystem_server_confines_paths_and_separates_permissions(tmp_path):
     root = tmp_path / "workspace"
     root.mkdir()
@@ -666,6 +893,7 @@ def test_external_mcp_requires_explicit_tool_and_write_grant(tmp_path, monkeypat
                 "external": {
                     "command": [sys.executable, "-c", FAKE_SERVER, "ok"],
                     "allow_tools": ["echo"],
+                    "trusted_local": True,
                 }
             }
         },
@@ -786,6 +1014,7 @@ def test_mcp_output_schema_is_enforced_without_exposing_result(tmp_path, monkeyp
                 "external": {
                     "command": [sys.executable, "-c", FAKE_SERVER, "output_mismatch"],
                     "allow_tools": ["echo"],
+                    "trusted_local": True,
                 }
             }
         },

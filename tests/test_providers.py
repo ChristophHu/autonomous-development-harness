@@ -47,6 +47,260 @@ def test_provider_errors_and_health():
         provider.complete("prompt")
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [{"data": "bad"}, {"data": [{"id": 3}]}, {"data": [{"id": "bad\nline"}]}],
+)
+def test_discovery_rejects_malformed_provider_inventory_without_leaking_body(payload):
+    provider = OpenAICompatibleProvider(
+        "local",
+        "http://model/v1",
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, json=payload)
+        ),
+    )
+    with pytest.raises(ProviderError, match="invalid model inventory") as error:
+        provider.models()
+    assert "bad" not in str(error.value)
+
+
+def test_discovery_returns_sorted_provider_ids():
+    provider = OpenAICompatibleProvider(
+        "local",
+        "http://model/v1",
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200, json={"data": [{"id": "z"}, {"id": "a"}]}
+            )
+        ),
+    )
+    assert provider.models() == ["z", "a"]
+
+
+def test_lmstudio_health_distinguishes_downloaded_and_loaded_models():
+    requests = []
+    deadlines = []
+
+    def handler(request):
+        requests.append(str(request.url))
+        deadlines.append(request.extensions["timeout"])
+        if request.url.path == "/v1/models":
+            return httpx.Response(200, json={"data": [{"id": "qwen"}]})
+        return httpx.Response(
+            200,
+            json={
+                "models": [
+                    {"key": "qwen", "type": "llm", "loaded_instances": []},
+                    {
+                        "key": "embed",
+                        "type": "embedding",
+                        "loaded_instances": [{"id": "embed"}],
+                    },
+                ]
+            },
+        )
+
+    provider = OpenAICompatibleProvider(
+        "lmstudio",
+        "http://127.0.0.1:1234/v1",
+        kind="lmstudio",
+        model="qwen",
+        transport=httpx.MockTransport(handler),
+    )
+    report = provider.health_report()
+    assert report.reachable and report.api_available
+    assert report.models == ("qwen",)
+    assert report.loaded_models == ()
+    assert report.status == "not_loaded"
+    assert not report.model_available("qwen")
+    assert not provider.health()
+    assert (
+        requests
+        == [
+            "http://127.0.0.1:1234/v1/models",
+            "http://127.0.0.1:1234/api/v1/models",
+        ]
+        * 2
+    )
+    assert all(limit["connect"] == limit["read"] == 2.5 for limit in deadlines)
+
+
+def test_lmstudio_health_reports_loaded_configured_model():
+    def handler(request):
+        if request.url.path == "/v1/models":
+            return httpx.Response(200, json={"data": [{"id": "qwen"}]})
+        return httpx.Response(
+            200,
+            json={
+                "models": [
+                    {
+                        "key": "qwen",
+                        "type": "llm",
+                        "loaded_instances": [{"id": "qwen"}],
+                    }
+                ]
+            },
+        )
+
+    provider = OpenAICompatibleProvider(
+        "lmstudio",
+        "http://127.0.0.1:1234/v1",
+        kind="lmstudio",
+        model="qwen",
+        transport=httpx.MockTransport(handler),
+    )
+    report = provider.health_report()
+    assert report.status == "available"
+    assert report.model_available("qwen")
+    assert provider.health()
+
+
+def test_lmstudio_loaded_model_must_also_be_visible_to_openai_api():
+    provider = OpenAICompatibleProvider(
+        "lmstudio",
+        "http://127.0.0.1:1234/v1",
+        kind="lmstudio",
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                json={"data": [{"id": "visible"}]}
+                if request.url.path == "/v1/models"
+                else {
+                    "models": [
+                        {
+                            "key": "other",
+                            "type": "llm",
+                            "loaded_instances": [{"id": "other"}],
+                        }
+                    ]
+                },
+            )
+        ),
+    )
+    report = provider.health_report()
+    assert report.models == ("visible",)
+    assert report.loaded_models == ()
+    assert report.status == "not_loaded"
+
+
+@pytest.mark.parametrize(
+    ("first", "second", "expected"),
+    [
+        (httpx.Response(503), None, "api_unavailable"),
+        (httpx.Response(200, json={"wrong": []}), None, "api_unavailable"),
+        (httpx.Response(200, json={"data": []}), None, "no_models"),
+        (
+            httpx.Response(200, json={"data": [{"id": "qwen"}]}),
+            httpx.Response(503),
+            "loaded_state_unknown",
+        ),
+        (
+            httpx.Response(200, json={"data": [{"id": "qwen"}]}),
+            httpx.Response(200, json={"models": "bad"}),
+            "loaded_state_unknown",
+        ),
+    ],
+)
+def test_provider_health_fails_closed_on_api_and_native_errors(first, second, expected):
+    provider = OpenAICompatibleProvider(
+        "lmstudio",
+        "http://127.0.0.1:1234/v1",
+        kind="lmstudio",
+        transport=httpx.MockTransport(
+            lambda request: first if request.url.path == "/v1/models" else second
+        ),
+    )
+    assert provider.health_report().status == expected
+
+
+def test_remote_provider_health_only_needs_valid_nonempty_model_api():
+    provider = OpenAICompatibleProvider(
+        "openai",
+        "https://example.test/v1",
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, json={"data": [{"id": "model"}]})
+        ),
+    )
+    report = provider.health_report()
+    assert report.status == "available"
+    assert report.loaded_models is None
+    assert report.model_available("model")
+
+
+def test_health_report_separates_transport_failure_and_configured_model_absence():
+    def offline(request):
+        raise httpx.ConnectError("private transport detail", request=request)
+
+    provider = OpenAICompatibleProvider(
+        "openai",
+        "https://example.test/v1",
+        transport=httpx.MockTransport(offline),
+    )
+    report = provider.health_report()
+    assert report.status == "unreachable"
+    assert not report.reachable and not provider.health()
+
+    provider = OpenAICompatibleProvider(
+        "openai",
+        "https://example.test/v1",
+        model="configured",
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, json={"data": [{"id": "other"}]})
+        ),
+    )
+    assert provider.health_report().status == "configured_model_unavailable"
+
+
+@pytest.mark.parametrize(
+    "native",
+    [
+        {"models": [42]},
+        {"models": [{"type": "llm", "loaded_instances": []}]},
+        {"models": [{"key": "q", "type": "other", "loaded_instances": []}]},
+        {"models": [{"key": "q", "type": "llm", "loaded_instances": "bad"}]},
+        {"models": [{"key": "q", "type": "llm", "loaded_instances": [42]}]},
+        {"models": [{"key": "q", "type": "llm", "loaded_instances": [{"id": 3}]}]},
+    ],
+)
+def test_lmstudio_invalid_native_inventory_cannot_claim_loaded_model(native):
+    provider = OpenAICompatibleProvider(
+        "lmstudio",
+        "http://127.0.0.1:1234/v1",
+        kind="lmstudio",
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                json={"data": [{"id": "q"}]}
+                if request.url.path == "/v1/models"
+                else native,
+            )
+        ),
+    )
+    report = provider.health_report()
+    assert report.status == "loaded_state_unknown"
+    assert not report.model_available("q")
+
+
+def test_lmstudio_probe_rejects_invalid_kind_url_and_native_transport_failure():
+    with pytest.raises(ValueError, match="kind"):
+        OpenAICompatibleProvider("x", "http://127.0.0.1:1234/v1", kind="unknown")
+    with pytest.raises(ValueError, match="/v1"):
+        OpenAICompatibleProvider("x", "http://127.0.0.1:1234/api", kind="lmstudio")
+
+    def handler(request):
+        if request.url.path == "/v1/models":
+            return httpx.Response(200, json={"data": [{"id": "q"}]})
+        raise httpx.ConnectError("offline", request=request)
+
+    provider = OpenAICompatibleProvider(
+        "lmstudio",
+        "http://127.0.0.1:1234/v1",
+        kind="lmstudio",
+        transport=httpx.MockTransport(handler),
+    )
+    assert provider.health_report().status == "loaded_state_unknown"
+
+
 def test_cost_unknown_model_and_usage_tracker():
     usage = ModelUsage("p", "unknown", 10, 10)
     assert CostCalculator().calculate(usage) is None

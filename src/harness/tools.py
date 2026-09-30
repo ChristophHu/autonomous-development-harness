@@ -5,6 +5,7 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 import uuid
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -689,8 +690,14 @@ class ToolRegistry:
 
     def _register_mcp(self):
         from .configuration import MCPSettings
-        from .mcp import MCPClient, MCPError, builtin_filesystem_command
+        from .mcp import (
+            MCPClient,
+            MCPError,
+            builtin_filesystem_command,
+            builtin_obsidian_command,
+        )
         from .mcp_servers.filesystem import _DELETE, _READ, _WRITE
+        from .mcp_servers.obsidian import READ_TOOLS as OBSIDIAN_READ
 
         mcp_config = self.permissions.config.data.get("tools", {}).get("mcp")
         if not mcp_config:
@@ -704,23 +711,40 @@ class ToolRegistry:
                 continue
             if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", server_name):
                 raise ValueError("invalid MCP server name")
-            command = (
-                builtin_filesystem_command(
+            vault = (
+                self.permissions.config.path("obsidian_vault")
+                if settings.builtin == "obsidian"
+                else None
+            )
+            if settings.builtin == "filesystem":
+                command = builtin_filesystem_command(
                     self.workspace,
                     read_only=settings.read_only,
                     allow_delete=settings.allow_delete,
                 )
-                if settings.builtin == "filesystem"
-                else settings.command
+            elif settings.builtin == "obsidian":
+                command = builtin_obsidian_command(vault)
+            else:
+                command = settings.command
+            read_roots = (
+                (self.workspace, Path(__file__).resolve().parents[1], Path(sys.prefix))
+                + ((vault,) if vault is not None else ())
+                if settings.builtin
+                else None
             )
-            client = MCPClient(command, self.workspace, timeout=settings.timeout)
+            client = MCPClient(
+                command,
+                self.workspace,
+                timeout=settings.timeout,
+                read_roots=read_roots,
+            )
             try:
                 discovered = client.discover()
             except MCPError as exc:
                 raise ValueError(f"MCP server {server_name} is unavailable") from exc
             for remote in discovered:
                 name = remote["name"]
-                if settings.builtin:
+                if settings.builtin == "filesystem":
                     if name in _READ:
                         permission, risk = "filesystem", "READ"
                     elif name in _WRITE:
@@ -729,6 +753,10 @@ class ToolRegistry:
                         permission, risk = "filesystem.delete", "DESTRUCTIVE"
                     else:
                         raise ValueError("builtin MCP server advertised unknown tool")
+                elif settings.builtin == "obsidian":
+                    if name not in OBSIDIAN_READ:
+                        raise ValueError("builtin MCP server advertised unknown tool")
+                    permission, risk = "obsidian", "READ"
                 elif name in settings.allow_tools:
                     permission, risk = f"mcp.{server_name}", "DESTRUCTIVE"
                 else:

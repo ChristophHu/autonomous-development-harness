@@ -17,7 +17,7 @@ models:
   providers:
     openai: {enabled: true, base_url: https://api.openai.com/v1, timeout: {total: 120, connect: 5, read: 30}, retry: {max_attempts: 3, base_delay: 0.25, max_delay: 4}}
     openrouter: {enabled: true, base_url: https://openrouter.ai/api/v1, timeout: {total: 120, connect: 5, read: 30}, retry: {max_attempts: 3, base_delay: 0.25, max_delay: 4}}
-    lmstudio: {enabled: true, base_url: http://127.0.0.1:1234/v1, timeout: {total: 120, connect: 5, read: 30}, retry: {max_attempts: 3, base_delay: 0.25, max_delay: 4}}
+    lmstudio: {enabled: true, kind: lmstudio, base_url: http://127.0.0.1:1234/v1, timeout: {total: 120, connect: 5, read: 30}, retry: {max_attempts: 3, base_delay: 0.25, max_delay: 4}}
 profiles:
   planner:
     model: {primary: lmstudio, fallback: [openai]}
@@ -38,7 +38,7 @@ profiles:
 api: {host: 127.0.0.1, port: 8080, swagger: true}
 logging: {level: INFO, file: ./logs/harness.log}
 tools:
-  permissions: {filesystem: write, shell: write, git: read, docker: denied, filesystem.delete: denied}
+  permissions: {filesystem: write, shell: write, git: read, docker: denied, filesystem.delete: denied, obsidian: denied}
   # MCP servers are opt-in. Enable this local reference server explicitly.
   mcp:
     servers:
@@ -47,6 +47,10 @@ tools:
         builtin: filesystem
         read_only: true
         allow_delete: false
+      vault:
+        enabled: false
+        builtin: obsidian
+        read_only: true
   http:
     allowed_hosts: []
     timeout: {total: 30, connect: 5, read: 30}

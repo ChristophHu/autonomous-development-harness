@@ -27,7 +27,7 @@ class MCPError(RuntimeError):
 
 
 class MCPClient:
-    def __init__(self, command, workspace, *, timeout=10):
+    def __init__(self, command, workspace, *, timeout=10, read_roots=None):
         self.workspace = Path(workspace).resolve(strict=True)
         if (
             not isinstance(command, list)
@@ -47,9 +47,12 @@ class MCPClient:
             raise ValueError("MCP timeout must be between 0 and 30 seconds")
         self.command = command
         self.timeout = timeout
+        self.read_roots = read_roots
 
     def _exchange(self, method, params):
-        command = isolated_command(self.command, self.workspace)
+        command = isolated_command(
+            self.command, self.workspace, read_roots=self.read_roots
+        )
         env = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}
         if "TMPDIR" in os.environ:
             env["TMPDIR"] = os.environ["TMPDIR"]
@@ -239,3 +242,7 @@ def builtin_filesystem_command(workspace, *, read_only=True, allow_delete=False)
     if allow_delete:
         command.append("--allow-delete")
     return command
+
+
+def builtin_obsidian_command(vault):
+    return [sys.executable, "-m", "harness.mcp_servers.obsidian", str(vault)]

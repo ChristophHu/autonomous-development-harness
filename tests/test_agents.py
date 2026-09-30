@@ -66,6 +66,102 @@ def test_registry_profiles_and_selection():
     )
 
 
+def test_discovery_supplies_single_unconfigured_runtime_model_without_mutating_config():
+    calls = []
+    provider = SimpleNamespace(
+        model=None,
+        models=lambda: [" local-b ", "local-a", "local-a", "   "],
+        complete=lambda prompt, **kwargs: calls.append(kwargs) or "ok",
+    )
+    cfg = config({"profiles": {"p": {"model": {"primary": "local"}}}})
+    registry = ModelRegistry(cfg)
+    registry.register("local", provider)
+    assert registry.discover("local") == ("local-a", "local-b")
+    with pytest.raises(RuntimeError, match="local: ValueError"):
+        ModelRouter(registry, cfg).complete("p", "prompt")
+    assert calls == []
+    provider.models = lambda: ["local-a"]
+    assert registry.discover("local") == ("local-a",)
+    assert ModelRouter(registry, cfg).complete("p", "prompt") == "ok"
+    assert calls == [{"model": "local-a"}]
+    with pytest.raises(ValueError, match="capabilities"):
+        registry.resolve("local", needs_tools=True)
+    assert cfg.data == {"profiles": {"p": {"model": {"primary": "local"}}}}
+
+
+def test_explicit_model_precedes_discovery_and_failed_refresh_keeps_no_stale_snapshot():
+    cfg = config(
+        {
+            "models": {
+                "registry": {
+                    "chosen": {
+                        "provider": "local",
+                        "model": "configured-id",
+                        "capabilities": ["tools"],
+                    }
+                }
+            },
+            "profiles": {"p": {"model": {"primary": "chosen"}}},
+        }
+    )
+    provider = SimpleNamespace(
+        model=None,
+        models=lambda: ["discovered-id"],
+        complete=lambda prompt, **kwargs: kwargs["model"],
+    )
+    registry = ModelRegistry(cfg)
+    registry.register("local", provider)
+    assert registry.discover("local") == ("discovered-id",)
+    assert ModelRouter(registry, cfg).complete("p", "prompt") == "configured-id"
+    provider.models = lambda: (_ for _ in ()).throw(RuntimeError("offline secret"))
+    with pytest.raises(RuntimeError):
+        registry.discover("local")
+    assert registry.discovered["local"] == ()
+    assert ModelRouter(registry, cfg).complete("p", "prompt") == "configured-id"
+
+
+def test_discovery_rejects_malformed_inventory_and_never_selects_many():
+    registry = ModelRegistry(config({}))
+    provider = SimpleNamespace(model=None, models=lambda: {"data": ["bad"]})
+    registry.register("local", provider)
+    with pytest.raises(ValueError, match="inventory"):
+        registry.discover("local")
+    provider.models = lambda: ["valid", 123]
+    with pytest.raises(ValueError, match="inventory"):
+        registry.discover("local")
+    provider.models = lambda: ["valid\nunsafe"]
+    with pytest.raises(ValueError, match="inventory"):
+        registry.discover("local")
+    assert registry.discovered["local"] == ()
+
+
+def test_replacing_provider_invalidates_discovery_snapshot():
+    registry = ModelRegistry(config({}))
+    registry.register("local", SimpleNamespace(model=None, models=lambda: ["old"]))
+    assert registry.discover("local") == ("old",)
+    registry.register("local", SimpleNamespace(model=None, models=lambda: ["new"]))
+    assert registry.resolve("local")[1] == "new"
+
+
+def test_registry_passes_explicit_lmstudio_kind_to_provider():
+    registry = ModelRegistry(
+        config(
+            {
+                "models": {
+                    "providers": {
+                        "local": {
+                            "enabled": True,
+                            "kind": "lmstudio",
+                            "base_url": "http://127.0.0.1:1234/v1",
+                        }
+                    }
+                }
+            }
+        )
+    )
+    assert registry.get("local").kind == "lmstudio"
+
+
 def test_router_usage_and_callback():
     usage = ModelUsage("provider", "m", 10, 20)
     observed = []

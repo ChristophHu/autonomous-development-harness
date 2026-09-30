@@ -35,6 +35,7 @@ models:
       base_url: https://openrouter.ai/api/v1
     lmstudio:
       enabled: true
+      kind: lmstudio
       base_url: http://127.0.0.1:1234/v1
   registry:
     openai_astra: {provider: openai, model: <EXACT-PREMIUM-MODEL-ID>, tier: premium}
@@ -102,7 +103,7 @@ testing:
   tdd: true
   coverage: {statements: 100, branches: 100, functions: 100, lines: 100}
 tools:
-  permissions: {filesystem: write, filesystem.delete: denied, shell: write, git: read, docker: denied}
+  permissions: {filesystem: write, filesystem.delete: denied, shell: write, git: read, docker: denied, obsidian: denied}
   http: {allowed_hosts: []}
   docker: {compose_file: ./docker-compose.yml}
   git:
@@ -112,3 +113,4 @@ tools:
   mcp:
     servers:
       files: {enabled: false, builtin: filesystem, read_only: true, allow_delete: false}
+      vault: {enabled: false, builtin: obsidian, read_only: true}
