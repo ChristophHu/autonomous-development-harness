@@ -2,6 +2,7 @@
 
 import json
 import logging
+import re
 import time
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -13,6 +14,23 @@ CURRENT_RUN = ContextVar("harness_run", default=None)
 LOGGER = logging.getLogger("harness")
 
 
+def _sensitive_key(key):
+    normalized = re.sub(r"[^a-z0-9]", "", str(key).casefold())
+    return any(
+        marker in normalized
+        for marker in (
+            "authorization",
+            "password",
+            "secret",
+            "token",
+            "apikey",
+            "credential",
+            "privatekey",
+            "cookie",
+        )
+    )
+
+
 class AuditRecorder:
     def __init__(self, database, secrets=None):
         self.repository = AuditRepository(database)
@@ -22,17 +40,18 @@ class AuditRecorder:
     def sanitize(self, value):
         if isinstance(value, dict):
             return {
-                key: "[REDACTED]"
-                if key.lower()
-                in {"authorization", "password", "secret", "api_key", "token"}
-                else self.sanitize(item)
+                key: "[REDACTED]" if _sensitive_key(key) else self.sanitize(item)
                 for key, item in value.items()
             }
         if isinstance(value, (list, tuple)):
             return [self.sanitize(item) for item in value]
         if isinstance(value, str):
             for key, secret in self.secrets.items():
-                if secret and not key.endswith("_MODEL"):
+                if (
+                    isinstance(secret, str)
+                    and secret
+                    and not str(key).endswith("_MODEL")
+                ):
                     value = value.replace(secret, "[REDACTED]")
         return value
 

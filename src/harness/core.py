@@ -641,53 +641,141 @@ class Store:
         self.db.parent.mkdir(parents=True, exist_ok=True)
 
     def create(self, task: Task) -> Task:
+        safe = self.audit.sanitize(task.model_dump(mode="json"))
         task.id = self.tasks.create(
-            task.title,
-            task.description,
-            task.status.value,
-            task.model_dump(mode="json"),
+            safe["title"],
+            safe["description"],
+            safe["status"],
+            safe,
         )
         return self.get(task.id)
 
     def get(self, task_id: int) -> Task | None:
         row = self.tasks.get(task_id)
-        return (
-            Task(
-                **{
-                    k: v
-                    for k, v in json.loads(row["metadata"]).items()
-                    if k
-                    not in {
-                        "id",
-                        "title",
-                        "description",
-                        "status",
-                        "result",
-                        "created_at",
-                        "updated_at",
-                    }
-                },
-                id=row["id"],
-                title=row["title"],
-                description=row["description"],
-                status=row["status"],
-                result=row["result"],
-                created_at=row["created_at"],
-                updated_at=row["updated_at"],
-            )
-            if row
-            else None
+        if row is None:
+            return None
+        metadata = self.audit.sanitize(json.loads(row["metadata"]))
+        fields = self.audit.sanitize(
+            {
+                "title": row["title"],
+                "description": row["description"],
+                "status": row["status"],
+                "result": row["result"],
+            }
+        )
+        return Task(
+            **{
+                key: value
+                for key, value in metadata.items()
+                if key
+                not in {
+                    "id",
+                    "title",
+                    "description",
+                    "status",
+                    "result",
+                    "created_at",
+                    "updated_at",
+                }
+            },
+            id=row["id"],
+            title=fields["title"],
+            description=fields["description"],
+            status=fields["status"],
+            result=fields["result"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
         )
 
     def update(self, task: Task):
-        self.tasks.update(
-            task.id,
-            title=task.title,
-            description=task.description,
-            status=task.status.value,
-            result=task.result,
-            metadata=task.model_dump(mode="json"),
+        fields = self.audit.sanitize(
+            {
+                "title": task.title,
+                "description": task.description,
+                "status": task.status.value,
+                "result": task.result,
+                "metadata": task.model_dump(mode="json"),
+            }
         )
+        self.tasks.update(task.id, **fields)
+
+    def update_task_fields(self, task_id, **fields):
+        self.tasks.update(task_id, **self.audit.sanitize(fields))
+
+    def update_task_if_idle(self, task_id, task):
+        fields = self.audit.sanitize(task.model_dump(mode="json"))
+        return self.tasks.update_if_idle(
+            task_id,
+            fields["title"],
+            fields["description"],
+            fields,
+        )
+
+    def save_plan(self, task_id, summary, payload):
+        return self.plans.save(
+            task_id,
+            self.audit.sanitize(summary),
+            self.audit.sanitize(payload),
+        )
+
+    def save_subtasks(self, task_id, subtasks, plan_id=None):
+        from .agents import Subtask
+
+        safe = []
+        for step in subtasks:
+            fields = self.audit.sanitize(step.model_dump(mode="json"))
+            safe.append(Subtask.model_validate(fields))
+        return self.subtasks.save_plan(task_id, safe, plan_id)
+
+    def update_subtask(self, task_id, external_id, status, output=None, plan_id=None):
+        safe_output = (
+            json.dumps(self.audit.sanitize(output)) if output is not None else None
+        )
+        return self.subtasks.update(task_id, external_id, status, safe_output, plan_id)
+
+    def record_validation(self, task_id, valid, report):
+        return self.validations.record(task_id, valid, self.audit.sanitize(report))
+
+    def record_correction(self, task_id, finding, plan_id=None):
+        return self.corrections.record(task_id, self.audit.sanitize(finding), plan_id)
+
+    def list_events(self, *filters):
+        rows = []
+        for row in self.events.list(*filters):
+            item = dict(row)
+            item["payload"] = json.dumps(
+                self.audit.sanitize(json.loads(item["payload"]))
+            )
+            rows.append(item)
+        return rows
+
+    def list_questions(self, task_id):
+        return [self._sanitize_question(row) for row in self.questions.list(task_id)]
+
+    def get_question(self, question_id):
+        row = self.questions.get(question_id)
+        return self._sanitize_question(row) if row is not None else None
+
+    def _sanitize_question(self, row):
+        item = dict(row)
+        item.update(
+            self.audit.sanitize(
+                {
+                    "question": item["question"],
+                    "reason": item["reason"],
+                    "options": json.loads(item["options"]),
+                    "answer": item["answer"],
+                }
+            )
+        )
+        item["options"] = json.dumps(item["options"])
+        return item
+
+    def latest_plan(self, task_id):
+        return self.audit.sanitize(self.plans.latest(task_id))
+
+    def latest_validation(self, task_id):
+        return self.audit.sanitize(self.validations.latest(task_id))
 
     def event(self, task_id: int | None, kind: EventKind | str, payload: dict):
         event_kind = EventKind(kind)
@@ -701,6 +789,14 @@ class Store:
     def ask(self, task_id, question, reason, options=None, required=True):
         if not question.strip():
             raise ValueError("question must not be blank")
+        safe_fields = self.audit.sanitize(
+            {"question": question, "reason": reason, "options": options or []}
+        )
+        question, reason, options = (
+            safe_fields["question"],
+            safe_fields["reason"],
+            safe_fields["options"],
+        )
         payload = self.audit.sanitize({"question": question, "required": required})
         question_id = self.questions.ask(
             task_id, question, reason, options, required, payload
@@ -708,7 +804,7 @@ class Store:
         return question_id
 
     def answer(self, question_id, answer, task_id=None):
-        return self.questions.answer(question_id, answer, task_id)
+        return self.questions.answer(question_id, self.audit.sanitize(answer), task_id)
 
 
 class Permissions:
@@ -855,7 +951,7 @@ class Orchestrator:
             }
             if interrupted or (
                 task.status in {Status.FAILED, Status.BLOCKED}
-                and self.store.plans.latest(task_id) is not None
+                and self.store.latest_plan(task_id) is not None
             ):
                 from .reconciliation import ReconciliationService
 
@@ -978,12 +1074,11 @@ class Orchestrator:
                 recovery_scope.validate_plan(plan, self.tools)
                 recovery_scope.verify_preserved()
             task.complexity = str(plan.complexity)
-            plan_id = self.store.plans.save(
-                task_id, plan.summary, plan.model_dump(mode="json")
-            )
-            self.store.subtasks.save_plan(task_id, plan.subtasks, plan_id)
+            safe_plan = self.store.audit.sanitize(plan.model_dump(mode="json"))
+            plan_id = self.store.save_plan(task_id, plan.summary, safe_plan)
+            self.store.save_subtasks(task_id, plan.subtasks, plan_id)
             self.context.memory.write(
-                f"tasks/{task_id}/plan", plan.model_dump_json(indent=2)
+                f"tasks/{task_id}/plan", json.dumps(safe_plan, indent=2)
             )
             if self.qdrant_enabled:
                 try:
@@ -997,7 +1092,7 @@ class Orchestrator:
                         EventKind.MEMORY_INDEX_FAILED,
                         {"error": type(exc).__name__},
                     )
-            self.store.tasks.update(
+            self.store.update_task_fields(
                 task_id,
                 metadata=task.model_dump(mode="json")
                 | {"plan": plan.model_dump(mode="json")},
@@ -1061,11 +1156,11 @@ class Orchestrator:
                             recovery_scope,
                         )
                     outputs.append(output)
-                    self.store.subtasks.update(
+                    self.store.update_subtask(
                         task_id,
                         step.id,
                         "completed" if output.success else "failed",
-                        output.model_dump_json(),
+                        output.model_dump(mode="json"),
                         plan_id,
                     )
                 workspace_after = await asyncio.to_thread(
@@ -1101,10 +1196,12 @@ class Orchestrator:
                     workspace_before,
                     workspace_after,
                 )
-                self.store.validations.record(
-                    task_id, validation.valid, validation.model_dump_json()
+                self.store.record_validation(
+                    task_id,
+                    validation.valid,
+                    validation.model_dump(mode="json"),
                 )
-                self.store.tasks.update(
+                self.store.update_task_fields(
                     task_id,
                     metadata=self.store.get(task_id).model_dump(mode="json")
                     | {
@@ -1132,7 +1229,7 @@ class Orchestrator:
                         }
                     ]
                 for finding in validation_findings:
-                    self.store.corrections.record(task_id, finding, plan_id)
+                    self.store.record_correction(task_id, finding, plan_id)
                 if validation.valid:
                     for item in self.store.corrections.list_for_task(
                         task_id, status="in_progress"
@@ -1174,13 +1271,13 @@ class Orchestrator:
                                 target_workspace,
                                 False,
                             )
-                            self.store.validations.record(
+                            self.store.record_validation(
                                 task_id,
                                 target_validation.valid,
-                                target_validation.model_dump_json(),
+                                target_validation.model_dump(mode="json"),
                             )
                             current = self.store.get(task_id)
-                            self.store.tasks.update(
+                            self.store.update_task_fields(
                                 task_id,
                                 metadata=current.model_dump(mode="json")
                                 | {
@@ -1218,7 +1315,7 @@ class Orchestrator:
                         if not merged:
                             return self.store.get(task_id)
                     transition(Status.COMPLETED)
-                    self.store.tasks.update(
+                    self.store.update_task_fields(
                         task_id,
                         result="Tests, coverage and independent acceptance validation passed.",
                     )
@@ -1252,8 +1349,10 @@ class Orchestrator:
             task = self.store.get(task_id)
             if task.status not in TERMINAL and task.status != Status.WAITING_HUMAN:
                 transition(Status.FAILED)
-                self.store.tasks.update(task_id, result=str(exc))
-                self.store.event(task_id, EventKind.TASK_FAILED, {"error": str(exc)})
+                safe_error = self.store.audit.sanitize(str(exc))
+                self.store.update_task_fields(task_id, result=safe_error)
+                self.store.event(task_id, EventKind.TASK_FAILED, {"error": safe_error})
+                exc.args = (safe_error,)
             raise
 
 

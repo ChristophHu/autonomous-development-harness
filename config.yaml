@@ -39,6 +39,14 @@ api: {host: 127.0.0.1, port: 8080, swagger: true}
 logging: {level: INFO, file: ./logs/harness.log}
 tools:
   permissions: {filesystem: write, shell: write, git: read, docker: denied, filesystem.delete: denied}
+  # MCP servers are opt-in. Enable this local reference server explicitly.
+  mcp:
+    servers:
+      files:
+        enabled: false
+        builtin: filesystem
+        read_only: true
+        allow_delete: false
   http:
     allowed_hosts: []
     timeout: {total: 30, connect: 5, read: 30}

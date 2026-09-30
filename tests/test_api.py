@@ -67,6 +67,81 @@ def test_api_all_routes_and_errors(client):
     assert http.delete("/api/tasks/999").status_code == 404
 
 
+def test_api_task_and_question_surfaces_do_not_expose_secret_canary(client):
+    http, store, _orchestrator = client
+    canary = "SS1-API-CANARY-NEVER-RETURN"
+    store.audit.secrets["SS1_API_TOKEN"] = canary
+
+    created = http.post(
+        "/api/tasks",
+        json={"title": f"task {canary}", "description": f"description {canary}"},
+    )
+    assert created.status_code == 200
+    task_id = created.json()["id"]
+    assert canary not in created.text
+    assert canary not in http.get(f"/api/tasks/{task_id}").text
+
+    patched = http.patch(
+        f"/api/tasks/{task_id}", json={"description": f"patched {canary}"}
+    )
+    assert patched.status_code == 200
+    assert canary not in patched.text
+
+    question = http.post(
+        f"/api/tasks/{task_id}/questions",
+        json={
+            "question": f"question {canary}",
+            "reason": f"reason {canary}",
+            "required": False,
+        },
+    )
+    assert question.status_code == 200
+    assert canary not in question.text
+    listed = http.get(f"/api/tasks/{task_id}/questions")
+    assert canary not in listed.text
+    answered = http.post(
+        f"/api/tasks/{task_id}/answers",
+        json={"question_id": question.json()["id"], "answer": canary},
+    )
+    assert answered.status_code == 200
+    assert canary not in answered.text
+    assert canary not in http.get(f"/api/tasks/{task_id}/questions").text
+
+    with store.database.connect() as connection:
+        raw = [
+            dict(row)
+            for table in ("tasks", "questions", "events")
+            for row in connection.execute(f"SELECT * FROM {table}")
+        ]
+    assert canary not in str(raw)
+
+
+def test_api_readbacks_redact_legacy_unfiltered_rows(client):
+    http, store, _orchestrator = client
+    canary = "SS1-LEGACY-CANARY"
+    store.audit.secrets["SS1_LEGACY_TOKEN"] = canary
+    task_id = store.tasks.create(
+        f"old {canary}",
+        f"description {canary}",
+        metadata={"context": {"api_key": canary}},
+    )
+    store.events.append(task_id, "task.failed", {"message": canary})
+    store.questions.create(task_id, canary, canary, [canary])
+    store.plans.save(task_id, canary, {"authorization": canary})
+    store.validations.record(task_id, False, {"details": canary, "apiKey": canary})
+
+    responses = (
+        http.get(f"/api/tasks/{task_id}"),
+        http.get(f"/api/tasks/{task_id}/events"),
+        http.get("/api/events", params={"task_id": task_id}),
+        http.get(f"/api/tasks/{task_id}/questions"),
+        http.get(f"/api/tasks/{task_id}/plan"),
+        http.get(f"/api/tasks/{task_id}/validation"),
+    )
+    assert all(response.status_code == 200 for response in responses)
+    assert all(canary not in response.text for response in responses)
+
+
 def test_api_typed_contracts_and_consistent_errors(client):
     http, store, _orchestrator = client
     created = http.post("/api/tasks", json={"title": "typed"})

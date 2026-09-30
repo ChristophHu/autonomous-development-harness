@@ -171,11 +171,11 @@ class ReconciliationService:
         self.validator = validator
 
     def inspect(self, task):
-        previous = self.store.plans.latest(task.id)
+        previous = self.store.latest_plan(task.id)
         report = ReconciliationReport(
             previous_state=str(task.status),
             previous_plan=dict(previous) if previous else None,
-            events=[dict(row) for row in self.store.events.list(task.id)[-100:]],
+            events=[dict(row) for row in self.store.list_events(task.id)[-100:]],
             uncertain_requirements=list(task.requirements),
         )
         names = {

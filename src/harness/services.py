@@ -62,12 +62,7 @@ class TaskService:
                 pending.extend(linked.dependencies)
                 if linked.parent_task_id:
                     pending.append(linked.parent_task_id)
-        if not self.store.tasks.update_if_idle(
-            task_id,
-            updated.title,
-            updated.description,
-            updated.model_dump(mode="json"),
-        ):
+        if not self.store.update_task_if_idle(task_id, updated):
             raise ValueError("task is currently running")
         return self.get(task_id)
 

@@ -805,6 +805,59 @@ def test_model_discovery_failure_is_reported_without_aborting(harness_context, c
     assert "Provider offline: unavailable" in capsys.readouterr().out
 
 
+def test_model_inventory_shows_tier_and_unavailable_configured_model(
+    harness_context, capsys
+):
+    _cfg, _store, orchestrator, _ = harness_context
+    orchestrator.models.providers.clear()
+    provider = SimpleNamespace(
+        health=lambda: True, models=lambda: ["live-v1", "unlisted-v2"]
+    )
+    orchestrator.models.register("local", provider)
+    orchestrator.models.models = {
+        "coding": {"provider": "local", "model": "live-v1", "tier": "advanced"},
+        "fallback": {"provider": "local", "model": "missing-v1", "tier": "local"},
+    }
+    cli.model_list()
+    listed = capsys.readouterr().out
+    assert "live-v1\tlocal\tcoding\tadvanced\tavailable" in listed
+    assert "missing-v1\tlocal\tfallback\tlocal\tunavailable" in listed
+    assert "unlisted-v2\tlocal\t-\t-\tavailable" in listed
+    cli.model_status()
+    assert capsys.readouterr().out == listed
+
+
+def test_model_inventory_reports_unknown_provider_without_secret_or_prompt(
+    harness_context, capsys
+):
+    _cfg, _store, orchestrator, _ = harness_context
+    orchestrator.models.providers.clear()
+    orchestrator.models.models = {
+        "remote-model": {"provider": "absent", "model": "vendor-v1", "tier": "premium"}
+    }
+    cli.model_list()
+    output = capsys.readouterr().out
+    assert "vendor-v1\tabsent\tremote-model\tpremium\tunavailable" in output
+
+
+def test_cli_command_groups_match_prompt_contract():
+    from typer.testing import CliRunner
+
+    result = CliRunner().invoke(cli.app, ["--help"])
+    assert result.exit_code == 0, result.output
+    for command in (
+        "start",
+        "stop",
+        "status",
+        "doctor",
+        "config",
+        "models",
+        "tasks",
+        "secrets",
+    ):
+        assert command in result.output
+
+
 def test_model_test_accepts_usage_tuple_and_rejects_empty_response(
     harness_context, capsys
 ):
@@ -832,7 +885,10 @@ def test_model_test_accepts_usage_tuple_and_rejects_empty_response(
 
 def test_secret_commands(harness_context, monkeypatch, capsys):
     names = SimpleNamespace(
-        list_names=lambda: ["TOKEN"], set=lambda *a: None, delete=lambda _: True
+        list_names=lambda: ["TOKEN"],
+        set=lambda *a: None,
+        delete=lambda _: True,
+        exists=lambda _: True,
     )
     monkeypatch.setattr(cli, "SecretResolver", lambda: names)
     monkeypatch.setattr(cli.typer, "prompt", lambda *a, **k: "value")
@@ -843,6 +899,64 @@ def test_secret_commands(harness_context, monkeypatch, capsys):
     names.delete = lambda _: False
     with pytest.raises(cli.typer.Exit):
         cli.secret_delete("missing")
+
+
+def test_secret_exists_cli_reports_only_boolean_status(monkeypatch):
+    from typer.testing import CliRunner
+
+    resolver = SimpleNamespace(exists=lambda _name: True)
+    monkeypatch.setattr(cli, "SecretResolver", lambda: resolver)
+    runner = CliRunner()
+    found = runner.invoke(cli.app, ["secrets", "exists", "TOKEN"])
+    assert found.exit_code == 0
+    assert found.output.strip() == "exists"
+    resolver.exists = lambda _name: False
+    absent = runner.invoke(cli.app, ["secrets", "exists", "TOKEN"])
+    assert absent.exit_code == 1
+    assert absent.output.strip() == "not found"
+
+
+def test_secret_cli_errors_do_not_render_exception_or_secret(monkeypatch):
+    from typer.testing import CliRunner
+
+    secret_value = "never-print-this-secret"
+    resolver = SimpleNamespace(
+        list_names=lambda: (_ for _ in ()).throw(RuntimeError(secret_value)),
+        set=lambda *_: (_ for _ in ()).throw(RuntimeError(secret_value)),
+        delete=lambda _: (_ for _ in ()).throw(RuntimeError(secret_value)),
+        exists=lambda _: (_ for _ in ()).throw(RuntimeError(secret_value)),
+    )
+    monkeypatch.setattr(cli, "SecretResolver", lambda: resolver)
+    monkeypatch.setattr(cli.typer, "prompt", lambda *a, **k: secret_value)
+    runner = CliRunner()
+    for args in (
+        ["secrets", "list"],
+        ["secrets", "set", "TOKEN"],
+        ["secrets", "delete", "TOKEN"],
+        ["secrets", "exists", "TOKEN"],
+    ):
+        result = runner.invoke(cli.app, args)
+        assert result.exit_code == 1
+        assert "secret operation failed" in result.output
+        assert secret_value not in result.output
+
+
+def test_task_events_cli_redacts_existing_event_payloads(
+    harness_context, monkeypatch, capsys
+):
+    _config, store, _orchestrator, _root = harness_context
+    canary = "SS1-CLI-CANARY"
+    store.audit.secrets["SS1_CLI_TOKEN"] = canary
+    task = store.tasks.create("legacy event")
+    store.events.append(task, "task.failed", {"message": canary, "apiKey": "other"})
+    monkeypatch.setattr(cli, "build", lambda: (None, store, None))
+
+    cli.task_events(task)
+
+    output = capsys.readouterr().out
+    assert canary not in output
+    assert "other" not in output
+    assert "[REDACTED]" in output
 
 
 def test_memory_sync_command_projects_sqlite_decisions(harness_context):
@@ -858,3 +972,257 @@ def test_memory_sync_command_projects_sqlite_decisions(harness_context):
     assert (root / "vault" / "_harness" / "decisions" / "1.md").read_text().find(
         "Use SQLite"
     ) >= 0
+
+
+def test_task_create_accepts_structured_yaml_spec(harness_context, tmp_path):
+    from typer.testing import CliRunner
+
+    _cfg, store, _orchestrator, _ = harness_context
+    spec = tmp_path / "task.yaml"
+    spec.write_text(
+        "title: Structured task\ngoal: Build feature\nrequirements: [Use tests]\nacceptance_criteria:\n  - {id: done, description: Feature works}\n"
+    )
+    result = CliRunner().invoke(cli.app, ["tasks", "create", "--file", str(spec)])
+    assert result.exit_code == 0, result.stdout
+    item = store.get(1)
+    assert item.title == "Structured task"
+    assert item.goal == "Build feature"
+    assert item.requirements == ["Use tests"]
+
+
+@pytest.mark.parametrize(
+    "contents",
+    [
+        "{bad-json",
+        "- not-a-mapping",
+        "title: x\nstatus: completed",
+        "title: x\nunknown: private-secret",
+    ],
+)
+def test_task_create_rejects_invalid_or_protected_spec(
+    harness_context, tmp_path, contents
+):
+    from typer.testing import CliRunner
+
+    spec = tmp_path / "task.yaml"
+    spec.write_text(contents)
+    result = CliRunner().invoke(cli.app, ["tasks", "create", "--file", str(spec)])
+    assert result.exit_code != 0
+    assert "private-secret" not in result.stdout
+
+
+def test_task_watch_follows_sse_and_resumes_cursor(harness_context, monkeypatch):
+    from contextlib import contextmanager
+
+    from typer.testing import CliRunner
+
+    _cfg, store, _orchestrator, _ = harness_context
+    task_id = store.create(Task(title="Watching")).id
+    cursors = []
+
+    @contextmanager
+    def stream(_method, _url, **kwargs):
+        cursors.append(kwargs["headers"]["Last-Event-ID"])
+        if len(cursors) == 1:
+            lines = [
+                "id: 5",
+                "event: task.started",
+                f"data: {json.dumps({'id': 5, 'task_id': task_id, 'kind': 'task.started', 'created_at': '09:31:01', 'payload': {}})}",
+                "",
+            ]
+        else:
+            lines = [
+                ": keep-alive",
+                "",
+                "id: 6",
+                "event: task.completed",
+                f"data: {json.dumps({'id': 6, 'task_id': task_id, 'kind': 'task.completed', 'created_at': '09:31:03', 'payload': {}})}",
+                "",
+            ]
+        yield SimpleNamespace(
+            raise_for_status=lambda: None, iter_lines=lambda: iter(lines)
+        )
+
+    monkeypatch.setattr(cli.httpx, "stream", stream)
+    result = CliRunner().invoke(cli.app, ["tasks", "watch", str(task_id)])
+    assert result.exit_code == 0, result.stdout
+    assert "task.started" in result.stdout and "task.completed" in result.stdout
+    assert cursors == ["0", "5"]
+
+
+def test_task_create_json_and_conflicting_options(harness_context, tmp_path):
+    from typer.testing import CliRunner
+
+    _cfg, store, _orchestrator, _ = harness_context
+    spec = tmp_path / "task.json"
+    spec.write_text(json.dumps({"title": "JSON task", "requirements": ["Checked"]}))
+    runner = CliRunner()
+    created = runner.invoke(cli.app, ["tasks", "create", "--file", str(spec)])
+    assert created.exit_code == 0, created.output
+    assert store.get(1).requirements == ["Checked"]
+    conflict = runner.invoke(cli.app, ["tasks", "create", "title", "--file", str(spec)])
+    assert conflict.exit_code == 1
+    assert store.get(2) is None
+    missing_title = runner.invoke(cli.app, ["tasks", "create"])
+    assert missing_title.exit_code == 1
+    assert "title is required" in missing_title.output
+
+
+@pytest.mark.parametrize(
+    "name,contents",
+    [
+        ("task.txt", "title: Unsupported"),
+        ("task.json", "{broken"),
+        ("task.yaml", "title: x\nstatus: completed"),
+    ],
+)
+def test_task_create_spec_errors_are_redacted(
+    harness_context, tmp_path, name, contents
+):
+    from typer.testing import CliRunner
+
+    spec = tmp_path / name
+    spec.write_text(contents)
+    result = CliRunner().invoke(cli.app, ["tasks", "create", "--file", str(spec)])
+    assert result.exit_code == 1
+    assert result.output.strip() == "invalid task specification"
+
+
+def test_task_create_rejects_oversized_or_missing_file(harness_context, tmp_path):
+    from typer.testing import CliRunner
+
+    spec = tmp_path / "large.yaml"
+    spec.write_text("x" * 1_000_001)
+    runner = CliRunner()
+    for path in (spec, tmp_path / "missing.yaml"):
+        result = runner.invoke(cli.app, ["tasks", "create", "--file", str(path)])
+        assert result.exit_code == 1
+        assert result.output.strip() == "invalid task specification"
+
+
+def test_task_watch_ignores_replayed_events_and_stops_on_cancel(
+    harness_context, monkeypatch
+):
+    from contextlib import contextmanager
+
+    from typer.testing import CliRunner
+
+    _cfg, store, _orchestrator, _ = harness_context
+    task_id = store.create(Task(title="Watching")).id
+    calls = []
+
+    @contextmanager
+    def stream(_method, url, **kwargs):
+        calls.append((url, kwargs["headers"]["Last-Event-ID"]))
+        if len(calls) == 1:
+            rows = [(4, "task.started", {})]
+        else:
+            rows = [
+                (4, "task.started", {}),
+                (5, "task.status", {"status": "cancelled"}),
+            ]
+        lines = []
+        for event_id, kind, payload in rows:
+            event = {
+                "id": event_id,
+                "task_id": task_id,
+                "kind": kind,
+                "payload": payload,
+            }
+            lines.extend([f"id: {event_id}", f"data: {json.dumps(event)}", ""])
+        yield SimpleNamespace(
+            raise_for_status=lambda: None, iter_lines=lambda: iter(lines)
+        )
+
+    monkeypatch.setattr(cli.httpx, "stream", stream)
+    result = CliRunner().invoke(cli.app, ["tasks", "watch", str(task_id)])
+    assert result.exit_code == 0, result.output
+    assert result.output.count("task.started") == 1
+    assert "task.status" in result.output
+    assert calls == [
+        ("http://127.0.0.1:8080/api/events/stream", "0"),
+        ("http://127.0.0.1:8080/api/events/stream", "4"),
+    ]
+
+
+def test_task_watch_missing_and_disconnected(harness_context, monkeypatch):
+    from contextlib import contextmanager
+
+    from typer.testing import CliRunner
+
+    runner = CliRunner()
+    missing = runner.invoke(cli.app, ["tasks", "watch", "999"])
+    assert missing.exit_code == 1
+    assert "task not found" in missing.output
+    _cfg, store, _orchestrator, _ = harness_context
+    task_id = store.create(Task(title="Watching")).id
+
+    @contextmanager
+    def disconnected(*_args, **_kwargs):
+        raise cli.httpx.ConnectError("private server error")
+        yield
+
+    monkeypatch.setattr(cli.httpx, "stream", disconnected)
+    result = runner.invoke(cli.app, ["tasks", "watch", str(task_id)])
+    assert result.exit_code == 1
+    assert result.output.count("TASK-") == 1
+    assert "task event stream unavailable" in result.output
+    assert "private server error" not in result.output
+
+
+def test_task_create_service_error_is_redacted(harness_context, monkeypatch):
+    from typer.testing import CliRunner
+
+    _cfg, _store, orchestrator, _ = harness_context
+    monkeypatch.setattr(
+        orchestrator.service,
+        "create",
+        lambda _item: (_ for _ in ()).throw(ValueError("private service detail")),
+    )
+    result = CliRunner().invoke(cli.app, ["tasks", "create", "a title"])
+    assert result.exit_code == 1
+    assert result.output.strip() == "task creation failed"
+
+
+def test_task_watch_interrupt_maps_to_exit_130(harness_context, monkeypatch):
+    from typer.testing import CliRunner
+
+    _cfg, store, _orchestrator, _ = harness_context
+    task_id = store.create(Task(title="Watching")).id
+    monkeypatch.setattr(
+        cli,
+        "_watch_task_events",
+        lambda *_args: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+    result = CliRunner().invoke(cli.app, ["tasks", "watch", str(task_id)])
+    assert result.exit_code == 130
+
+
+@pytest.mark.parametrize(
+    "lines",
+    [
+        ["id: nope", ""],
+        ["id: 1", 'data: {"id": 1, "task_id": 1}', ""],
+    ],
+)
+def test_task_watch_rejects_malformed_sse(harness_context, monkeypatch, lines):
+    from contextlib import contextmanager
+
+    from typer.testing import CliRunner
+
+    _cfg, store, _orchestrator, _ = harness_context
+    task_id = store.create(Task(title="Watching")).id
+    attempts = []
+
+    @contextmanager
+    def stream(*_args, **_kwargs):
+        attempts.append(True)
+        yield SimpleNamespace(
+            raise_for_status=lambda: None, iter_lines=lambda: iter(lines)
+        )
+
+    monkeypatch.setattr(cli.httpx, "stream", stream)
+    result = CliRunner().invoke(cli.app, ["tasks", "watch", str(task_id)])
+    assert result.exit_code == 1
+    assert len(attempts) == 3
+    assert result.output.endswith("task event stream unavailable\n")

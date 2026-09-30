@@ -12,6 +12,7 @@ from pydantic import (
     StrictFloat,
     StrictInt,
     StrictStr,
+    model_validator,
 )
 
 Number: TypeAlias = StrictInt | StrictFloat
@@ -111,11 +112,18 @@ class ModelStrategy(ExtensibleSettings):
     profile: StrictStr | None = None
 
 
+class ModelRate(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    input: Annotated[Number, Field(ge=0)]
+    output: Annotated[Number, Field(ge=0)]
+
+
 class ModelSettings(ExtensibleSettings):
     defaults: ModelDefaults = Field(default_factory=ModelDefaults)
     providers: dict[StrictStr, ProviderSettings] = Field(default_factory=dict)
     registry: dict[StrictStr, ModelDefinition] = Field(default_factory=dict)
-    rates: dict[StrictStr, Any] = Field(default_factory=dict)
+    rates: dict[StrictStr, ModelRate] = Field(default_factory=dict)
     strategies: dict[StrictStr, ModelStrategy] = Field(default_factory=dict)
 
 
@@ -177,19 +185,47 @@ class HTTPToolSettings(ExtensibleSettings):
     timeout: TimeoutValue = 30
 
 
+class GitSSHCredential(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    username: Annotated[StrictStr, Field(pattern=r"^[A-Za-z0-9._-]{1,64}$")]
+    fingerprint: Annotated[StrictStr, Field(pattern=r"^SHA256:[A-Za-z0-9+/]{43}$")]
+
+
+class GitHTTPSCredential(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    mode: Literal["basic", "bearer"] | None = None
+    username: StrictStr | None = None
+    secret_name: Annotated[StrictStr, Field(pattern=r"^[A-Z0-9_]{1,128}$")]
+
+    @model_validator(mode="after")
+    def valid_mode(self):
+        if self.mode != "bearer" and (
+            not self.username
+            or ":" in self.username
+            or "\r" in self.username
+            or "\n" in self.username
+        ):
+            raise ValueError("basic Git credential needs a safe username")
+        if self.mode == "bearer" and self.username is not None:
+            raise ValueError("bearer Git credential must not have a username")
+        return self
+
+
 class GitSSHSettings(ExtensibleSettings):
     allowed_hosts: list[StrictStr] = Field(default_factory=list)
     allowed_ports: list[Annotated[StrictInt, Field(ge=1, le=65535)]] = Field(
         default_factory=lambda: [22]
     )
-    host_keys: dict[StrictStr, StrictStr] = Field(default_factory=dict)
-    credentials: dict[StrictStr, Any] = Field(default_factory=dict)
+    host_keys: dict[StrictStr, list[StrictStr]] = Field(default_factory=dict)
+    credentials: dict[StrictStr, GitSSHCredential] = Field(default_factory=dict)
 
 
 class GitToolSettings(ExtensibleSettings):
     allowed_hosts: list[StrictStr] = Field(default_factory=list)
     ca_bundle: StrictStr | None = None
-    credentials: dict[StrictStr, Any] = Field(default_factory=dict)
+    credentials: dict[StrictStr, GitHTTPSCredential] = Field(default_factory=dict)
     ssh: GitSSHSettings = Field(default_factory=GitSSHSettings)
 
 
@@ -198,11 +234,42 @@ class DockerToolSettings(ExtensibleSettings):
     socket_path: StrictStr | None = None
 
 
+class MCPServerSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    enabled: StrictBool = True
+    builtin: Literal["filesystem"] | None = None
+    command: list[StrictStr] = Field(default_factory=list)
+    allow_tools: list[StrictStr] = Field(default_factory=list)
+    read_only: StrictBool = True
+    allow_delete: StrictBool = False
+    timeout: Annotated[Number, Field(gt=0, le=30)] = 10
+
+    @model_validator(mode="after")
+    def valid_source(self):
+        if (self.builtin is None) == (not self.command):
+            raise ValueError("exactly one MCP server source is required")
+        if self.builtin and self.allow_tools:
+            raise ValueError("builtin MCP tools are fixed")
+        if not self.builtin and not self.allow_tools:
+            raise ValueError("external MCP server needs an explicit tool allowlist")
+        if self.read_only and self.allow_delete:
+            raise ValueError("read-only MCP server cannot delete")
+        return self
+
+
+class MCPSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    servers: dict[StrictStr, MCPServerSettings] = Field(default_factory=dict)
+
+
 class ToolsSettings(ExtensibleSettings):
     permissions: dict[StrictStr, StrictStr] = Field(default_factory=dict)
     http: HTTPToolSettings = Field(default_factory=HTTPToolSettings)
     docker: DockerToolSettings = Field(default_factory=DockerToolSettings)
     git: GitToolSettings = Field(default_factory=GitToolSettings)
+    mcp: MCPSettings = Field(default_factory=MCPSettings)
 
 
 class HarnessConfig(ExtensibleSettings):

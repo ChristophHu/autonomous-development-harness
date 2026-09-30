@@ -48,7 +48,7 @@ class RequirementCompleter:
                 )
         answers = [
             dict(row)
-            for row in self.store.questions.list(task.id)
+            for row in self.store.list_questions(task.id)
             if row["status"] != "open"
         ]
         for answer in answers:
@@ -187,7 +187,7 @@ class RequirementCompleter:
                         )
             except (RuntimeError, ValueError, TypeError):
                 pass
-        self.store.tasks.update(task.id, metadata=task.model_dump(mode="json"))
+        self.store.update_task_fields(task.id, metadata=task.model_dump(mode="json"))
         self.store.event(
             task.id,
             EventKind.REQUIREMENTS_INSPECTED,

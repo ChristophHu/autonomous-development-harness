@@ -69,7 +69,7 @@ class DecisionService:
         if decision.task_id is not None and task is None:
             raise ValueError("task not found")
         if decision.question_id is not None:
-            question = self.store.questions.get(decision.question_id)
+            question = self.store.get_question(decision.question_id)
             if question is None or question["task_id"] != decision.task_id:
                 raise ValueError("question does not belong to decision task")
             if question["status"] not in {"answered", "consumed", "executed"}:
@@ -90,7 +90,7 @@ class DecisionService:
                 if task is None or task.parent_task_id != reference_id:
                     raise ValueError("parent evidence does not match task parent")
             elif item.source == "answer":
-                question = self.store.questions.get(reference_id)
+                question = self.store.get_question(reference_id)
                 if (
                     question is None
                     or question["task_id"] != decision.task_id

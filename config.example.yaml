@@ -1,0 +1,114 @@
+# Complete declarative example. Replace model IDs and paths for your machine.
+# Never put API keys, passwords or access tokens in this file.
+harness:
+  name: autonomous-development-harness
+  environment: development
+paths:
+  workspace: ./workspace
+  obsidian_vault: ./vault
+  logs: ./logs
+  database: ./data/harness.db
+database:
+  type: sqlite
+memory:
+  obsidian:
+    enabled: true
+  qdrant:
+    enabled: false
+    url: http://127.0.0.1:6333
+    collection: harness-memory
+  embeddings:
+    provider: lmstudio
+    base_url: http://127.0.0.1:1234/v1
+    model: <EXACT-EMBEDDING-MODEL-ID>
+    dimensions: 1024
+    batch_size: 32
+models:
+  defaults:
+    provider: lmstudio
+  providers:
+    openai:
+      enabled: true
+      base_url: https://api.openai.com/v1
+    openrouter:
+      enabled: true
+      base_url: https://openrouter.ai/api/v1
+    lmstudio:
+      enabled: true
+      base_url: http://127.0.0.1:1234/v1
+  registry:
+    openai_astra: {provider: openai, model: <EXACT-PREMIUM-MODEL-ID>, tier: premium}
+    openai_sol: {provider: openai, model: <EXACT-ADVANCED-MODEL-ID>, tier: advanced}
+    openai_luna: {provider: openai, model: <EXACT-STANDARD-MODEL-ID>, tier: standard}
+    deepseek_flash: {provider: openrouter, model: <EXACT-ECONOMICAL-MODEL-ID>, tier: economical}
+    qwen_local: {provider: lmstudio, model: <EXACT-LOCAL-MODEL-ID>, tier: local}
+  rates:
+    <EXACT-PREMIUM-MODEL-ID>: {input: 0, output: 0}
+  strategies:
+    planning: {profile: planner}
+    implementation: {profile: coding}
+profiles:
+  software-architect:
+    model: {primary: openai_astra, fallback: [openai_sol, deepseek_flash]}
+    instructions: Design the architecture and explain tradeoffs.
+    tools: [filesystem.read, search.text]
+    permissions: [filesystem]
+  planner:
+    model: {primary: openai_sol, fallback: [openai_luna, deepseek_flash]}
+    instructions: Produce grounded, executable plans.
+    tools: [filesystem.read, search.text]
+    permissions: [filesystem]
+  coding:
+    model: {primary: openai_sol, fallback: [deepseek_flash, qwen_local]}
+    instructions: Implement approved steps and report observed results.
+    tools: [filesystem.read, filesystem.write, shell.execute]
+    permissions: [filesystem, shell]
+  validator:
+    model: {primary: openai_astra, fallback: [openai_sol]}
+    instructions: Independently validate artifacts and evidence.
+    tools: [filesystem.read, test.run_tests]
+    permissions: [filesystem, shell]
+  test-engineer:
+    model: {primary: openai_luna, fallback: [qwen_local]}
+    instructions: Write and run tests.
+    tools: [filesystem.read, test.run_tests]
+    permissions: [filesystem, shell]
+  documentation:
+    model: {primary: qwen_local, fallback: [openai_luna]}
+    instructions: Maintain documentation.
+    tools: [filesystem.read, filesystem.write]
+    permissions: [filesystem]
+  classification:
+    model: {primary: qwen_local, fallback: [deepseek_flash]}
+    instructions: Classify task complexity.
+    tools: []
+    permissions: []
+git:
+  enabled: false
+  branches: {main: main, development: dev}
+  workflow: {feature: feature/, bugfix: bugfix/, hotfix: hotfix/, release: release/}
+docker:
+  enabled: false
+  compose_preferred: true
+api:
+  enabled: true
+  host: 127.0.0.1
+  port: 8080
+  swagger: true
+logging:
+  level: INFO
+  file: ./logs/harness.log
+testing:
+  tdd: true
+  coverage: {statements: 100, branches: 100, functions: 100, lines: 100}
+tools:
+  permissions: {filesystem: write, filesystem.delete: denied, shell: write, git: read, docker: denied}
+  http: {allowed_hosts: []}
+  docker: {compose_file: ./docker-compose.yml}
+  git:
+    allowed_hosts: []
+    credentials: {}
+    ssh: {allowed_hosts: [], allowed_ports: [22], host_keys: {}, credentials: {}}
+  mcp:
+    servers:
+      files: {enabled: false, builtin: filesystem, read_only: true, allow_delete: false}

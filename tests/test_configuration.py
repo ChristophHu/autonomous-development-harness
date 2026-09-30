@@ -8,6 +8,134 @@ from harness.configuration import HarnessConfig
 from harness.core import ConfigurationService
 
 
+def test_complete_example_config_is_valid_and_has_specified_sections(tmp_path):
+    from pathlib import Path
+
+    sample = Path(__file__).resolve().parents[1] / "config.example.yaml"
+    data = yaml.safe_load(sample.read_text())
+    settings = HarnessConfig.model_validate(data)
+    assert set(settings.models.registry) >= {
+        "openai_astra",
+        "openai_sol",
+        "openai_luna",
+        "deepseek_flash",
+        "qwen_local",
+    }
+    assert {item.tier for item in settings.models.registry.values()} >= {
+        "premium",
+        "advanced",
+        "standard",
+        "economical",
+        "local",
+    }
+    assert set(settings.profiles) >= {
+        "software-architect",
+        "planner",
+        "coding",
+        "validator",
+        "test-engineer",
+        "documentation",
+        "classification",
+    }
+    assert settings.git.workflow["feature"] == "feature/"
+    assert settings.testing.coverage.branches == 100
+    assert settings.tools.permissions["filesystem.delete"] == "denied"
+    assert ConfigurationService(sample).validate()
+
+
+@pytest.mark.parametrize(
+    "payload,path",
+    [
+        (
+            {"models": {"rates": {"m": {"input": -1, "output": 2}}}},
+            "models.rates.m.input",
+        ),
+        (
+            {"models": {"rates": {"m": {"input": 1, "output": "bad"}}}},
+            "models.rates.m.output",
+        ),
+        (
+            {
+                "tools": {
+                    "git": {
+                        "credentials": {
+                            "example.com": {"mode": "bearer", "secret_name": "bad name"}
+                        }
+                    }
+                }
+            },
+            "tools.git.credentials.example.com",
+        ),
+        (
+            {
+                "tools": {
+                    "git": {
+                        "ssh": {
+                            "credentials": {
+                                "example.com": {"username": "git", "fingerprint": "bad"}
+                            }
+                        }
+                    }
+                }
+            },
+            "tools.git.ssh.credentials.example.com",
+        ),
+    ],
+)
+def test_operational_config_objects_reject_invalid_shapes(payload, path):
+    with pytest.raises(ValidationError) as error:
+        HarnessConfig.model_validate(payload)
+    assert path in str(error.value).replace("`", "")
+
+
+@pytest.mark.parametrize(
+    "credential",
+    [
+        {"username": "oauth2", "secret_name": "GIT_TOKEN"},
+        {"mode": "basic", "username": "oauth2", "secret_name": "GIT_TOKEN"},
+        {"mode": "bearer", "secret_name": "GIT_TOKEN"},
+    ],
+)
+def test_operational_config_accepts_supported_credential_modes(credential):
+    settings = HarnessConfig.model_validate(
+        {
+            "models": {"rates": {"model-id": {"input": 1, "output": 2}}},
+            "tools": {
+                "git": {
+                    "credentials": {"example.com": credential},
+                    "ssh": {
+                        "credentials": {
+                            "ssh.example.com": {
+                                "username": "git",
+                                "fingerprint": "SHA256:" + "A" * 43,
+                            }
+                        },
+                        "host_keys": {"ssh.example.com": ["ssh-ed25519 AAAA"]},
+                    },
+                }
+            },
+        }
+    )
+    assert settings.models.rates["model-id"].input == 1
+    assert settings.tools.git.credentials["example.com"].secret_name == "GIT_TOKEN"
+
+
+@pytest.mark.parametrize(
+    "credential",
+    [
+        {"secret_name": "GIT_TOKEN"},
+        {"username": "bad:name", "secret_name": "GIT_TOKEN"},
+        {"username": "bad\nname", "secret_name": "GIT_TOKEN"},
+        {"mode": "bearer", "username": "extra", "secret_name": "GIT_TOKEN"},
+    ],
+)
+def test_operational_config_rejects_invalid_credential_combinations(credential):
+    with pytest.raises(ValidationError):
+        HarnessConfig.model_validate(
+            {"tools": {"git": {"credentials": {"example.com": credential}}}}
+        )
+
+
 def test_typed_config_accepts_current_runtime_configuration():
     settings = HarnessConfig.model_validate(
         {

@@ -30,7 +30,10 @@ def test_matrix_has_all_requirements_and_consistent_counts():
         60,
         61,
         62,
+        65,
+        79,
         80,
+        85,
         90,
         92,
         98,
@@ -45,3 +48,6 @@ def test_matrix_has_all_requirements_and_consistent_counts():
     assert "Grant-Replays" in by_id[62][4]
     assert "persistierte Commit-Absicht" in by_id[57][4]
     assert "Zielbranchvalidierung" in by_id[57][4]
+    assert "servicegenaues Namenslisting" in by_id[10][4]
+    assert "exists" in by_id[13][4]
+    assert "historische Readbacks" in by_id[11][4]

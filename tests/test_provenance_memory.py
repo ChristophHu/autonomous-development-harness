@@ -137,6 +137,138 @@ def test_tool_failure_redaction_and_atomic_events(tmp_path):
     assert "SENSITIVE-SECRET" not in store.events.list(task.id)[-1]["payload"]
 
 
+def test_task_question_and_answer_persistence_redacts_secret_canary(tmp_path):
+    store, _orchestrator = runtime(tmp_path)
+    canary = "SS1-CANARY-DO-NOT-PERSIST"
+    store.audit.secrets["SS1_TEST_TOKEN"] = canary
+    task = store.create(
+        Task(
+            title=f"title {canary}",
+            description=f"desc {canary}",
+            context={"apiKey": canary, "ordinary": canary},
+        )
+    )
+    assert canary not in task.title + task.description + str(task.context)
+
+    task.title = f"updated {canary}"
+    task.description = f"updated {canary}"
+    task.result = f"failed {canary}"
+    store.update(task)
+    question_id = store.ask(
+        task.id,
+        f"question {canary}",
+        f"reason {canary}",
+        [f"option {canary}"],
+    )
+    store.answer(question_id, f"answer {canary}", task.id)
+    store.event(task.id, "task.failed", {"detail": f"failure {canary}"})
+
+    with store.database.connect() as connection:
+        rows = [
+            dict(row)
+            for table in ("tasks", "questions", "events")
+            for row in connection.execute(f"SELECT * FROM {table}")
+        ]
+    assert canary not in str(rows)
+    assert "[REDACTED]" in str(rows)
+
+
+def test_task_failure_result_and_event_redact_secret_canary(tmp_path, monkeypatch):
+    store, orchestrator = runtime(tmp_path)
+    canary = "SS1-FAILURE-CANARY"
+    store.audit.secrets["SS1_TEST_TOKEN"] = canary
+    task = store.create(Task(title="failure test"))
+
+    def fail_before_planning(*_args, **_kwargs):
+        raise RuntimeError(f"provider failed with {canary}")
+
+    monkeypatch.setattr(orchestrator, "_invoke", fail_before_planning)
+    with pytest.raises(RuntimeError, match="provider failed") as raised:
+        asyncio.run(orchestrator.run(task.id))
+
+    with store.database.connect() as connection:
+        row = connection.execute(
+            "SELECT result FROM tasks WHERE id=?", (task.id,)
+        ).fetchone()
+    events = store.events.list(task.id, "task.failed")
+    assert canary not in str(row) + str(events)
+    assert "[REDACTED]" in row["result"]
+    assert canary not in str(raised.value)
+
+
+def test_sensitive_field_names_are_redacted_recursively(tmp_path):
+    store, _orchestrator = runtime(tmp_path)
+    safe = store.audit.sanitize(
+        {
+            "apiKey": "unknown-key",
+            "nested": [
+                {"access_token": "unknown-token"},
+                {"client-secret": "unknown-secret"},
+                {"Authorization": "Bearer unknown-auth"},
+                {"ordinary": "visible"},
+            ],
+        }
+    )
+    assert safe == {
+        "apiKey": "[REDACTED]",
+        "nested": [
+            {"access_token": "[REDACTED]"},
+            {"client-secret": "[REDACTED]"},
+            {"Authorization": "[REDACTED]"},
+            {"ordinary": "visible"},
+        ],
+    }
+
+
+def test_plan_validation_subtask_and_correction_storage_redacts_canary(tmp_path):
+    from harness.agents import Subtask
+
+    store, _orchestrator = runtime(tmp_path)
+    canary = "SS1-ARTIFACT-CANARY"
+    store.audit.secrets["SS1_ARTIFACT_TOKEN"] = canary
+    task = store.create(Task(title="artifact persistence"))
+    plan_id = store.save_plan(
+        task.id,
+        f"summary {canary}",
+        {"description": canary, "apiKey": "unknown-sensitive-value"},
+    )
+    store.save_subtasks(
+        task.id,
+        [Subtask(id="step", title=canary, description=f"desc {canary}")],
+        plan_id,
+    )
+    store.update_subtask(
+        task.id,
+        "step",
+        "completed",
+        {"output": canary, "client_secret": "unknown-sensitive-value"},
+        plan_id,
+    )
+    store.record_validation(
+        task.id, False, {"errors": [canary], "access_token": "unknown-sensitive-value"}
+    )
+    store.record_correction(
+        task.id,
+        {
+            "category": "validation",
+            "source": "validator",
+            "rule": "safe.output",
+            "message": canary,
+            "evidence": {"credential": "unknown-sensitive-value"},
+        },
+        plan_id,
+    )
+
+    with store.database.connect() as connection:
+        rows = [
+            dict(row)
+            for table in ("plans", "subtasks", "validations", "correction_items")
+            for row in connection.execute(f"SELECT * FROM {table}")
+        ]
+    assert canary not in str(rows)
+    assert "unknown-sensitive-value" not in str(rows)
+
+
 def test_context_is_isolated_between_parallel_tasks(tmp_path):
     store, orchestrator = runtime(tmp_path)
     first, second = (

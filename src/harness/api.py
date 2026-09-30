@@ -198,20 +198,28 @@ def _event(row):
         id=row["id"],
         task_id=row["task_id"],
         kind=row["kind"],
-        payload=json.loads(row["payload"]),
+        payload=store.audit.sanitize(json.loads(row["payload"])),
         created_at=row["created_at"],
     )
 
 
 def _question(row):
+    safe = store.audit.sanitize(
+        {
+            "question": row["question"],
+            "reason": row["reason"],
+            "options": json.loads(row["options"]),
+            "answer": row["answer"],
+        }
+    )
     return QuestionResponse(
         id=row["id"],
         task_id=row["task_id"],
-        question=row["question"],
-        reason=row["reason"],
-        options=json.loads(row["options"]),
+        question=safe["question"],
+        reason=safe["reason"],
+        options=safe["options"],
         required=bool(row["required"]),
-        answer=row["answer"],
+        answer=safe["answer"],
         status=row["status"],
         created_at=row["created_at"],
         answered_at=row["answered_at"],
@@ -350,7 +358,7 @@ def task_result(task_id: int):
 )
 def events(task_id: int):
     _require_task(task_id)
-    return [_event(row) for row in store.events.list(task_id)]
+    return [_event(row) for row in store.list_events(task_id)]
 
 
 @router.get(
@@ -360,7 +368,7 @@ def events(task_id: int):
 )
 def questions(task_id: int):
     _require_task(task_id)
-    return [_question(row) for row in store.questions.list(task_id)]
+    return [_question(row) for row in store.list_questions(task_id)]
 
 
 @router.post(
@@ -408,7 +416,7 @@ def ask_question(task_id: int, payload: QuestionRequest):
 )
 def plan(task_id: int):
     _require_task(task_id)
-    return store.plans.latest(task_id)
+    return store.latest_plan(task_id)
 
 
 @router.get(
@@ -418,7 +426,7 @@ def plan(task_id: int):
 )
 def validation(task_id: int):
     _require_task(task_id)
-    return store.validations.latest(task_id)
+    return store.latest_validation(task_id)
 
 
 @router.get(
@@ -465,7 +473,7 @@ def all_events(
     until_utc = until.astimezone(UTC) if until else None
     if since_utc and until_utc and since_utc > until_utc:
         raise HTTPException(422, "since must not be later than until")
-    rows = store.events.list(
+    rows = store.list_events(
         task_id,
         event_type,
         since_utc.isoformat() if since_utc else None,

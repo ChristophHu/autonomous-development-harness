@@ -15,6 +15,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from jsonschema import Draft202012Validator, ValidationError
+from pydantic import ValidationError as PydanticValidationError
 
 from .isolation import git_metadata, isolated_command
 from .process_control import current_run_control, run_cancellable
@@ -684,6 +685,69 @@ class ToolRegistry:
                 self.executor.http,
             )
         )
+        self._register_mcp()
+
+    def _register_mcp(self):
+        from .configuration import MCPSettings
+        from .mcp import MCPClient, MCPError, builtin_filesystem_command
+        from .mcp_servers.filesystem import _DELETE, _READ, _WRITE
+
+        mcp_config = self.permissions.config.data.get("tools", {}).get("mcp")
+        if not mcp_config:
+            return
+        try:
+            servers = MCPSettings.model_validate(mcp_config).servers
+        except PydanticValidationError:
+            raise ValueError("tools.mcp has invalid configuration") from None
+        for server_name, settings in servers.items():
+            if not settings.enabled:
+                continue
+            if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", server_name):
+                raise ValueError("invalid MCP server name")
+            command = (
+                builtin_filesystem_command(
+                    self.workspace,
+                    read_only=settings.read_only,
+                    allow_delete=settings.allow_delete,
+                )
+                if settings.builtin == "filesystem"
+                else settings.command
+            )
+            client = MCPClient(command, self.workspace, timeout=settings.timeout)
+            try:
+                discovered = client.discover()
+            except MCPError as exc:
+                raise ValueError(f"MCP server {server_name} is unavailable") from exc
+            for remote in discovered:
+                name = remote["name"]
+                if settings.builtin:
+                    if name in _READ:
+                        permission, risk = "filesystem", "READ"
+                    elif name in _WRITE:
+                        permission, risk = "filesystem", "WRITE"
+                    elif name in _DELETE:
+                        permission, risk = "filesystem.delete", "DESTRUCTIVE"
+                    else:
+                        raise ValueError("builtin MCP server advertised unknown tool")
+                elif name in settings.allow_tools:
+                    permission, risk = f"mcp.{server_name}", "DESTRUCTIVE"
+                else:
+                    continue
+                schema = remote["inputSchema"]
+                spec_name = f"mcp.{server_name}.{name}"
+                self.register(
+                    ToolSpec(
+                        spec_name,
+                        str(remote.get("description", "MCP tool"))[:500],
+                        schema,
+                        permission,
+                        risk,
+                        lambda _client=client, _name=name, _schema=schema, **kwargs: (
+                            _client.call(_name, kwargs, _schema)
+                        ),
+                        output_schema=remote.get("outputSchema"),
+                    )
+                )
 
     def register(self, spec: ToolSpec):
         Draft202012Validator.check_schema(spec.input_schema)
@@ -711,9 +775,12 @@ class ToolRegistry:
         spec = self.specs.get(name)
         if not spec:
             raise KeyError(f"unknown tool: {name}")
+        mcp_tool = name.startswith("mcp.")
         try:
             Draft202012Validator(spec.input_schema).validate(arguments)
         except ValidationError as exc:
+            if mcp_tool:
+                raise ValueError("invalid tool arguments") from None
             raise ValueError("invalid tool arguments: " + exc.message) from exc
         if profile and (
             name not in profile.tools
@@ -745,7 +812,9 @@ class ToolRegistry:
                     "tool": name,
                     "risk": risk,
                     "call_id": call_id,
-                    "input": arguments,
+                    "input": {"argument_names": sorted(arguments)}
+                    if mcp_tool
+                    else arguments,
                 },
             )
         try:
@@ -757,18 +826,35 @@ class ToolRegistry:
             if getattr(result, "returncode", 0) and not allow_nonzero:
                 raise ToolExecutionError(f"{name} exited with code {result.returncode}")
             if spec.output_schema:
-                Draft202012Validator(spec.output_schema).validate(result)
+                try:
+                    Draft202012Validator(spec.output_schema).validate(result)
+                except ValidationError:
+                    if mcp_tool:
+                        raise ToolExecutionError(
+                            "MCP output schema violation"
+                        ) from None
+                    raise
             if self.event_sink:
                 self.event_sink(
                     "TOOL_CALL_COMPLETED",
-                    {"tool": name, "call_id": call_id, "output": str(result)},
+                    {
+                        "tool": name,
+                        "call_id": call_id,
+                        "output": {"type": type(result).__name__}
+                        if mcp_tool
+                        else str(result),
+                    },
                 )
             return result
         except Exception as exc:
             if self.event_sink:
                 self.event_sink(
                     "TOOL_CALL_FAILED",
-                    {"tool": name, "call_id": call_id, "error": str(exc)},
+                    {
+                        "tool": name,
+                        "call_id": call_id,
+                        "error": type(exc).__name__ if mcp_tool else str(exc),
+                    },
                 )
             raise
 

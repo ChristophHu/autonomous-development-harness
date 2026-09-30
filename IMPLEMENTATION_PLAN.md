@@ -1,5 +1,49 @@
 # Weiterer Implementierungsplan zur GAP_MATRIX
 
+## Strukturpaket MCP-SERVER-ORDNER
+
+Der integrierte Filesystem-MCP-Server wurde ohne Verhaltensänderung nach `src/harness/mcp_servers/filesystem.py` verschoben. Das neue Python-Paket enthält künftig die integrierten MCP-Server; `mcp.py` bleibt Client und `tools.py` Registry. Builtin-Startkommando, Imports, Modul-Tests und `harness-filesystem-mcp`-Entry-Point referenzieren nur noch den neuen Paketpfad. Die Matrixzählung ändert sich durch diesen Strukturumbau nicht.
+
+## Umgesetzte Pakete MODELCLI2 und FSMCP4
+
+MODELCLI2: `harness models list/status` verbinden Provider-Health, dynamische Discovery und konfigurierte Registry zu einer deterministischen Übersicht. Je Modell werden ID, Provider, Alias, Tier und Verfügbarkeit angezeigt. Konfigurierte, aber nicht entdeckte Modelle sowie fehlende Provider bleiben sichtbar; Discoveryfehler geben keine Exceptiondetails aus. Alle acht mindestens geforderten CLI-Top-Level-Befehle/-Gruppen sind per CLI-Vertrag geprüft. Punkte 79 und 85 sind nach Abgleich mit den Mindestanforderungen des Ursprungsprompts erfüllt; persistente Discovery gehört zu Punkt 40.
+
+FSMCP4: Der Filesystem-MCP-Referenzserver ergänzt `copy_file`, `exists` und `glob`. Copy nutzt die bestehenden sicheren dirfd-Read-/exklusiven Create-Pfade, überschreibt kein Ziel und verändert die Quelle nicht; `exists` folgt keinen Symlinks. Glob traversiert nur reguläre Workspace-Dateien, ignoriert Symlinks und `.git` und begrenzt Ergebnisse. Registry-Rechte klassifizieren Exists/Glob als Read und Copy als Write; Delete bleibt separat. Punkt 65 ist damit erfüllt; allgemeine Prozess-Leseisolation bleibt Punkt 93/94.
+
+RED/GREEN-Tests umfassen Modellstatus, CLI-Gruppen, Pfadausbrüche, Symlinks, vorhandene Copy-Ziele, Rechte-/Limitgrenzen und eine native macOS-MCP-Ausführung. Finale `sh scripts/verify.sh`: **1087 Tests bestanden**, 100 % Statements/Branches/Funktionen (6890 Statements/2438 Branches, 37 Module/504 Funktionen), Ruff und Formatcheck bestanden. Matrix: 41 erfüllt, 66 teilweise, 2 offen.
+
+## Umgesetzte Pakete CFG3, KEY2 und TASKCLI1
+
+CFG3: Eine getrennte, sichere `config.example.yaml` deckt die im Prompt vorgeschlagenen fünf Modelltiers, sieben Profile, Git-Workflowpräfixe und Betriebsabschnitte ab. Modell-IDs sind austauschbare Platzhalter, keine im Code festgeschriebenen Annahmen. Dynamische Modellrates sowie HTTPS-Basic-/Bearer- und SSH-Credentialobjekte sind strikt typisiert; fehlerhafte Werte und Moduskombinationen scheitern bei der Validierung. Punkt 8 ist erfüllt, Punkt 7 bleibt wegen absichtlich erweiterbarer Felder und nicht durchgängig live abgenommener optionaler Betriebskonfiguration teilweise.
+
+KEY2: Der Keychain-Provider akzeptiert einen expliziten absoluten Test-Schlüsselbundpfad für sämtliche Operationen. `set` sendet einen hexkodierten Wert über stdin an `security -i` und prüft per Readback, ohne Secrets in argv oder Fehlertext zu legen. Ein temporärer macOS-Schlüsselbund mit Leerzeichen im Pfad belegt Set/Get/Update/List/Exists/Delete, CLI-Eingabe und Environment-Fallback; er wird danach gezielt gelöscht. Der persönliche Schlüsselbund bleibt unverändert. Punkte 10 und 13 sind erfüllt; allgemeine Secret-Safety bleibt Punkt 11.
+
+TASKCLI1: `tasks create` nimmt neben den bisherigen Positionsargumenten `--file` mit validiertem JSON/YAML-Taskvertrag entgegen; geschützte Lifecycle-/Ergebnisfelder, unbekannte Felder und übergroße Eingaben werden zurückgewiesen. `tasks watch` liest lokale Task-SSE-Ereignisse, nutzt `Last-Event-ID` für Wiederaufnahme, ignoriert wiederholte IDs und beendet sich bei terminalen Zuständen. Verbindungsfehler werden ohne Serverdetails angezeigt. Punkt 84 ist erfüllt; Punkt 79 bleibt wegen weiterer CLI-Gesamtbreite teilweise.
+
+Abnahme der drei Pakete zusammen mit MCP1–MCP3: Native `sh scripts/verify.sh` bestand mit **1082 Tests**, 100 % Statements/Branches/Funktionen (6838 Statements/2410 Branches, 37 Module/501 Funktionen), Ruff und Formatcheck. Die Matrix enthält nun 38 erfüllte, 69 teilweise erfüllte und 2 offene Punkte von 109.
+
+## Umgesetzte Pakete MCP1–MCP3 – lokale MCP-Toolschicht und Filesystem-Referenzserver
+
+MCP1: Typisierte, standardmäßig deaktivierte `tools.mcp.servers`-Konfiguration; für ausdrücklich freigegebene lokale `stdio`-Server werden Protokollversion und `tools/list` geprüft, Input-/Outputschemas validiert und erlaubte Namen unter `mcp.<server>.<tool>` registriert. Externe Servertools sind konservativ destruktiv und benötigen globale `mcp.<server>: write`- sowie Profilfreigabe. Die bestehenden Tool-Audit-/Abbruchpfade bleiben verbindlich; MCP-Audit speichert keine ungeprüften Argumentwerte oder Inhalte. Nachrichten, Laufzeit und Prozessgruppenlebensdauer sind begrenzt.
+
+MCP2: `harness-filesystem-mcp` ist ein separat startbarer Referenzserver für Workspace-relative Datei-/Verzeichnisoperationen. Read/List/Search, Create/Write/Mkdir/Delete/Move sind mit separaten Schreib-/Löschrechten, `dir_fd`/`O_NOFOLLOW`, `.git`-Sperre und Größenlimits umgesetzt. `write_file` ersetzt atomar, `create_file` räumt Fehlversuche auf. Move kopiert exklusiv und löscht danach die Quelle; bei Abbruch zwischen beiden Schritten kann eine zusätzliche Kopie verbleiben, aber keine stille Überschreibung des Ziels.
+
+MCP3: Echte `stdio`-E2Es einschließlich nativer `sandbox-exec`-Abnahme für Read/Create/Move/Delete, Registry-/Profil-/Recovery-Gates, fehlerhafte und bösartige Serverantworten, Schemawechsel, Timeouts, Prozessgruppenkill, Pfadausbrüche, Symlinks, Audit-Canary und Konfigurationsfehler wurden per RED/GREEN getestet. Native `sh scripts/verify.sh`: **1043 Tests bestanden**, 100 % Statements/Branches/Funktionen (6721 Statements/2364 Branches, 37 Module/496 Funktionen), Ruff und Formatcheck bestanden. Die Matrixpunkte 54/65/93 werden vertieft, aber nicht voreilig geschlossen; Punkt 55 bleibt erfüllt. Streamable HTTP und allgemeine Read-Isolation externer Server bleiben eigenständige Folgepakete.
+
+## Abgeschlossenes Paket SS1 – durchgängige Secret-Redaktion (Punkt 11 vertieft)
+
+`AuditRecorder.sanitize()` erkennt sensible Feldnamen rekursiv und unabhängig von Groß-/Kleinschreibung bzw. Trennzeichen (API-Key, Token, Passwort, Secret, Credential, Authorization, Private Key, Cookie) und ersetzt konfigurierte Secretwerte in Freitexten. Die effektive Runtime-Konfiguration wird nicht verändert.
+
+`Store` redigiert Tasks, Metadaten, Resultate, Fragen/Antworten, Events, Pläne, Subtasks, Validierungen und Korrekturfindings an den Schreibgrenzen. Interne Reads, API und CLI redigieren zusätzlich historische Task-/Event-/Frage-/Plan-/Validation-Daten; Requirement- und Recovery-Kontexte nutzen diese Read-Fassade ebenfalls. Fehlertext wird vor Persistenz und erneutem Propagieren bereinigt. Bekannte Legacydaten werden nicht rückwirkend in SQLite umgeschrieben. Nicht konfigurierte beliebige Geheimnisse in Freitexten sowie externe Plugin-/Bibliothekslogs lassen sich nicht allgemein erkennen; Punkt 11 bleibt daher teilweise.
+
+Canary-TDD deckt Persistenz und Readback für Task/Metadaten, Frage/Antwort, Events, Plan/Subtask, Validierung/Korrektur, Fehlertext, API/CLI und Legacyzeilen ab. Native `sh scripts/verify.sh`: **996 passed**, 100 % Statements/Branches (6289 Statements/2182 Branches), 100 % Funktionen (35 Module/476 Funktionen), Ruff und Formatcheck bestanden.
+
+## Abgeschlossenes Paket KEY1 – Secret-Provider und CLI (Punkte 10/13/79 vertieft)
+
+`SecretProvider` definiert den injizierbaren Read-Vertrag; `KeychainSecretProvider` kapselt macOS-`security`, `EnvironmentSecretProvider` liest die Prozessumgebung, und `SecretResolver` behält Keychain-vor-Environment-Priorität sowie die bestehenden Aufrufer bei. Secret-Namen sind auf `[A-Z0-9_]{1,128}` begrenzt. Beim Setzen wird der Secretwert über stdin statt argv an `security` übergeben. Das CLI bietet `secrets list/set/delete/exists`; `list` filtert Accountnamen auf den exakten Harness-Service, und Fehlertexte geben keine Exceptiondetails oder Werte preis.
+
+TDD prüft Providerinjektion, Priorität/Fallback, Namenvalidierung, stdin statt argv, servicegenaues Listing, Fehlerfälle und CLI-Exit-/Ausgabeverträge. KEY1-fokussiert: **53 Tests**, 100 % Statements/Branches für `security.py` und `cli.py`. Vollständige native `sh scripts/verify.sh`: **989 passed**, 100 % Statements/Branches (6229 Statements/2176 Branches), 100 % Funktionen (35 Module/462 Funktionen), Ruff und Formatcheck. Keine reale Keychain wurde verändert; ein isolierter Live-Keychain-Abnahmetest bleibt offen. Punkt 10/13/79 wird vertieft, aber nicht pauschal geschlossen; Punkt 11 bleibt ein separates Secret-Safety-Paket.
+
 ## Abgeschlossenes Paket CFG2 – typisierte Config-Schemas und atomarer Reload (Punkt 12 erfüllt)
 
 `src/harness/configuration.py` definiert strikte Pydantic-Modelle für die bekannten Settings aus Harness, Pfaden, SQLite, Memory/Qdrant/Embeddings, Git/Docker, API, Logging, Provider/Modellregistry/Strategien, Profile, Testing/Coverage und Tools. Bekannt definierte Felder verwenden Strict-Typen und Wertebereiche; dynamische Registries und nicht spezifizierte Erweiterungen bleiben erhalten. Timeout- und Retry-Objekte sind selbst strikt, damit unbekannte Felder in diesen begrenzten Verträgen nicht stillschweigend akzeptiert werden.

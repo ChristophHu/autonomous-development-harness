@@ -12,11 +12,14 @@ import sqlite3
 import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor, wait
+from pathlib import Path
+from typing import Annotated
 
 import httpx
 import typer
 import uvicorn
 import yaml
+from pydantic import ValidationError as PydanticValidationError
 
 from .core import ROOT, Config, Task, build
 from .docker_broker import DockerComposeBroker
@@ -422,10 +425,55 @@ def memory_sync():
 
 
 @tasks.command("create")
-def task_create(title: str, description: str = ""):
+def task_create(
+    title: str | None = typer.Argument(None),
+    description: str = typer.Argument(""),
+    spec_file: Annotated[Path | None, typer.Option("--file")] = None,
+):
+    if spec_file is not None:
+        if title or description:
+            typer.echo("choose title/description or --file")
+            raise typer.Exit(1)
+        try:
+            item = _load_task_spec(spec_file)
+        except (OSError, ValueError, PydanticValidationError, yaml.YAMLError):
+            typer.echo("invalid task specification")
+            raise typer.Exit(1) from None
+    else:
+        if not title:
+            typer.echo("task title is required")
+            raise typer.Exit(1)
+        item = Task(title=title, description=description)
     _, _, orchestrator = build()
-    item = orchestrator.service.create(Task(title=title, description=description))
+    try:
+        item = orchestrator.service.create(item)
+    except ValueError:
+        typer.echo("task creation failed")
+        raise typer.Exit(1) from None
     typer.echo(f"created task {item.id}")
+
+
+def _load_task_spec(path: Path) -> Task:
+    if path.suffix.lower() not in {".yaml", ".yml", ".json"}:
+        raise ValueError("unsupported task specification format")
+    if path.stat().st_size > 1_000_000:
+        raise ValueError("task specification is too large")
+    text = path.read_text(encoding="utf-8")
+    data = json.loads(text) if path.suffix.lower() == ".json" else yaml.safe_load(text)
+    if not isinstance(data, dict) or set(data) & {
+        "id",
+        "status",
+        "created_at",
+        "updated_at",
+        "result",
+        "plan",
+        "validation_result",
+        "test_result",
+        "git_state",
+        "decisions",
+    }:
+        raise ValueError("task specification contains protected fields")
+    return Task.model_validate(data)
 
 
 @tasks.command("list")
@@ -459,39 +507,129 @@ def task_run(task_id: int):
 @tasks.command("events")
 def task_events(task_id: int):
     _, store, _ = build()
-    for event in store.events.list(task_id):
-        typer.echo(f"{event['created_at']} {event['kind']} {event['payload']}")
+    for event in store.list_events(task_id):
+        payload = store.audit.sanitize(json.loads(event["payload"]))
+        typer.echo(
+            f"{event['created_at']} {event['kind']} "
+            f"{json.dumps(payload, sort_keys=True)}"
+        )
+
+
+@tasks.command("watch")
+def task_watch(task_id: int):
+    conf, store, _ = build()
+    if store.get(task_id) is None:
+        typer.echo("task not found")
+        raise typer.Exit(1)
+    typer.echo(f"TASK-{task_id}")
+    try:
+        _watch_task_events(conf, task_id)
+    except KeyboardInterrupt:
+        raise typer.Exit(130) from None
+    except (httpx.HTTPError, ValueError, RuntimeError):
+        typer.echo("task event stream unavailable")
+        raise typer.Exit(1) from None
+
+
+def _watch_task_events(conf, task_id: int):
+    api = conf.settings.api
+    url = f"http://{api.host}:{api.port}/api/events/stream"
+    cursor = 0
+    failures = 0
+    while failures < 3:
+        previous = cursor
+        try:
+            with httpx.stream(
+                "GET",
+                url,
+                params={"task_id": task_id},
+                headers={"Last-Event-ID": str(cursor)},
+                timeout=30,
+            ) as response:
+                response.raise_for_status()
+                event_id = None
+                data_lines = []
+                for line in response.iter_lines():
+                    if line.startswith(":"):
+                        continue
+                    if line == "":
+                        if data_lines:
+                            event = json.loads("\n".join(data_lines))
+                            if (
+                                not isinstance(event, dict)
+                                or not isinstance(event_id, int)
+                                or event.get("id") != event_id
+                                or event.get("task_id") != task_id
+                                or not isinstance(event.get("kind"), str)
+                            ):
+                                raise ValueError("invalid task event")
+                            if event_id <= cursor:
+                                event_id, data_lines = None, []
+                                continue
+                            cursor = event_id
+                            typer.echo(
+                                f"[{event.get('created_at', '')}] {event['kind']}"
+                            )
+                            if event["kind"] in {"task.completed", "task.failed"} or (
+                                event["kind"] == "task.status"
+                                and isinstance(event.get("payload"), dict)
+                                and event["payload"].get("status") == "cancelled"
+                            ):
+                                return
+                        event_id, data_lines = None, []
+                    elif line.startswith("id:"):
+                        try:
+                            event_id = int(line[3:].strip())
+                        except ValueError as exc:
+                            raise ValueError("invalid event cursor") from exc
+                    elif line.startswith("data:"):
+                        data_lines.append(line[5:].lstrip())
+        except (httpx.HTTPError, ValueError):
+            failures += 1
+        else:
+            failures = 0 if cursor > previous else failures + 1
+    raise RuntimeError("event stream disconnected")
 
 
 @models.command("list")
 def model_list():
     _, _, orchestrator = build()
-    for name, provider in orchestrator.models.providers.items():
+    providers = orchestrator.models.providers
+    definitions = orchestrator.models.models
+    names = set(providers) | {item.get("provider") for item in definitions.values()}
+    for name in sorted(item for item in names if isinstance(item, str)):
+        provider = providers.get(name)
         try:
-            available = bool(provider.health())
+            available = bool(provider and provider.health())
         except (OSError, RuntimeError, ValueError):
             available = False
         typer.echo(f"{name}\t{'available' if available else 'unavailable'}")
-        try:
-            discovered = provider.models()
-        except (OSError, RuntimeError, ValueError):
-            typer.echo(f"{name}\t<discovery failed>")
-            continue
-        aliases = {
-            alias: definition
-            for alias, definition in orchestrator.models.models.items()
-            if definition.get("provider") == name
+        discovered = []
+        if provider is not None:
+            try:
+                discovered = [
+                    item for item in provider.models() if isinstance(item, str) and item
+                ]
+            except (OSError, RuntimeError, ValueError):
+                typer.echo(f"{name}\t<discovery failed>")
+        configured = {
+            alias: item
+            for alias, item in definitions.items()
+            if item.get("provider") == name
         }
-        for model_id in discovered:
-            if not isinstance(model_id, str) or not model_id:
-                continue
-            matching = [
-                alias
-                for alias, definition in aliases.items()
-                if definition.get("model") == model_id
-            ]
-            label = ",".join(matching) if matching else "-"
-            typer.echo(f"{model_id}\t{name}\t{label}")
+        for alias, item in sorted(configured.items()):
+            model_id = item.get("model") or "-"
+            tier = item.get("tier") or "-"
+            state = (
+                "available" if available and model_id in discovered else "unavailable"
+            )
+            typer.echo(f"{model_id}\t{name}\t{alias}\t{tier}\t{state}")
+        for model_id in sorted(
+            set(discovered) - {item.get("model") for item in configured.values()}
+        ):
+            typer.echo(
+                f"{model_id}\t{name}\t-\t-\t{'available' if available else 'unavailable'}"
+            )
 
 
 @models.command("status")
@@ -569,18 +707,44 @@ def config_validate():
 
 @secrets.command("list")
 def secrets_list():
-    typer.echo("\n".join(SecretResolver().list_names()))
+    try:
+        typer.echo("\n".join(SecretResolver().list_names()))
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+        typer.echo("secret operation failed")
+        raise typer.Exit(1) from None
 
 
 @secrets.command("set")
 def secret_set(name: str):
     value = typer.prompt("Secret", hide_input=True, confirmation_prompt=True)
-    SecretResolver().set(name, value)
+    try:
+        SecretResolver().set(name, value)
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+        typer.echo("secret operation failed")
+        raise typer.Exit(1) from None
     typer.echo(f"stored {name} in macOS Keychain")
 
 
 @secrets.command("delete")
 def secret_delete(name: str):
-    if not SecretResolver().delete(name):
+    try:
+        deleted = SecretResolver().delete(name)
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+        typer.echo("secret operation failed")
+        raise typer.Exit(1) from None
+    if not deleted:
+        typer.echo("secret not found")
         raise typer.Exit(1)
     typer.echo(f"deleted {name} from macOS Keychain")
+
+
+@secrets.command("exists")
+def secret_exists(name: str):
+    try:
+        found = SecretResolver().exists(name)
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+        typer.echo("secret operation failed")
+        raise typer.Exit(1) from None
+    typer.echo("exists" if found else "not found")
+    if not found:
+        raise typer.Exit(1)

@@ -1,6 +1,7 @@
 import subprocess
 
 import pytest
+from jsonschema import ValidationError
 
 from harness.core import Config, Permissions
 from harness.tools import ToolExecutor, ToolRegistry, ToolSpec
@@ -160,6 +161,23 @@ def test_registry_denies_write_without_permission():
     )
     with pytest.raises(PermissionError):
         registry.execute("write", {})
+
+
+def test_registry_rejects_native_tool_output_schema_violation():
+    registry = ToolRegistry(Permissions(Config()))
+    registry.register(
+        ToolSpec(
+            "bad-output",
+            "return wrong type",
+            {"type": "object"},
+            "filesystem",
+            "READ",
+            lambda: "not-an-integer",
+            output_schema={"type": "integer"},
+        )
+    )
+    with pytest.raises(ValidationError):
+        registry.execute("bad-output", {})
 
 
 def test_registry_confines_process_tools_to_workspace(tmp_path, monkeypatch):
