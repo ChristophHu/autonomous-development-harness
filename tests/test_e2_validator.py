@@ -21,6 +21,7 @@ def _task():
                 "id": "implement",
                 "write_paths": ["addition.py"],
                 "acceptance_criteria": ["sum"],
+                "requirement_ids": ["add two integers"],
             }
         ],
     }
@@ -58,6 +59,27 @@ def _output(changed_files=None):
     )
 
 
+def test_independent_review_must_cover_exactly_declared_contract_keys():
+    from harness.validation import EvidenceValidator
+
+    task = _task()
+    task.requirements = ["add two integers"]
+    valid = {
+        "requirements": {"add two integers": True},
+        "criteria": {"sum": True},
+        "evidence": "checked output and tests",
+    }
+    extra = {
+        **valid,
+        "requirements": {**valid["requirements"], "invented": True},
+    }
+    missing = {**valid, "criteria": {}}
+
+    assert EvidenceValidator._review_confirms(valid, task)
+    assert not EvidenceValidator._review_confirms(extra, task)
+    assert not EvidenceValidator._review_confirms(missing, task)
+
+
 def test_plan_must_match_executor_outputs(tmp_path):
     _, orchestrator = runtime(tmp_path)
     task = _task()
@@ -72,6 +94,16 @@ def test_plan_must_match_executor_outputs(tmp_path):
     assert plan_finding.category == "plan"
     assert plan_finding.source == "plan_validator"
     assert "missing executor result" in plan_finding.message
+
+
+def test_plan_requires_requirement_and_criterion_in_the_same_step(tmp_path):
+    _, orchestrator = runtime(tmp_path)
+    task = _task()
+    task.plan["subtasks"][0]["acceptance_criteria"] = []
+
+    errors, _ = orchestrator.validator._plan_findings(task, [_output()])
+
+    assert "requirement has no linked acceptance criterion: add two integers" in errors
 
 
 def test_missing_workspace_snapshots_block_mutation_validation(tmp_path):

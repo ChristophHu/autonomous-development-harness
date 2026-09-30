@@ -36,8 +36,11 @@ class ModelUsageReportService:
         self,
         *,
         task_id=None,
+        agent=None,
+        profile=None,
         provider=None,
         model=None,
+        group_by=None,
         since=None,
         until=None,
         limit=50,
@@ -57,14 +60,28 @@ class ModelUsageReportService:
             raise ValueError("offset must be a non-negative integer")
         provider = self._text(provider, "provider")
         model = self._text(model, "model")
+        agent = self._text(agent, "agent")
+        profile = self._text(profile, "profile")
+        if group_by is not None and group_by not in {
+            "task_id",
+            "agent",
+            "profile",
+            "provider",
+            "model",
+            "day",
+        }:
+            raise ValueError("invalid group_by dimension")
         since = self._date(since, "since")
         until = self._date(until, "until")
         if since is not None and until is not None and since > until:
             raise ValueError("since must not be later than until")
         report = self.repository.usage_report(
             task_id=task_id,
+            agent=agent,
+            profile=profile,
             provider=provider,
             model=model,
+            group_by=group_by,
             since=since,
             until=until,
             limit=limit,

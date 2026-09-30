@@ -207,6 +207,7 @@ def test_orchestrator_uses_embedding_config_dimensions_and_batch_size(tmp_path):
     config = Config()
     config.data["paths"]["database"] = str(tmp_path / "harness.db")
     config.data["paths"]["obsidian_vault"] = str(tmp_path / "vault")
+    config.data["tools"]["mcp"]["servers"]["vault"]["enabled"] = False
     config.data["memory"]["embeddings"].pop("dimensions")
     orchestrator = Orchestrator(Store(config), config)
     assert orchestrator.qdrant.dimension == 1024

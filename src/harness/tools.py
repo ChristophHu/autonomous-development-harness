@@ -441,6 +441,7 @@ class ToolRegistry:
             env_allowlist=tool_config.get("env_allowlist", []),
         )
         self.event_sink = event_sink
+        self.approvals = None
         self.workspace = Path(
             workspace or permissions.config.path("workspace")
         ).resolve()
@@ -693,6 +694,7 @@ class ToolRegistry:
         from .mcp import (
             MCPClient,
             MCPError,
+            MCPHTTPClient,
             builtin_filesystem_command,
             builtin_obsidian_command,
         )
@@ -716,7 +718,23 @@ class ToolRegistry:
                 if settings.builtin == "obsidian"
                 else None
             )
-            if settings.builtin == "filesystem":
+            if settings.transport == "streamable_http":
+                token = None
+                if settings.auth_secret:
+                    from .security import SecretResolver
+
+                    token = SecretResolver().get(settings.auth_secret)
+                    if not token:
+                        raise ValueError(
+                            f"MCP server {server_name} auth secret is unavailable"
+                        )
+                client = MCPHTTPClient(
+                    settings.url,
+                    settings.allowed_hosts,
+                    timeout=settings.timeout,
+                    bearer_token=token,
+                )
+            elif settings.builtin == "filesystem":
                 command = builtin_filesystem_command(
                     self.workspace,
                     read_only=settings.read_only,
@@ -732,12 +750,13 @@ class ToolRegistry:
                 if settings.builtin
                 else None
             )
-            client = MCPClient(
-                command,
-                self.workspace,
-                timeout=settings.timeout,
-                read_roots=read_roots,
-            )
+            if settings.transport == "stdio":
+                client = MCPClient(
+                    command,
+                    self.workspace,
+                    timeout=settings.timeout,
+                    read_roots=read_roots,
+                )
             try:
                 discovered = client.discover()
             except MCPError as exc:
@@ -796,7 +815,16 @@ class ToolRegistry:
             for name in allowed_names
         ]
 
-    def execute(self, name, arguments, profile=None, *, allow_nonzero=False):
+    def execute(
+        self,
+        name,
+        arguments,
+        profile=None,
+        *,
+        allow_nonzero=False,
+        approval=None,
+        task_id=None,
+    ):
         control = current_run_control()
         if control is not None:
             control.check()
@@ -832,6 +860,47 @@ class ToolRegistry:
             target = (self.workspace / arguments["path"]).resolve()
             if target not in paths:
                 raise PermissionError("write is outside recovery step scope")
+        if name.startswith("filesystem.") and risk in {"WRITE", "DESTRUCTIVE"}:
+            from .isolation import git_metadata
+
+            path_values = [arguments.get("path"), arguments.get("destination")]
+            for value in path_values:
+                if isinstance(value, str):
+                    target = (self.workspace / value).resolve()
+                    relative = target.relative_to(self.workspace)
+                    if ".git" in relative.parts or any(
+                        target == metadata
+                        or target.is_relative_to(metadata)
+                        or metadata.is_relative_to(target)
+                        for metadata in git_metadata(self.workspace)
+                    ):
+                        raise PermissionError(
+                            "filesystem mutation inside Git metadata is prohibited"
+                        )
+        # Git mutations retain their stronger GitApprovalTarget contract.
+        if risk in {"DESTRUCTIVE", "EXTERNAL"} and name != "git.execute":
+            from .approvals import ApprovalGrant, ToolApprovalTarget
+            from .audit import CURRENT_RUN
+
+            task_id = task_id or (CURRENT_RUN.get() or {}).get("task_id")
+            if task_id is not None and self.approvals is None:
+                raise PermissionError(
+                    "high-impact tool action requires task-bound human approval"
+                )
+            affected = [
+                str((self.workspace / value).resolve())
+                for key in ("path", "destination")
+                if isinstance((value := arguments.get(key)), str)
+            ]
+            if task_id is not None:
+                target = ToolApprovalTarget.create(task_id, name, arguments, affected)
+                approval = approval or self.approvals.grant_tool_for_target(target)
+                if not isinstance(approval, ApprovalGrant) or not approval.consume(
+                    target.action, target
+                ):
+                    raise PermissionError(
+                        "high-impact tool action requires a matching single-use approval"
+                    )
         call_id = str(uuid.uuid4())
         if self.event_sink:
             self.event_sink(

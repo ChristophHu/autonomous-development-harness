@@ -190,6 +190,7 @@ def test_executor_propagates_cancellation():
 def test_configured_phase_and_total_deadlines_are_used(tmp_path):
     config = Config()
     config.data["paths"]["database"] = str(tmp_path / "task.db")
+    config.data["tools"]["mcp"]["servers"]["vault"]["enabled"] = False
     limits = {"total": 1, "connect": 0.2, "read": 0.3}
     config.data["models"]["providers"]["lmstudio"]["timeout"] = limits
     config.data["memory"]["embeddings"]["timeout"] = limits

@@ -61,6 +61,11 @@ class DecisionService:
     def __init__(self, store):
         self.store = store
         self.repository = store.decisions
+        self.projection_enabled = (
+            store.config.data.get("memory", {})
+            .get("obsidian", {})
+            .get("enabled", False)
+        )
 
     def _validate_evidence(self, decision):
         task = (
@@ -122,7 +127,25 @@ class DecisionService:
             decision.field_names,
             decision.question_id,
         )
-        return Decision.model_validate(self.repository.get(decision_id))
+        created = Decision.model_validate(self.repository.get(decision_id))
+        if self.projection_enabled:
+            self._project_after_record(created)
+        return created
+
+    def _project_after_record(self, decision):
+        """Keep SQLite authoritative if the derived Markdown projection fails."""
+        from .memory_projection import DecisionProjection
+
+        try:
+            DecisionProjection(self.store.config.path("obsidian_vault")).sync(
+                self.repository.list_all()
+            )
+        except (OSError, RuntimeError, ValueError) as error:
+            self.store.event(
+                decision.task_id,
+                "memory.projection_failed",
+                {"decision_id": decision.id, "error_type": type(error).__name__},
+            )
 
     def list(self, task_id):
         return [Decision.model_validate(row) for row in self.repository.list(task_id)]

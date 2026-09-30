@@ -21,11 +21,13 @@ import uvicorn
 import yaml
 from pydantic import ValidationError as PydanticValidationError
 
+from .completion import audit_gap_matrix, audit_harness_completion
 from .core import ROOT, Config, Task, build
 from .docker_broker import DockerComposeBroker
 from .providers import ProviderHealth
 from .security import SecretResolver
 from .service_lifecycle import ServiceLifecycle
+from .verification import source_tree_sha256
 
 app = typer.Typer(no_args_is_help=True)
 tasks = typer.Typer(no_args_is_help=True)
@@ -38,6 +40,41 @@ app.add_typer(models, name="models")
 app.add_typer(config, name="config")
 app.add_typer(secrets, name="secrets")
 app.add_typer(memory, name="memory")
+
+
+@app.command("completion")
+def completion_status():
+    """Audit matrix, latest verification report, tests, and coverage evidence."""
+    matrix = ROOT / "GAP_MATRIX.md"
+    try:
+        markdown = matrix.read_text(encoding="utf-8")
+        coverage_path = ROOT / "coverage.json"
+        coverage_text = (
+            coverage_path.read_text(encoding="utf-8")
+            if coverage_path.is_file()
+            else None
+        )
+        verification_path = ROOT / "data" / "verification.json"
+        try:
+            evidence = json.loads(verification_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            evidence = None
+        matrix_report = audit_gap_matrix(markdown)
+        report = audit_harness_completion(
+            markdown,
+            coverage_text,
+            evidence,
+            source_sha256=source_tree_sha256(ROOT),
+        )
+    except (OSError, ValueError) as error:
+        typer.echo(f"Harness completion: unverifiable ({type(error).__name__})")
+        raise typer.Exit(2) from None
+    report["fulfilled"] = matrix_report["fulfilled"]
+    report["partial"] = matrix_report["partial"]
+    report["open"] = matrix_report["open"]
+    typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+    if not report["complete"]:
+        raise typer.Exit(1)
 
 
 def _lifecycle():
@@ -90,6 +127,33 @@ def _component_health(call, *, enabled=True):
         return "available" if bool(call()) else "unavailable"
     except (OSError, RuntimeError, ValueError, TypeError, httpx.HTTPError):
         return "unavailable"
+
+
+def _qdrant_report(orchestrator, *, enabled):
+    if not enabled:
+        return {
+            "healthy": True,
+            "service": "disabled",
+            "collection_exists": False,
+            "errors": [],
+        }
+    try:
+        report = orchestrator.qdrant.health_report()
+        return (
+            report
+            if isinstance(report, dict)
+            else {
+                "healthy": False,
+                "service": "unavailable",
+                "errors": ["invalid_health_report"],
+            }
+        )
+    except (OSError, RuntimeError, ValueError, TypeError, httpx.HTTPError):
+        return {
+            "healthy": False,
+            "service": "unavailable",
+            "errors": ["qdrant_probe_failed"],
+        }
 
 
 def _sqlite_health(store):
@@ -287,25 +351,7 @@ def status():
     except (OSError, RuntimeError, ValueError):
         service = {"state": "unknown", "record": None, "ready": False}
     running = service["state"] == "running"
-    counts = {
-        name: len(store.tasks.list(name))
-        for name in (
-            "pending",
-            "analyzing",
-            "planning",
-            "ready",
-            "executing",
-            "testing",
-            "validating",
-            "correcting",
-            "recovering",
-            "waiting_human",
-            "failed",
-            "blocked",
-            "cancelled",
-            "completed",
-        )
-    }
+    counts = orchestrator.service.status_counts()
     service_description = service["state"]
     if running:
         record = service.get("record") or {}
@@ -320,14 +366,22 @@ def status():
         f"Obsidian: {_component_health(lambda: vault.is_dir() and os.access(vault, os.R_OK | os.W_OK))}"
     )
     qdrant_enabled = conf.data.get("memory", {}).get("qdrant", {}).get("enabled", False)
-    typer.echo(
-        f"Qdrant: {_component_health(orchestrator.qdrant.health, enabled=qdrant_enabled)}"
-    )
+    qdrant_report = _qdrant_report(orchestrator, enabled=qdrant_enabled)
+    typer.echo(f"Qdrant: {qdrant_report['service']}")
+    if qdrant_enabled:
+        typer.echo("Qdrant evidence: " + json.dumps(qdrant_report, sort_keys=True))
     for name, count in counts.items():
         typer.echo(f"{name}: {count}")
     for name, provider in orchestrator.models.providers.items():
         report = _provider_probe(provider)
         typer.echo(f"Provider {name}: {_provider_status(report)}")
+
+
+@app.command("metrics")
+def runtime_metrics():
+    """Print durable task, event-catalogue, and model-usage counters."""
+    _conf, _store, orchestrator = build()
+    typer.echo(json.dumps(orchestrator.observability.metrics(), indent=2))
 
 
 @app.command()
@@ -367,6 +421,7 @@ def doctor():
     vault = conf.path("obsidian_vault")
     log_dir = conf.path("logs")
     providers = _provider_health(orchestrator.models.providers)
+    qdrant_report = _qdrant_report(orchestrator, enabled=qdrant_enabled)
     checks = {
         "macOS": platform.system() == "Darwin",
         "Apple Silicon": platform.machine() == "arm64",
@@ -379,8 +434,9 @@ def doctor():
         "Obsidian Vault": vault.is_dir() and os.access(vault, os.R_OK | os.W_OK),
         "Workspace": workspace.is_dir() and os.access(workspace, os.R_OK | os.W_OK),
         "Logs Directory": log_dir.is_dir() and os.access(log_dir, os.W_OK),
-        "Qdrant": _component_health(orchestrator.qdrant.health, enabled=qdrant_enabled)
-        in {"available", "disabled"},
+        "Qdrant": qdrant_report["healthy"],
+        "Qdrant Collection": not qdrant_enabled
+        or qdrant_report.get("collection_exists", False),
         "API Service": service["state"] == "running" and service["ready"],
     }
     checks.update(
@@ -446,6 +502,126 @@ def memory_sync():
         "Obsidian decision projection: "
         + ", ".join(f"{key}={value}" for key, value in result.items())
     )
+
+
+@memory.command("status")
+def memory_status():
+    """Report configured Obsidian and MCP vault state without writing files."""
+    conf, _, _ = build()
+    from .memory_projection import DecisionProjection
+
+    settings = conf.data.get("memory", {}).get("obsidian", {})
+    servers = conf.data.get("tools", {}).get("mcp", {}).get("servers", {})
+    status = DecisionProjection(conf.path("obsidian_vault")).status(
+        obsidian_enabled=settings.get("enabled", False),
+        mcp_enabled=servers.get("vault", {}).get("enabled", False),
+    )
+    typer.echo(json.dumps(status, ensure_ascii=False, indent=2))
+
+
+@memory.command("audit")
+def memory_audit():
+    """Audit curated Vault notes, links, and review dates without writing."""
+    from .vault_audit import audit_vault
+
+    try:
+        conf = Config()
+        report = audit_vault(conf.path("obsidian_vault"))
+    except (OSError, ValueError) as error:
+        typer.echo(f"Vault audit unavailable: {type(error).__name__}")
+        raise typer.Exit(2) from None
+    typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+    if not report["healthy"]:
+        raise typer.Exit(1)
+
+
+@memory.command("qdrant-status")
+def qdrant_status():
+    """Show Qdrant health, collection contract, and persisted point counts."""
+    conf, _store, orchestrator = build()
+    enabled = conf.data.get("memory", {}).get("qdrant", {}).get("enabled", False)
+    report = _qdrant_report(orchestrator, enabled=enabled)
+    report["enabled"] = enabled
+    if not enabled:
+        report["healthy"] = True
+    typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+    if enabled and not report["healthy"]:
+        raise typer.Exit(1)
+
+
+@memory.command("qdrant-init")
+def qdrant_init(confirm: bool = typer.Option(False, "--confirm")):
+    """Create the configured collection or validate its vector contract."""
+    if not confirm:
+        typer.echo(
+            "No action taken. Repeat with --confirm to initialize the collection."
+        )
+        raise typer.Exit(2)
+    conf, _store, orchestrator = build()
+    qdrant = conf.data.get("memory", {}).get("qdrant", {})
+    if not qdrant.get("enabled", False):
+        typer.echo("Qdrant is disabled in configuration")
+        raise typer.Exit(1)
+    try:
+        orchestrator.qdrant.ensure_collection()
+    except (OSError, RuntimeError, ValueError, httpx.HTTPError) as error:
+        typer.echo(f"Qdrant collection initialization failed: {type(error).__name__}")
+        raise typer.Exit(1) from None
+    typer.echo(
+        json.dumps(
+            {
+                "initialized": True,
+                "collection": qdrant.get("collection", "harness-memory"),
+                "dimension": conf.data.get("memory", {})
+                .get("embeddings", {})
+                .get("dimensions", 1024),
+                "distance": "Cosine",
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+
+
+@memory.command("qdrant-search")
+def qdrant_search(query: str, limit: int = 5):
+    """Search indexed memory using the configured embedding provider."""
+    if not query.strip():
+        typer.echo("Query must not be empty")
+        raise typer.Exit(2)
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 20:
+        typer.echo("Limit must be an integer between 1 and 20")
+        raise typer.Exit(2)
+    conf, _store, orchestrator = build()
+    if not conf.data.get("memory", {}).get("qdrant", {}).get("enabled", False):
+        typer.echo("Qdrant is disabled in configuration")
+        raise typer.Exit(1)
+    try:
+        result = orchestrator.qdrant.search(query, limit=limit)
+    except (OSError, RuntimeError, ValueError, httpx.HTTPError) as error:
+        typer.echo(f"Qdrant search failed: {type(error).__name__}")
+        raise typer.Exit(1) from None
+    typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+@memory.command("qdrant-reconcile")
+def qdrant_reconcile(confirm: bool = typer.Option(False, "--confirm")):
+    """Reindex vault notes and remove stale Harness-owned Qdrant vectors."""
+    if not confirm:
+        typer.echo(
+            "No action taken. Repeat with --confirm to reconcile the Qdrant index."
+        )
+        raise typer.Exit(2)
+    conf, _store, orchestrator = build()
+    if not conf.data.get("memory", {}).get("qdrant", {}).get("enabled", False):
+        typer.echo("Qdrant is disabled in configuration")
+        raise typer.Exit(1)
+    try:
+        result = orchestrator.memory_service.reconcile()
+    except (OSError, RuntimeError, ValueError, httpx.HTTPError) as error:
+        typer.echo(f"Qdrant reconciliation failed: {type(error).__name__}")
+        raise typer.Exit(1) from None
+    typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
 
 
 @tasks.command("create")
@@ -530,9 +706,14 @@ def task_run(task_id: int):
 
 @tasks.command("events")
 def task_events(task_id: int):
-    _, store, _ = build()
-    for event in store.list_events(task_id):
-        payload = store.audit.sanitize(json.loads(event["payload"]))
+    _, _store, orchestrator = build()
+    try:
+        events = orchestrator.service.events(task_id)
+    except ValueError:
+        typer.echo("task not found")
+        raise typer.Exit(1) from None
+    for event in events:
+        payload = json.loads(event["payload"])
         typer.echo(
             f"{event['created_at']} {event['kind']} "
             f"{json.dumps(payload, sort_keys=True)}"
@@ -645,7 +826,7 @@ def model_list():
         }
         for alias, item in sorted(configured.items()):
             model_id = item.get("model") or "-"
-            tier = item.get("tier") or "-"
+            tier = item.get("tier") or "unknown"
             model_state = (
                 "available"
                 if _model_available(report, model_id, discovered)
@@ -660,7 +841,7 @@ def model_list():
                 if _model_available(report, model_id, discovered)
                 else "unavailable"
             )
-            typer.echo(f"{model_id}\t{name}\t-\t-\t{model_state}")
+            typer.echo(f"{model_id}\t{name}\t-\tunknown\t{model_state}")
 
 
 @models.command("status")
@@ -671,20 +852,26 @@ def model_status():
 @models.command("usage")
 def model_usage(
     task_id: int | None = None,
+    agent: str | None = None,
+    profile: str | None = None,
     provider: str | None = None,
     model: str | None = None,
+    group_by: str | None = None,
     since: str | None = None,
     until: str | None = None,
     limit: int = 50,
     offset: int = 0,
 ):
     """Show persisted model-call usage without exposing prompts or secrets."""
-    _, store, _ = build()
+    _, _store, orchestrator = build()
     try:
-        report = store.model_usage.report(
+        report = orchestrator.service.model_usage(
             task_id=task_id,
+            agent=agent,
+            profile=profile,
             provider=provider,
             model=model,
+            group_by=group_by,
             since=since,
             until=until,
             limit=limit,

@@ -16,6 +16,8 @@ LOGGER = logging.getLogger("harness")
 
 def _sensitive_key(key):
     normalized = re.sub(r"[^a-z0-9]", "", str(key).casefold())
+    if "token" in normalized and normalized.endswith("budget"):
+        return False
     return any(
         marker in normalized
         for marker in (
@@ -55,6 +57,18 @@ class AuditRecorder:
                     value = value.replace(secret, "[REDACTED]")
         return value
 
+    def model_budget_usage(self, task_id):
+        with self.repository.db.connect() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) AS runs, SUM(prompt_tokens) AS prompt_tokens, "
+                "SUM(completion_tokens) AS completion_tokens, SUM(cost) AS cost, "
+                "SUM(CASE WHEN cost IS NULL THEN 1 ELSE 0 END) AS missing_cost, "
+                "SUM(CASE WHEN prompt_tokens IS NULL OR completion_tokens IS NULL THEN 1 ELSE 0 END) AS missing_tokens "
+                "FROM model_runs WHERE task_id=? AND status IN ('completed','failed')",
+                (task_id,),
+            ).fetchone()
+        return dict(row)
+
     @contextmanager
     def agent(self, task, agent, profile):
         agent, profile = self.sanitize(agent), self.sanitize(profile)
@@ -65,6 +79,8 @@ class AuditRecorder:
             "agent": agent,
             "profile": profile,
             "complexity": task.complexity,
+            "model_cost_budget": task.model_cost_budget,
+            "model_token_budget": task.model_token_budget,
         }
         token = CURRENT_RUN.set(self.sanitize(context))
         span = {"status": "completed", "output": None}

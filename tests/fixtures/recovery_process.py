@@ -18,9 +18,11 @@ class Provider:
     def complete(self, prompt, **kwargs):
         if isinstance(prompt, list):
             first = prompt[1]["content"]
-            step = json.loads(first.split("\nContext:\n")[0].split("\n", 1)[1])
+            step = json.loads(first.split("\nContext:\n")[0].rsplit("\n", 1)[-1])
             if len(prompt) > 2:
-                return "Implemented declared remaining artifact."
+                return json.dumps(
+                    {"output": "Implemented declared remaining artifact."}
+                )
             if step["id"] == "remaining" and self.phase == "crash":
                 (self.workspace / "crash.ready").write_text("active execution")
                 os.kill(os.getpid(), signal.SIGKILL)
@@ -62,7 +64,20 @@ class Provider:
                             "title": name,
                             "description": "implement only declared file",
                             "expected_result": "working arithmetic",
-                            "acceptance_criteria": ["observed arithmetic"],
+                            "requirement_ids": (
+                                ["add integers", "multiply integers"]
+                                if self.phase == "restart"
+                                else [
+                                    "add integers"
+                                    if name == "addition"
+                                    else "multiply integers"
+                                ]
+                            ),
+                            "acceptance_criteria": (
+                                ["add", "multiply"]
+                                if self.phase == "restart"
+                                else ["add" if name == "addition" else "multiply"]
+                            ),
                             "required_tools": ["filesystem.write"],
                             "dependencies": ["addition"]
                             if name == "remaining" and self.phase == "crash"

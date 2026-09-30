@@ -8,7 +8,18 @@ import stat
 import time
 from pathlib import Path, PurePosixPath
 
+from pydantic import BaseModel, ConfigDict, StrictBool, StrictStr
+
 from .agents import ValidatorOutput
+from .structured_output import parse_model_output
+
+
+class IndependentReviewOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    requirements: dict[StrictStr, StrictBool]
+    criteria: dict[StrictStr, StrictBool]
+    evidence: StrictStr
 
 
 class EvidenceValidator:
@@ -175,6 +186,77 @@ class EvidenceValidator:
             if step_id in planned:
                 errors.append(f"plan contains duplicate step: {step_id}")
             planned[step_id] = step
+        mapped_requirements = set()
+        mapped_criteria = set()
+        recovery_targets = set()
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            requirement_ids = step.get("requirement_ids", [])
+            criteria = step.get("acceptance_criteria", [])
+            if not isinstance(requirement_ids, list) or not all(
+                isinstance(item, str) for item in requirement_ids
+            ):
+                errors.append(f"plan requirement mapping is invalid: {step.get('id')}")
+                requirement_ids = []
+            if not isinstance(criteria, list) or not all(
+                isinstance(item, str) for item in criteria
+            ):
+                errors.append(f"plan acceptance mapping is invalid: {step.get('id')}")
+                criteria = []
+            mapped_requirements.update(requirement_ids)
+            mapped_criteria.update(criteria)
+            targets = step.get("recovery_targets", [])
+            if isinstance(targets, list) and all(
+                isinstance(item, str) for item in targets
+            ):
+                recovery_targets.update(targets)
+            elif targets:
+                errors.append(f"plan recovery mapping is invalid: {step.get('id')}")
+        scoped_recovery = bool(recovery_targets)
+        all_criteria = {item.id for item in task.acceptance_criteria}
+        required_requirements = (
+            {
+                target.removeprefix("requirement:")
+                for target in recovery_targets
+                if target.startswith("requirement:")
+            }
+            if scoped_recovery
+            else set(task.requirements)
+        )
+        required_criteria = (
+            {
+                target.removeprefix("criterion:")
+                for target in recovery_targets
+                if target.startswith("criterion:")
+            }
+            if scoped_recovery
+            else {item.id for item in task.acceptance_criteria}
+        )
+        for requirement in required_requirements:
+            if requirement not in mapped_requirements:
+                errors.append(f"requirement has no plan step: {requirement}")
+                continue
+            linked_steps = [
+                step
+                for step in steps
+                if isinstance(step, dict)
+                and requirement in step.get("requirement_ids", [])
+            ]
+            if not any(
+                set(step.get("acceptance_criteria", [])) & all_criteria
+                for step in linked_steps
+            ):
+                errors.append(
+                    f"requirement has no linked acceptance criterion: {requirement}"
+                )
+        known_requirements = set(task.requirements)
+        for requirement in sorted(mapped_requirements - known_requirements):
+            errors.append(f"plan references unknown requirement: {requirement}")
+        for criterion in sorted(required_criteria - mapped_criteria):
+            errors.append(f"acceptance criterion has no plan step: {criterion}")
+        for criterion in sorted(mapped_criteria - all_criteria):
+            errors.append(f"plan references unknown acceptance criterion: {criterion}")
         actual_ids = [output.subtask_id for output in outputs]
         if len(actual_ids) != len(set(actual_ids)):
             errors.append("executor results contain duplicate plan steps")
@@ -513,7 +595,8 @@ class EvidenceValidator:
             )
         review_parse_failed = False
         try:
-            review = json.loads(
+            review = parse_model_output(
+                IndependentReviewOutput,
                 self.router.complete(
                     "validator",
                     "REVIEW: Independently verify every requirement and acceptance criterion against these observations. Return JSON with requirements (exact requirement strings mapped to booleans), criteria (criterion IDs mapped to booleans), and evidence (nonempty string).\n"
@@ -530,9 +613,12 @@ class EvidenceValidator:
                             "observed_changes": observed_changes,
                         }
                     ),
-                )
+                    complexity=task.complexity,
+                ),
+                agent="independent_review",
             )
-        except (TypeError, ValueError, json.JSONDecodeError):
+            review = review.model_dump()
+        except (TypeError, ValueError):
             review = None
             review_parse_failed = True
         if not self._review_confirms(review, task):
@@ -577,6 +663,8 @@ class EvidenceValidator:
             and bool(evidence.strip())
             and isinstance(requirements, dict)
             and isinstance(criteria, dict)
+            and set(requirements) == set(task.requirements)
+            and set(criteria) == {item.id for item in task.acceptance_criteria}
             and all(requirements.get(value) is True for value in task.requirements)
             and all(
                 criteria.get(value.id) is True for value in task.acceptance_criteria

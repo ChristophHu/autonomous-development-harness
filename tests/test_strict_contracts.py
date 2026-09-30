@@ -43,6 +43,138 @@ def test_acceptance_contracts(payload):
         AcceptanceCriterion(**payload)
 
 
+def test_plan_must_map_each_requirement_and_criterion_to_steps():
+    from harness.agents import PlannerOutput, Subtask
+
+    task = Task(
+        title="implement",
+        requirements=["persist data"],
+        acceptance_criteria=[
+            AcceptanceCriterion(id="persisted", description="data persists")
+        ],
+    )
+    step = Subtask(
+        id="step-1",
+        title="persist",
+        description="store data",
+        expected_result="data stored",
+        acceptance_criteria=["persisted"],
+        requirement_ids=["persist data"],
+    )
+    plan = PlannerOutput(summary="plan", complexity="low", subtasks=[step])
+    assert plan.validate_task_coverage(task) == []
+    step.requirement_ids = []
+    assert "requirement has no plan step: persist data" in plan.validate_task_coverage(
+        task
+    )
+    step.requirement_ids = ["persist data"]
+    step.acceptance_criteria = []
+    assert (
+        "acceptance criterion has no plan step: persisted"
+        in plan.validate_task_coverage(task)
+    )
+    assert (
+        "requirement has no linked acceptance criterion: persist data"
+        in plan.validate_task_coverage(task)
+    )
+    step.requirement_ids = ["unknown requirement"]
+    step.acceptance_criteria = ["unknown criterion"]
+    assert plan.validate_task_coverage(task) == [
+        "requirement has no plan step: persist data",
+        "acceptance criterion has no plan step: persisted",
+        "plan references unknown requirement: unknown requirement",
+        "plan references unknown acceptance criterion: unknown criterion",
+    ]
+
+
+def test_recovery_requirement_remains_linked_to_task_criterion(tmp_path):
+    _store, orchestrator, task = ready_runtime(tmp_path)
+    task.plan = {
+        "subtasks": [
+            {
+                "id": "recover",
+                "requirement_ids": ["add two integers"],
+                "acceptance_criteria": ["sum"],
+                "recovery_targets": ["requirement:add two integers", "verify"],
+            }
+        ]
+    }
+
+    errors, _planned = orchestrator.validator._plan_findings(task, [])
+
+    assert (
+        "requirement has no linked acceptance criterion: add two integers" not in errors
+    )
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("model_cost_budget", -0.01),
+        ("model_cost_budget", float("inf")),
+        ("model_token_budget", -1),
+        ("model_token_budget", True),
+    ],
+)
+def test_task_rejects_invalid_model_budgets(field, value):
+    with pytest.raises(ValueError):
+        Task(title="budget", **{field: value})
+
+
+def test_validator_rejects_plan_with_unmapped_task_requirement(tmp_path):
+    _store, orchestrator = runtime(tmp_path)
+    task = specification()
+    task.plan = {"subtasks": [{"id": "planned", "acceptance_criteria": ["sum"]}]}
+    errors, _ = orchestrator.validator._plan_findings(task, [])
+    assert "requirement has no plan step: add two integers" in errors
+
+
+@pytest.mark.parametrize(
+    "mapping,error",
+    [
+        ({"requirement_ids": "not-a-list"}, "plan requirement mapping is invalid"),
+        ({"acceptance_criteria": [1]}, "plan acceptance mapping is invalid"),
+        ({"recovery_targets": "bad"}, "plan recovery mapping is invalid"),
+        ({"requirement_ids": ["unknown"]}, "plan references unknown requirement"),
+        (
+            {"acceptance_criteria": ["unknown"]},
+            "plan references unknown acceptance criterion",
+        ),
+    ],
+)
+def test_validator_rejects_malformed_or_unknown_plan_mappings(tmp_path, mapping, error):
+    _store, orchestrator = runtime(tmp_path)
+    task = specification()
+    task.plan = {"subtasks": [{"id": "planned", **mapping}]}
+    errors, _ = orchestrator.validator._plan_findings(task, [])
+    assert any(error in item for item in errors)
+
+
+def test_validator_skips_nonmapping_plan_step_in_coverage_scan(tmp_path):
+    _store, orchestrator = runtime(tmp_path)
+    task = specification()
+    task.plan = {"subtasks": [None]}
+    errors, _ = orchestrator.validator._plan_findings(task, [])
+    assert "plan contains an invalid step" in errors
+
+
+def test_validator_treats_null_recovery_targets_as_absent(tmp_path):
+    _store, orchestrator = runtime(tmp_path)
+    task = specification()
+    task.plan = {
+        "subtasks": [
+            {
+                "id": "planned",
+                "requirement_ids": ["add two integers"],
+                "acceptance_criteria": ["sum"],
+                "recovery_targets": None,
+            }
+        ]
+    }
+    errors, _ = orchestrator.validator._plan_findings(task, [])
+    assert "plan recovery mapping is invalid: planned" not in errors
+
+
 def test_duplicate_ids_and_terminal_transitions():
     criterion = AcceptanceCriterion(id="x", description="x")
     with pytest.raises(ValueError):
@@ -441,7 +573,7 @@ def test_executor_observation_and_failure_paths(tmp_path):
                     )
                 ],
             ),
-            ModelResponse(text="done"),
+            ModelResponse(text='{"output":"done"}'),
         ]
     )
     observed = []
@@ -465,7 +597,9 @@ def test_executor_observation_and_failure_paths(tmp_path):
         ),
         orchestrator.tools,
     )
-    assert not plain.execute(step).success
+    invalid_report = plain.execute(step)
+    assert not invalid_report.success
+    assert "claims success" not in invalid_report.output
     config.data["profiles"]["coding"]["tools"] = []
     assert not executor.execute(step).success
     config.data["profiles"]["coding"]["tools"] = ["filesystem.write"]
@@ -498,7 +632,15 @@ def test_executor_observation_and_failure_paths(tmp_path):
 def test_remaining_validator_paths(tmp_path):
     _, orchestrator = runtime(tmp_path)
     task = specification()
-    task.plan = {"subtasks": [{"id": "planned"}]}
+    task.plan = {
+        "subtasks": [
+            {
+                "id": "planned",
+                "requirement_ids": ["add two integers"],
+                "acceptance_criteria": ["sum"],
+            }
+        ]
+    }
     task.acceptance_criteria = [
         AcceptanceCriterion(id="sum", description="independent review")
     ]
@@ -578,7 +720,15 @@ def test_validator_coverage_threshold_and_branch_gate(
 ):
     _store, orchestrator = runtime(tmp_path)
     task = specification()
-    task.plan = {"subtasks": [{"id": "planned"}]}
+    task.plan = {
+        "subtasks": [
+            {
+                "id": "planned",
+                "requirement_ids": ["add two integers"],
+                "acceptance_criteria": ["sum"],
+            }
+        ]
+    }
     from harness.agents import ExecutorOutput
 
     outputs = [ExecutorOutput(subtask_id="planned", success=True, output="done")]
@@ -639,7 +789,15 @@ def test_validator_shell_commands_use_audited_test_tools(tmp_path):
     events = []
     orchestrator.tools.event_sink = lambda kind, payload: events.append((kind, payload))
     task = specification()
-    task.plan = {"subtasks": [{"id": "planned"}]}
+    task.plan = {
+        "subtasks": [
+            {
+                "id": "planned",
+                "requirement_ids": ["add two integers"],
+                "acceptance_criteria": ["sum"],
+            }
+        ]
+    }
     task.test_commands = [["/usr/bin/true"]]
     task.lint_commands = [["/usr/bin/true"]]
     task.coverage_command = []

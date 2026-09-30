@@ -14,7 +14,6 @@ class DecisionProjection:
 
     def __init__(self, vault):
         self.vault = Path(vault).resolve()
-        self.vault.mkdir(parents=True, exist_ok=True)
         self.root = self.vault / "_harness"
         self.notes = self.root / "decisions"
         self.manifest_path = self.root / "manifest.json"
@@ -170,3 +169,29 @@ class DecisionProjection:
             + "\n",
         )
         return counts
+
+    def status(self, obsidian_enabled=True, mcp_enabled=False):
+        """Describe the configured vault without changing its contents."""
+        markdown = sorted(
+            path.relative_to(self.vault).as_posix()
+            for path in self.vault.rglob("*.md")
+            if not any(
+                part.startswith(".") for part in path.relative_to(self.vault).parts
+            )
+            and path.is_file()
+            and not path.is_symlink()
+        )
+        manifest = self._read_manifest()
+        return {
+            "path": str(self.vault),
+            "exists": self.vault.is_dir(),
+            "obsidian_enabled": bool(obsidian_enabled),
+            "mcp_enabled": bool(mcp_enabled),
+            "markdown_notes": len(markdown),
+            "managed_decisions": len(manifest),
+            "nested_vaults": sorted(
+                path.relative_to(self.vault).as_posix()
+                for path in self.vault.rglob(".obsidian")
+                if path.is_dir() and path.parent != self.vault
+            ),
+        }

@@ -1,4 +1,5 @@
 import json
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
@@ -196,6 +197,7 @@ def test_start_blocks_critical_preflight_before_pid_or_server(
 
 def test_start_preflight_reports_roles_without_secrets(harness_context, monkeypatch):
     cfg, store, orchestrator, _ = harness_context
+    cfg.data["memory"]["qdrant"]["enabled"] = False
     cfg.data["models"]["registry"] = {
         "primary-alias": {"provider": "alpha", "model": "private-model"},
         "fallback-alias": {"provider": "beta", "model": "fallback-model"},
@@ -454,6 +456,7 @@ def test_sqlite_health_always_closes_read_only_connection(
 
 def test_status_and_doctor(harness_context, monkeypatch, capsys):
     cfg, _, orchestrator, _root = harness_context
+    cfg.data["memory"]["qdrant"]["enabled"] = False
     cli.status()
     assert "stopped" in capsys.readouterr().out
 
@@ -478,6 +481,14 @@ def test_status_and_doctor(harness_context, monkeypatch, capsys):
     cfg.path("logs").mkdir(exist_ok=True)
     cfg.data["memory"] = {"qdrant": {"enabled": True}}
     orchestrator.qdrant.health = lambda: True
+    orchestrator.qdrant.health_report = lambda: {
+        "healthy": True,
+        "service": "available",
+        "collection_exists": True,
+    }
+    cli.status()
+    status_output = capsys.readouterr().out
+    assert "Qdrant evidence:" in status_output
     orchestrator.models.providers.clear()
     monkeypatch.setattr(
         cli.subprocess,
@@ -515,6 +526,12 @@ def test_status_and_doctor_fail_safe_diagnostics(harness_context, monkeypatch, c
     cfg.data["memory"] = {"qdrant": {"enabled": True}}
     orchestrator.models.providers.clear()
     orchestrator.qdrant.health = lambda: False
+    orchestrator.qdrant.health_report = lambda: {
+        "healthy": False,
+        "service": "unavailable",
+        "collection_exists": False,
+        "errors": ["offline"],
+    }
     monkeypatch.setattr(cli.platform, "system", lambda: "Darwin")
     monkeypatch.setattr(cli.platform, "machine", lambda: "arm64")
     monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/bin/" + name)
@@ -551,6 +568,12 @@ def test_doctor_handles_missing_docker_and_broker_failure(harness_context, monke
     cfg.data["memory"] = {"qdrant": {"enabled": True}}
     orchestrator.models.providers.clear()
     orchestrator.qdrant.health = lambda: False
+    orchestrator.qdrant.health_report = lambda: {
+        "healthy": False,
+        "service": "unavailable",
+        "collection_exists": False,
+        "errors": ["offline"],
+    }
     monkeypatch.setattr(cli.platform, "system", lambda: "Darwin")
     monkeypatch.setattr(cli.platform, "machine", lambda: "arm64")
     monkeypatch.setattr(
@@ -661,6 +684,22 @@ def test_qdrant_smoke_reports_daemon_failure(monkeypatch, capsys):
     with pytest.raises(cli.typer.Exit):
         cli.qdrant_smoke(confirm=True)
     assert "daemon unavailable" in capsys.readouterr().out
+
+
+def test_qdrant_report_is_fail_safe_and_does_not_probe_when_disabled():
+    orchestrator = SimpleNamespace(
+        qdrant=SimpleNamespace(
+            health_report=lambda: (_ for _ in ()).throw(RuntimeError("secret detail"))
+        )
+    )
+    assert cli._qdrant_report(orchestrator, enabled=False)["service"] == "disabled"
+    assert cli._qdrant_report(orchestrator, enabled=True)["errors"] == [
+        "qdrant_probe_failed"
+    ]
+    orchestrator.qdrant.health_report = lambda: "invalid"
+    assert cli._qdrant_report(orchestrator, enabled=True)["errors"] == [
+        "invalid_health_report"
+    ]
 
 
 def test_task_commands(harness_context, capsys):
@@ -819,12 +858,14 @@ def test_model_inventory_shows_tier_and_unavailable_configured_model(
     orchestrator.models.models = {
         "coding": {"provider": "local", "model": "live-v1", "tier": "advanced"},
         "fallback": {"provider": "local", "model": "missing-v1", "tier": "local"},
+        "untiered": {"provider": "local", "model": "legacy-v1"},
     }
     cli.model_list()
     listed = capsys.readouterr().out
     assert "live-v1\tlocal\tcoding\tadvanced\tavailable" in listed
     assert "missing-v1\tlocal\tfallback\tlocal\tunavailable" in listed
-    assert "unlisted-v2\tlocal\t-\t-\tavailable" in listed
+    assert "legacy-v1\tlocal\tuntiered\tunknown\tunavailable" in listed
+    assert "unlisted-v2\tlocal\t-\tunknown\tavailable" in listed
     cli.model_status()
     assert capsys.readouterr().out == listed
 
@@ -1022,12 +1063,12 @@ def test_secret_cli_errors_do_not_render_exception_or_secret(monkeypatch):
 def test_task_events_cli_redacts_existing_event_payloads(
     harness_context, monkeypatch, capsys
 ):
-    _config, store, _orchestrator, _root = harness_context
+    _config, store, orchestrator, _root = harness_context
     canary = "SS1-CLI-CANARY"
     store.audit.secrets["SS1_CLI_TOKEN"] = canary
     task = store.tasks.create("legacy event")
     store.events.append(task, "task.failed", {"message": canary, "apiKey": "other"})
-    monkeypatch.setattr(cli, "build", lambda: (None, store, None))
+    monkeypatch.setattr(cli, "build", lambda: (None, store, orchestrator))
 
     cli.task_events(task)
 
@@ -1035,6 +1076,13 @@ def test_task_events_cli_redacts_existing_event_payloads(
     assert canary not in output
     assert "other" not in output
     assert "[REDACTED]" in output
+
+
+def test_task_events_cli_reports_missing_task(harness_context, capsys):
+    with pytest.raises(cli.typer.Exit) as result:
+        cli.task_events(999999)
+    assert result.value.exit_code == 1
+    assert capsys.readouterr().out == "task not found\n"
 
 
 def test_memory_sync_command_projects_sqlite_decisions(harness_context):
@@ -1304,3 +1352,337 @@ def test_task_watch_rejects_malformed_sse(harness_context, monkeypatch, lines):
     assert result.exit_code == 1
     assert len(attempts) == 3
     assert result.output.endswith("task event stream unavailable\n")
+
+
+def test_memory_status_reports_explicit_mcp_opt_in(harness_context, capsys):
+    cfg, _store, _orchestrator, _root = harness_context
+    cfg.data["memory"]["obsidian"]["enabled"] = True
+    cfg.data["tools"]["mcp"]["servers"]["vault"]["enabled"] = False
+
+    cli.memory_status()
+
+    report = json.loads(capsys.readouterr().out)
+    assert report["obsidian_enabled"] is True
+    assert report["mcp_enabled"] is False
+    assert report["markdown_notes"] == 0
+
+
+def test_memory_status_does_not_create_a_missing_vault(harness_context, capsys):
+    cfg, _store, _orchestrator, _root = harness_context
+    vault = cfg.path("obsidian_vault")
+    vault.rmdir()
+
+    cli.memory_status()
+
+    report = json.loads(capsys.readouterr().out)
+    assert report["exists"] is False
+    assert not vault.exists()
+
+
+def test_memory_audit_reports_read_only_health(tmp_path, monkeypatch, capsys):
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    for relative in (
+        "Willkommen.md",
+        "Vault-Übersicht.md",
+        "rules/Harness-Prinzipien.md",
+        "architecture/Systemarchitektur.md",
+        "architecture/Vault und Memory.md",
+        "decisions/Entscheidungsregister.md",
+        "agents/Agentenprofile.md",
+        "tasks/Task-Register.md",
+    ):
+        path = vault / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            f"---\nlast_reviewed: {datetime.now(UTC).date().isoformat()}\n---\n# Note",
+            encoding="utf-8",
+        )
+    monkeypatch.setattr(
+        cli, "Config", lambda: SimpleNamespace(path=lambda _name: vault)
+    )
+
+    cli.memory_audit()
+
+    report = json.loads(capsys.readouterr().out)
+    assert report["healthy"] is True
+    assert report["audited_notes"] == 8
+    assert all(
+        (vault / relative).is_file()
+        for relative in (
+            "Willkommen.md",
+            "Vault-Übersicht.md",
+            "rules/Harness-Prinzipien.md",
+            "architecture/Systemarchitektur.md",
+            "architecture/Vault und Memory.md",
+            "decisions/Entscheidungsregister.md",
+            "agents/Agentenprofile.md",
+            "tasks/Task-Register.md",
+        )
+    )
+
+
+def test_memory_audit_fails_closed_for_missing_vault(tmp_path, monkeypatch, capsys):
+    vault = tmp_path / "missing-vault"
+    monkeypatch.setattr(
+        cli, "Config", lambda: SimpleNamespace(path=lambda _name: vault)
+    )
+
+    with pytest.raises(cli.typer.Exit) as exc:
+        cli.memory_audit()
+
+    report = json.loads(capsys.readouterr().out)
+    assert exc.value.exit_code == 1
+    assert report["healthy"] is False
+    assert not vault.exists()
+
+
+def test_memory_audit_reports_configuration_error(monkeypatch, capsys):
+    def unavailable_config():
+        raise OSError("private configuration detail")
+
+    monkeypatch.setattr(cli, "Config", unavailable_config)
+    with pytest.raises(cli.typer.Exit) as exc:
+        cli.memory_audit()
+    assert exc.value.exit_code == 2
+    assert capsys.readouterr().out == "Vault audit unavailable: OSError\n"
+
+
+def test_qdrant_status_reports_disabled_service_and_exits_on_bad_health(
+    harness_context, monkeypatch, capsys
+):
+    _cfg, _store, orchestrator, _root = harness_context
+    _cfg.data["memory"]["qdrant"]["enabled"] = False
+    monkeypatch.setattr(
+        orchestrator.qdrant,
+        "health_report",
+        lambda: {"healthy": False, "service": "unavailable", "errors": ["offline"]},
+    )
+    cli.qdrant_status()
+    report = json.loads(capsys.readouterr().out)
+    assert report["enabled"] is False
+    assert report["service"] == "disabled"
+    assert report["healthy"] is True
+
+    _cfg.data["memory"]["qdrant"]["enabled"] = True
+    with pytest.raises(cli.typer.Exit):
+        cli.qdrant_status()
+    assert json.loads(capsys.readouterr().out)["errors"] == ["offline"]
+
+
+def test_qdrant_reconcile_requires_confirmation_and_enabled_configuration(
+    harness_context, monkeypatch, capsys
+):
+    cfg, _store, orchestrator, _root = harness_context
+    cfg.data["memory"]["qdrant"]["enabled"] = False
+    calls = []
+    monkeypatch.setattr(
+        orchestrator.memory_service,
+        "reconcile",
+        lambda: calls.append(True) or {"notes": 2, "chunks": 3, "removed_points": 1},
+    )
+    with pytest.raises(cli.typer.Exit) as result:
+        cli.qdrant_reconcile(confirm=False)
+    assert result.value.exit_code == 2
+    assert not calls
+    assert "No action taken" in capsys.readouterr().out
+    with pytest.raises(cli.typer.Exit) as result:
+        cli.qdrant_reconcile(confirm=True)
+    assert result.value.exit_code == 1
+    assert not calls
+    capsys.readouterr()
+    cfg.data["memory"]["qdrant"]["enabled"] = True
+    cli.qdrant_reconcile(confirm=True)
+    assert calls == [True]
+    assert json.loads(capsys.readouterr().out)["removed_points"] == 1
+
+
+def test_qdrant_reconcile_reports_only_error_type(harness_context, monkeypatch, capsys):
+    cfg, _store, orchestrator, _root = harness_context
+    cfg.data["memory"]["qdrant"]["enabled"] = True
+    monkeypatch.setattr(
+        orchestrator.memory_service,
+        "reconcile",
+        lambda: (_ for _ in ()).throw(RuntimeError("secret-bearing detail")),
+    )
+    with pytest.raises(cli.typer.Exit):
+        cli.qdrant_reconcile(confirm=True)
+    output = capsys.readouterr().out
+    assert "RuntimeError" in output
+    assert "secret-bearing detail" not in output
+
+
+def test_qdrant_init_requires_confirmation_and_enabled_service(
+    harness_context, monkeypatch, capsys
+):
+    cfg, _store, orchestrator, _root = harness_context
+    cfg.data["memory"]["qdrant"]["enabled"] = False
+    calls = []
+    monkeypatch.setattr(cli, "build", lambda: (cfg, _store, orchestrator))
+    monkeypatch.setattr(
+        orchestrator.qdrant, "ensure_collection", lambda: calls.append(True)
+    )
+
+    with pytest.raises(cli.typer.Exit) as result:
+        cli.qdrant_init(confirm=False)
+    assert result.value.exit_code == 2
+    assert not calls
+    assert "No action taken" in capsys.readouterr().out
+
+    with pytest.raises(cli.typer.Exit) as result:
+        cli.qdrant_init(confirm=True)
+    assert result.value.exit_code == 1
+    assert not calls
+    capsys.readouterr()
+
+    cfg.data["memory"]["qdrant"]["enabled"] = True
+    cli.qdrant_init(confirm=True)
+    assert calls == [True]
+    assert json.loads(capsys.readouterr().out)["initialized"] is True
+
+
+def test_qdrant_init_reports_only_error_type(harness_context, monkeypatch, capsys):
+    cfg, _store, orchestrator, _root = harness_context
+    cfg.data["memory"]["qdrant"]["enabled"] = True
+    monkeypatch.setattr(cli, "build", lambda: (cfg, _store, orchestrator))
+    monkeypatch.setattr(
+        orchestrator.qdrant,
+        "ensure_collection",
+        lambda: (_ for _ in ()).throw(RuntimeError("private response body")),
+    )
+
+    with pytest.raises(cli.typer.Exit) as result:
+        cli.qdrant_init(confirm=True)
+    assert result.value.exit_code == 1
+    output = capsys.readouterr().out
+    assert "RuntimeError" in output
+    assert "private response body" not in output
+
+
+def test_qdrant_search_is_internal_and_requires_enabled_service(
+    harness_context, monkeypatch, capsys
+):
+    cfg, _store, orchestrator, _root = harness_context
+    cfg.data["memory"]["qdrant"]["enabled"] = False
+    calls = []
+    monkeypatch.setattr(cli, "build", lambda: (cfg, _store, orchestrator))
+    monkeypatch.setattr(
+        orchestrator.qdrant,
+        "search",
+        lambda query, limit: calls.append((query, limit)) or [{"id": "point-1"}],
+    )
+
+    with pytest.raises(cli.typer.Exit) as result:
+        cli.qdrant_search("query", limit=3)
+    assert result.value.exit_code == 1
+    assert not calls
+    capsys.readouterr()
+    cfg.data["memory"]["qdrant"]["enabled"] = True
+    cli.qdrant_search("query", limit=3)
+    assert calls == [("query", 3)]
+    assert json.loads(capsys.readouterr().out) == [{"id": "point-1"}]
+
+
+@pytest.mark.parametrize(
+    ("query", "limit"), [(" ", 5), ("query", 0), ("query", 21), ("query", True)]
+)
+def test_qdrant_search_rejects_invalid_query_and_limit(
+    harness_context, query, limit, capsys
+):
+    with pytest.raises(cli.typer.Exit) as result:
+        cli.qdrant_search(query, limit=limit)
+    assert result.value.exit_code == 2
+    assert capsys.readouterr().out
+
+
+def test_qdrant_search_reports_only_error_type(harness_context, monkeypatch, capsys):
+    cfg, _store, orchestrator, _root = harness_context
+    cfg.data["memory"]["qdrant"]["enabled"] = True
+    monkeypatch.setattr(cli, "build", lambda: (cfg, _store, orchestrator))
+    monkeypatch.setattr(
+        orchestrator.qdrant,
+        "search",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("private response body")
+        ),
+    )
+
+    with pytest.raises(cli.typer.Exit) as result:
+        cli.qdrant_search("query")
+    assert result.value.exit_code == 1
+    output = capsys.readouterr().out
+    assert "RuntimeError" in output
+    assert "private response body" not in output
+
+
+def test_metrics_command_prints_structured_durable_counters(harness_context, capsys):
+    _cfg, store, _orchestrator, _root = harness_context
+    task = store.create(Task(title="metrics"))
+    store.event(task.id, "task.created", {})
+
+    cli.runtime_metrics()
+
+    report = json.loads(capsys.readouterr().out)
+    assert report["tasks"]["by_status"]["pending"] == 1
+    assert report["events"]["total"] == 1
+
+
+def test_completion_command_reports_gap_count_and_returns_incomplete(
+    harness_context, capsys
+):
+    import typer
+
+    _cfg, _store, _orchestrator, root = harness_context
+    lines = ["| Nr. | Name | Status | Tiefe |\n|---:|---|---|---|\n"]
+    lines.extend(
+        f"| {number} | item | {'Offen' if number == 2 else 'Erfüllt'} | status |\n"
+        for number in range(1, 110)
+    )
+    (root / "GAP_MATRIX.md").write_text("".join(lines))
+
+    with pytest.raises(typer.Exit) as error:
+        cli.completion_status()
+
+    assert error.value.exit_code == 1
+    report = json.loads(capsys.readouterr().out)
+    assert report["remaining"] == [2]
+    assert report["complete"] is False
+
+
+def test_completion_command_accepts_a_fully_satisfied_matrix(harness_context, capsys):
+    _cfg, _store, _orchestrator, root = harness_context
+    rows = "".join(
+        f"| {number} | item | Erfüllt | evidence |\n" for number in range(1, 110)
+    )
+    matrix_path = root / "GAP_MATRIX.md"
+    matrix_path.write_text(
+        "| Nr. | Name | Status | Tiefe |\n|---:|---|---|---|\n" + rows
+    )
+    from test_completion import coverage_report
+
+    from harness.verification import write_verification_report
+
+    coverage_path = root / "coverage.json"
+    coverage_path.write_text(json.dumps(coverage_report()))
+    junit_path = root / "junit.xml"
+    junit_path.write_text('<testsuite tests="1"><testcase name="ok" /></testsuite>')
+    write_verification_report(
+        matrix_path, coverage_path, junit_path, root / "data" / "verification.json"
+    )
+
+    cli.completion_status()
+
+    assert json.loads(capsys.readouterr().out)["complete"] is True
+
+
+def test_completion_command_fails_closed_on_invalid_matrix(harness_context, capsys):
+    import typer
+
+    _cfg, _store, _orchestrator, root = harness_context
+    (root / "GAP_MATRIX.md").write_text("not a matrix")
+
+    with pytest.raises(typer.Exit) as error:
+        cli.completion_status()
+
+    assert error.value.exit_code == 2
+    assert "unverifiable" in capsys.readouterr().out

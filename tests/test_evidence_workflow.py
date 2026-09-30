@@ -7,6 +7,7 @@ import sys
 import pytest
 
 from harness.agents import ExecutorOutput, ValidatorOutput
+from harness.approvals import ApprovalDenied, ApprovalRequired, ToolApprovalTarget
 from harness.core import Config, Orchestrator, Store
 from harness.domain import AcceptanceCriterion, Task
 
@@ -38,13 +39,27 @@ def runtime(tmp_path):
                         "requirements": {
                             "add two integers": {
                                 "status": "uncertain",
-                                "criteria": [],
-                                "evidence": "Current observations require renewed independent inspection.",
+                                "criteria": ["sum"],
+                                "evidence": "The addition criterion needs renewed independent inspection.",
                             }
                         }
                     }
                 )
             if prompt.startswith("PLAN:"):
+                try:
+                    task_data = json.loads(
+                        prompt.split("\nTask:\n", 1)[1].split("\nContext:\n", 1)[0]
+                    )
+                except (IndexError, json.JSONDecodeError):
+                    task_data = {}
+                requirement_ids = task_data.get("requirements", []) or [
+                    "add two integers"
+                ]
+                criterion_ids = [
+                    item.get("id")
+                    for item in task_data.get("acceptance_criteria", [])
+                    if isinstance(item, dict) and item.get("id")
+                ]
                 targets = []
                 write_paths = []
                 if "RECOVERY_SCOPE_JSON:\n" in prompt:
@@ -69,7 +84,8 @@ def runtime(tmp_path):
                                 "title": "addition",
                                 "description": "implement",
                                 "expected_result": "correct sum",
-                                "acceptance_criteria": ["sum is correct"],
+                                "acceptance_criteria": criterion_ids or ["sum"],
+                                "requirement_ids": requirement_ids,
                                 "recovery_targets": targets,
                                 "write_paths": write_paths,
                             }
@@ -338,6 +354,77 @@ def test_missing_requirements_pause_without_model_or_success(tmp_path):
         asyncio.run(orchestrator.run(task.id))
 
 
+def test_high_impact_tool_approval_pauses_task_and_records_exact_target(tmp_path):
+    store, orchestrator = runtime(tmp_path)
+    task = store.create(specification())
+    target = ToolApprovalTarget.create(
+        task.id, "http.request", {"method": "POST", "url": "https://example.test"}
+    )
+
+    def request_approval(*_args, **_kwargs):
+        question_id = orchestrator.approvals.request_tool(target)
+        raise ApprovalRequired(question_id)
+
+    orchestrator._invoke = request_approval
+    result = asyncio.run(orchestrator.run(task.id))
+    assert result.status == "waiting_human"
+    question = store.questions.list(task.id)[0]
+    assert question["reason"] == target.reason()
+    assert "https://example.test" not in question["question"]
+
+
+def test_persisted_approval_resumes_for_exact_action_once(tmp_path):
+    store, orchestrator = runtime(tmp_path)
+    task = store.create(specification())
+    secret = "authorization-secret-do-not-store"
+    arguments = {"method": "POST", "headers": {"Authorization": secret}}
+    target = ToolApprovalTarget.create(task.id, "http.request", arguments)
+    question_id = orchestrator.approvals.request_tool(target)
+    question = store.questions.get(question_id)
+    assert secret not in question["question"]
+    assert store.get(task.id).status == "waiting_human"
+    assert store.answer(question_id, "approve", task.id)
+
+    grant = orchestrator.approvals.grant_tool_for_target(target)
+    assert grant.consume(target.action, target)
+    with pytest.raises(PermissionError, match="already consumed"):
+        orchestrator.approvals.grant_tool_for_target(target)
+    changed = ToolApprovalTarget.create(
+        task.id,
+        "http.request",
+        {"method": "POST", "headers": {"Authorization": "different"}},
+    )
+    with pytest.raises(ApprovalRequired):
+        orchestrator.approvals.grant_tool_for_target(changed)
+
+
+def test_denied_action_approval_blocks_task(tmp_path):
+    store, orchestrator = runtime(tmp_path)
+    task = store.create(specification())
+    orchestrator._invoke = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        ApprovalDenied("denied")
+    )
+    result = asyncio.run(orchestrator.run(task.id))
+    assert result.status == "blocked"
+    assert any(row["kind"] == "task.blocked" for row in store.events.list(task.id))
+
+
+def test_denial_does_not_reopen_a_task_that_became_terminal(tmp_path):
+    store, orchestrator = runtime(tmp_path)
+    task = store.create(specification())
+
+    def terminal_then_deny(*_args, **_kwargs):
+        with store.database.connect() as connection:
+            connection.execute(
+                "UPDATE tasks SET status='completed' WHERE id=?", (task.id,)
+            )
+        raise ApprovalDenied("denied")
+
+    orchestrator._invoke = terminal_then_deny
+    result = asyncio.run(orchestrator.run(task.id))
+    assert result.status == "completed"
+
+
 def test_service_metadata_and_concurrent_claim(tmp_path):
     store, orchestrator = runtime(tmp_path)
     task = orchestrator.service.create(specification())
@@ -364,7 +451,7 @@ def test_real_executor_tool_loop_corrects_a_real_test_failure(tmp_path):
             if isinstance(prompt, list):
                 if prompt[-1]["role"] == "tool":
                     assert prompt[-1]["tool_call_id"] == "edit-call"
-                    return "Actual workspace edit performed", ModelUsage(
+                    return '{"output":"Actual workspace edit performed"}', ModelUsage(
                         "fixture", "fixture"
                     )
                 corrected = "command failed" in prompt[1]["content"]
@@ -396,6 +483,7 @@ def test_real_executor_tool_loop_corrects_a_real_test_failure(tmp_path):
                                 "description": "implement addition",
                                 "expected_result": "sum",
                                 "acceptance_criteria": ["sum"],
+                                "requirement_ids": ["add two integers"],
                                 "required_tools": ["filesystem.write"],
                                 "write_paths": ["addition.py"],
                             }

@@ -57,6 +57,86 @@ def test_decision_service_records_typed_provenance_and_event(tmp_path):
     assert "The user supplied" not in event["payload"]
 
 
+def test_decision_record_automatically_projects_when_memory_is_enabled(tmp_path):
+    store, task = task_store(tmp_path)
+    vault = store.config.path("obsidian_vault")
+    store.config.data.setdefault("memory", {}).setdefault("obsidian", {})["enabled"] = (
+        True
+    )
+
+    created = DecisionService(store).record(
+        {
+            "task_id": task.id,
+            "category": "architecture",
+            "source": "agent",
+            "decision": "Use SQLite",
+            "rationale": "Keep a canonical store",
+            "evidence": [{"source": "task", "ref": f"task:{task.id}"}],
+        }
+    )
+
+    note = vault / "_harness" / "decisions" / f"{created.id}.md"
+    assert note.exists()
+    assert "Use SQLite" in note.read_text()
+
+
+def test_decision_record_respects_disabled_obsidian_projection(tmp_path):
+    store, task = task_store(tmp_path)
+    vault = store.config.path("obsidian_vault")
+    store.config.data.setdefault("memory", {}).setdefault("obsidian", {})["enabled"] = (
+        False
+    )
+
+    DecisionService(store).record(
+        {
+            "task_id": task.id,
+            "category": "architecture",
+            "source": "agent",
+            "decision": "Use SQLite",
+            "rationale": "Keep a canonical store",
+            "evidence": [{"source": "task", "ref": f"task:{task.id}"}],
+        }
+    )
+
+    assert not (vault / "_harness" / "manifest.json").exists()
+
+
+def test_decision_projection_failure_does_not_lose_canonical_decision(
+    tmp_path, monkeypatch
+):
+    from harness.memory_projection import DecisionProjection
+
+    store, task = task_store(tmp_path)
+    store.config.data.setdefault("memory", {}).setdefault("obsidian", {})["enabled"] = (
+        True
+    )
+    monkeypatch.setattr(
+        DecisionProjection,
+        "sync",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("sensitive path")),
+    )
+
+    created = DecisionService(store).record(
+        {
+            "task_id": task.id,
+            "category": "architecture",
+            "source": "agent",
+            "decision": "Keep SQLite",
+            "rationale": "Canonical source",
+            "evidence": [{"source": "task", "ref": f"task:{task.id}"}],
+        }
+    )
+
+    assert store.decisions.get(created.id)["decision"] == "Keep SQLite"
+    failure = next(
+        item
+        for item in store.events.list(task.id)
+        if item["kind"] == "memory.projection_failed"
+    )
+    assert "sensitive path" not in failure["payload"]
+    assert json.loads(failure["payload"])["error_type"] == "OSError"
+
+
 @pytest.mark.parametrize(
     "payload",
     [

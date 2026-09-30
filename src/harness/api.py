@@ -9,7 +9,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
 from .core import Event, Task, build
-from .domain import AcceptanceCriterion, Status
+from .domain import AcceptanceCriterion, Status, TaskComplexity
 
 
 class ErrorResponse(BaseModel):
@@ -30,7 +30,7 @@ class TaskPatchRequest(BaseModel):
     dependencies: list[int] | None = None
     assigned_agent: str | None = None
     assigned_profile: str | None = None
-    complexity: str | None = None
+    complexity: TaskComplexity | None = None
     context: dict[str, Any] | None = None
     decisions: list[dict[str, Any]] | None = None
     test_commands: list[list[str]] | None = None
@@ -138,7 +138,7 @@ class ModelUsageRow(BaseModel):
     task_id: int | None
     agent: str | None
     profile: str | None
-    complexity: str | None
+    complexity: TaskComplexity | None
     provider: str
     model: str
     status: str | None
@@ -162,9 +162,20 @@ class ModelUsageTotals(BaseModel):
     completion_tokens: int | None
     completion_tokens_reported: int
     completion_tokens_missing: int
+    cached_tokens: int | None
+    cached_tokens_reported: int
+    cached_tokens_missing: int
+    reasoning_tokens: int | None
+    reasoning_tokens_reported: int
+    reasoning_tokens_missing: int
     cost: float | None
     cost_reported: int
     cost_missing: int
+
+
+class ModelUsageGroup(BaseModel):
+    value: int | str | None
+    totals: ModelUsageTotals
 
 
 class UsageReportResponse(BaseModel):
@@ -173,6 +184,8 @@ class UsageReportResponse(BaseModel):
     offset: int
     totals: ModelUsageTotals
     items: list[ModelUsageRow]
+    group_by: str | None
+    groups: list[ModelUsageGroup]
 
 
 def _service_error(error: ValueError):
@@ -245,6 +258,16 @@ async def request_validation_error(_request, error):
 @router.get("/health")
 def health():
     return {"status": "ok", "service": "harness"}
+
+
+@router.get("/metrics")
+def metrics():
+    return orchestrator.observability.metrics()
+
+
+@router.get("/event-kinds")
+def event_kinds():
+    return {"event_kinds": list(orchestrator.observability.event_kinds)}
 
 
 @router.post("/tasks", response_model=Task, responses={422: {"model": ErrorResponse}})
@@ -358,7 +381,7 @@ def task_result(task_id: int):
 )
 def events(task_id: int):
     _require_task(task_id)
-    return [_event(row) for row in store.list_events(task_id)]
+    return [_event(row) for row in orchestrator.service.events(task_id)]
 
 
 @router.get(
@@ -368,7 +391,7 @@ def events(task_id: int):
 )
 def questions(task_id: int):
     _require_task(task_id)
-    return [_question(row) for row in store.list_questions(task_id)]
+    return [_question(row) for row in orchestrator.service.questions(task_id)]
 
 
 @router.post(
@@ -395,9 +418,8 @@ async def answer(task_id: int, payload: AnswerRequest):
     responses={404: {"model": ErrorResponse}, 422: {"model": ErrorResponse}},
 )
 def ask_question(task_id: int, payload: QuestionRequest):
-    _require_task(task_id)
     try:
-        question_id = store.ask(
+        question_id = orchestrator.service.ask_question(
             task_id,
             payload.question,
             payload.reason,
@@ -416,7 +438,7 @@ def ask_question(task_id: int, payload: QuestionRequest):
 )
 def plan(task_id: int):
     _require_task(task_id)
-    return store.latest_plan(task_id)
+    return orchestrator.service.plan(task_id)
 
 
 @router.get(
@@ -426,7 +448,7 @@ def plan(task_id: int):
 )
 def validation(task_id: int):
     _require_task(task_id)
-    return store.latest_validation(task_id)
+    return orchestrator.service.validation(task_id)
 
 
 @router.get(
@@ -440,18 +462,25 @@ def validation(task_id: int):
 )
 def model_usage(
     task_id: int | None = Query(default=None, gt=0),
+    agent: str | None = Query(default=None, min_length=1),
+    profile: str | None = Query(default=None, min_length=1),
     provider: str | None = Query(default=None, min_length=1),
     model: str | None = Query(default=None, min_length=1),
+    group_by: Literal["task_id", "agent", "profile", "provider", "model", "day"]
+    | None = None,
     since: AwareDatetime | None = None,
     until: AwareDatetime | None = None,
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
 ):
     try:
-        return store.model_usage.report(
+        return orchestrator.service.model_usage(
             task_id=task_id,
+            agent=agent,
+            profile=profile,
             provider=provider,
             model=model,
+            group_by=group_by,
             since=since,
             until=until,
             limit=limit,
@@ -473,7 +502,7 @@ def all_events(
     until_utc = until.astimezone(UTC) if until else None
     if since_utc and until_utc and since_utc > until_utc:
         raise HTTPException(422, "since must not be later than until")
-    rows = store.list_events(
+    rows = orchestrator.service.event_feed(
         task_id,
         event_type,
         since_utc.isoformat() if since_utc else None,
@@ -518,7 +547,7 @@ async def stream(request: Request, task_id: int | None = None):
         while True:
             if await request.is_disconnected():
                 return
-            rows = store.events.after(current, task_id)
+            rows = orchestrator.service.events_after(current, task_id)
             for row in rows:
                 current = row["id"]
                 yield f"id: {current}\nevent: {row['kind']}\ndata: {json.dumps(_event(row).model_dump(mode='json'), default=str)}\n\n"

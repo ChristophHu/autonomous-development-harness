@@ -45,6 +45,47 @@ def test_decision_projection_writes_deterministic_markdown_and_manifest(tmp_path
     assert manifest == {"version": 1, "files": ["decisions/1.md"]}
 
 
+def test_vault_status_reports_root_notes_and_managed_decisions(tmp_path):
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "Willkommen.md").write_text("hello")
+    (vault / ".obsidian").mkdir()
+    (vault / ".obsidian" / "hidden.md").write_text("hidden")
+    projection = DecisionProjection(vault)
+    projection.sync([])
+
+    status = projection.status(obsidian_enabled=True, mcp_enabled=False)
+
+    assert status == {
+        "path": str(vault.resolve()),
+        "exists": True,
+        "obsidian_enabled": True,
+        "mcp_enabled": False,
+        "markdown_notes": 1,
+        "managed_decisions": 0,
+        "nested_vaults": [],
+    }
+
+
+def test_vault_status_detects_nested_obsidian_configuration(tmp_path):
+    vault = tmp_path / "vault"
+    (vault / "nested" / ".obsidian").mkdir(parents=True)
+
+    status = DecisionProjection(vault).status()
+
+    assert status["nested_vaults"] == ["nested/.obsidian"]
+
+
+def test_vault_status_does_not_create_a_missing_vault(tmp_path):
+    vault = tmp_path / "missing"
+
+    status = DecisionProjection(vault).status()
+
+    assert status["exists"] is False
+    assert status["markdown_notes"] == 0
+    assert not vault.exists()
+
+
 def test_decision_projection_updates_owned_note_and_preserves_user_files(tmp_path):
     store = fixture_store(tmp_path)
     projection = DecisionProjection(tmp_path / "vault")

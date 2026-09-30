@@ -48,6 +48,20 @@ models:
   strategies:
     planning: {profile: planner}
     implementation: {profile: coding}
+  routing:
+    tier_preferences:
+      low: [local, economical, standard, advanced, premium]
+      medium: [standard, local, economical, advanced, premium]
+      high: [advanced, standard, premium, economical, local]
+      critical: [premium, advanced, standard, economical, local]
+    profile_tier_preferences:
+      software-architect:
+        low: [advanced, premium, standard, economical, local]
+    fallback:
+      max_attempts: 3
+      base_delay: 0.25
+      max_delay: 4
+      max_elapsed: 300
 profiles:
   software-architect:
     model: {primary: openai_astra, fallback: [openai_sol, deepseek_flash]}
@@ -99,6 +113,8 @@ api:
 logging:
   level: INFO
   file: ./logs/harness.log
+  max_bytes: 10485760
+  backup_count: 3
 testing:
   tdd: true
   coverage: {statements: 100, branches: 100, functions: 100, lines: 100}
@@ -114,3 +130,11 @@ tools:
     servers:
       files: {enabled: false, builtin: filesystem, read_only: true, allow_delete: false}
       vault: {enabled: false, builtin: obsidian, read_only: true}
+      # Remote tools are opt-in, HTTPS-only, host-pinned, and require a narrow allowlist.
+      # lookup:
+      #   enabled: false
+      #   transport: streamable_http
+      #   url: https://mcp.example.invalid/rpc
+      #   allowed_hosts: [mcp.example.invalid]
+      #   auth_secret: REMOTE_MCP_TOKEN
+      #   allow_tools: [lookup]

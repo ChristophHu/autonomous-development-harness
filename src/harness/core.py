@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -24,7 +25,7 @@ from .agents import (
     ModelRouter,
     Planner,
 )
-from .approvals import ApprovalService
+from .approvals import ApprovalDenied, ApprovalRequired, ApprovalService
 from .audit import AuditRecorder
 from .configuration import HarnessConfig
 from .database import (
@@ -274,7 +275,7 @@ class ConfigurationService:
             {
                 key: value
                 for key, value in environment.items()
-                if key.endswith("_API_KEY")
+                if (key.endswith("_API_KEY") and str(value).strip())
                 or (key != "LLM_MODEL" and re.fullmatch(r"[A-Z][A-Z0-9_]*_MODEL", key))
             }
         )
@@ -822,6 +823,9 @@ class Orchestrator:
     def __init__(self, store: Store, config: Config | None = None):
         self.store = store
         self.config = config or store.config
+        from .observability import ObservabilityService
+
+        self.observability = ObservabilityService(store.database, EventKind)
         self.queue: asyncio.Queue[Event] = asyncio.Queue()
         registry = ModelRegistry(self.config)
         self.audit = store.audit
@@ -832,6 +836,7 @@ class Orchestrator:
         workspace = self.config.path("workspace")
         self.tools = ToolRegistry(Permissions(self.config), self._tool_event, workspace)
         self.approvals = ApprovalService(self.store.questions, self.store)
+        self.tools.approvals = self.approvals
         self.git_workflow = GitWorkflow(self.tools)
         from .git_service import GitWorkflowService
 
@@ -859,6 +864,7 @@ class Orchestrator:
             embeddings.get("dimensions", EMBEDDING_DIMENSION_DEFAULT),
             embedder,
             timeout=qdrant.get("timeout", 5),
+            api_key=self.config.data.get("secrets", {}).get("QDRANT__SERVICE__API_KEY"),
         )
         notes = ObsidianMemory(self.config.path("obsidian_vault"))
         self.memory_service = MemoryService(
@@ -875,9 +881,9 @@ class Orchestrator:
     def _tool_event(self, kind, payload):
         self.audit.tool_event(kind, payload)
 
-    def _invoke(self, task, agent, profile, operation, *args):
+    def _invoke(self, task, agent, profile, operation, *args, **kwargs):
         with self.audit.agent(task, agent, profile) as span:
-            result = operation(*args)
+            result = operation(*args, **kwargs)
             span["output"] = (
                 result.model_dump(mode="json")
                 if isinstance(result, BaseModel)
@@ -906,13 +912,21 @@ class Orchestrator:
             else nullcontext()
         )
         with guard:
+            execute = self.executor.execute
+            parameters = inspect.signature(execute).parameters.values()
+            accepts_complexity = any(
+                parameter.name == "complexity"
+                or parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters
+            )
             return self._invoke(
                 task,
                 step.assigned_agent,
                 step.profile,
-                self.executor.execute,
+                execute,
                 step,
                 context,
+                **({"complexity": task.complexity} if accepts_complexity else {}),
             )
 
     async def emit(self, e: Event):
@@ -1341,6 +1355,20 @@ class Orchestrator:
                     EventKind.CORRECTION_STARTED,
                     {"attempt": attempt, "findings": findings},
                 )
+        except ApprovalRequired:
+            # ApprovalService.ask atomically persisted the exact action and
+            # transitioned this task to WAITING_HUMAN; return that durable state.
+            return self.store.get(task_id)
+        except ApprovalDenied:
+            task = self.store.get(task_id)
+            if task.status not in TERMINAL:
+                self.store.tasks.transition(task_id, Status.BLOCKED, owner)
+                self.store.event(
+                    task_id,
+                    EventKind.TASK_BLOCKED,
+                    {"reason": "human denied a specific tool action"},
+                )
+            return self.store.get(task_id)
         except TaskCancelled:
             if run_control is not None and run_control.reason == "lease_lost":
                 self.store.event(task_id, EventKind.TASK_LEASE_LOST, {"owner": owner})
@@ -1358,14 +1386,18 @@ class Orchestrator:
 
 def build():
     config = Config()
-    config.path("logs").mkdir(parents=True, exist_ok=True)
-    logging.basicConfig(
-        level=config.settings.logging.level,
-        format="%(asctime)s %(levelname)s %(message)s",
-        handlers=[
-            logging.FileHandler(config.path("logs") / "harness.log"),
-            logging.StreamHandler(),
-        ],
+    log_settings = config.settings.logging
+    log_path = Path(log_settings.file)
+    if not log_path.is_absolute():
+        log_path = config._path.parent / log_path
+    from .observability import configure_logging
+
+    configure_logging(
+        log_path,
+        level=log_settings.level,
+        max_bytes=log_settings.max_bytes,
+        backup_count=log_settings.backup_count,
+        secrets=config.data.get("secrets", {}).values(),
     )
     store = Store(config)
     return config, store, Orchestrator(store, config)

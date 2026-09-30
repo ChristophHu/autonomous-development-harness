@@ -54,6 +54,237 @@ def test_provider_kind_is_explicit_and_validated():
         )
 
 
+def test_mcp_streamable_http_requires_https_exact_host_binding_and_allowlist():
+    server = {
+        "transport": "streamable_http",
+        "url": "https://mcp.example.test/rpc",
+        "allowed_hosts": ["mcp.example.test"],
+        "allow_tools": ["lookup"],
+    }
+    settings = HarnessConfig.model_validate(
+        {"tools": {"mcp": {"servers": {"remote": server}}}}
+    )
+    assert settings.tools.mcp.servers["remote"].transport == "streamable_http"
+    for invalid in (
+        server | {"url": "http://mcp.example.test/rpc"},
+        server | {"url": "https://attacker.test/rpc"},
+        server | {"url": "https://user:pass@mcp.example.test/rpc"},
+        server | {"allowed_hosts": []},
+        server | {"auth_secret": "bad-name"},
+        server | {"url": "https://mcp.example.test:bad/rpc"},
+        server | {"read_only": False},
+        server | {"trusted_local": True},
+        {
+            "command": ["mcp-server"],
+            "trusted_local": True,
+            "url": "https://mcp.example.test/rpc",
+            "allow_tools": ["lookup"],
+        },
+    ):
+        with pytest.raises(ValidationError):
+            HarnessConfig.model_validate(
+                {"tools": {"mcp": {"servers": {"remote": invalid}}}}
+            )
+
+
+@pytest.mark.parametrize(
+    "logging_settings",
+    [
+        {"max_bytes": 1023},
+        {"max_bytes": 104_857_601},
+        {"max_bytes": True},
+        {"backup_count": -1},
+        {"backup_count": 11},
+    ],
+)
+def test_logging_rotation_settings_are_bounded_and_strict(logging_settings):
+    with pytest.raises(ValidationError):
+        HarnessConfig.model_validate({"logging": logging_settings})
+
+
+@pytest.mark.parametrize(
+    "tier", ["premium", "advanced", "standard", "economical", "local"]
+)
+def test_model_tier_accepts_each_supported_configurable_tier(tier):
+    settings = HarnessConfig.model_validate(
+        {"models": {"registry": {"m": {"provider": "p", "model": "id", "tier": tier}}}}
+    )
+    assert settings.models.registry["m"].tier == tier
+
+
+@pytest.mark.parametrize("tier", ["Premium", "unknown", "", 1])
+def test_model_tier_rejects_values_outside_supported_tiers(tier):
+    with pytest.raises(ValidationError):
+        HarnessConfig.model_validate(
+            {
+                "models": {
+                    "registry": {"m": {"provider": "p", "model": "id", "tier": tier}}
+                }
+            }
+        )
+
+
+def test_model_tier_remains_optional_for_legacy_models():
+    settings = HarnessConfig.model_validate(
+        {"models": {"registry": {"m": {"provider": "p", "model": "id"}}}}
+    )
+    assert settings.models.registry["m"].tier is None
+
+
+def test_model_fallback_policy_is_bounded_and_validated():
+    settings = HarnessConfig.model_validate(
+        {
+            "models": {
+                "routing": {
+                    "fallback": {"max_attempts": 3, "base_delay": 0.1, "max_delay": 1.0}
+                }
+            }
+        }
+    )
+    assert settings.models.routing.fallback.max_attempts == 3
+    with pytest.raises(ValidationError):
+        HarnessConfig.model_validate(
+            {"models": {"routing": {"fallback": {"max_attempts": 9}}}}
+        )
+
+
+@pytest.mark.parametrize(
+    "strategy",
+    [
+        {"primary": "a", "fallback": ["a"]},
+        {"primary": "a", "fallback": ["b", "b"]},
+        {"primary": " ", "fallback": []},
+        {"primary": "a", "fallback": [""]},
+    ],
+)
+def test_profile_model_strategy_rejects_blank_or_duplicate_candidates(strategy):
+    with pytest.raises(ValidationError):
+        HarnessConfig.model_validate({"profiles": {"coding": {"model": strategy}}})
+
+
+def test_profile_model_strategy_preserves_primary_and_fallback_order():
+    settings = HarnessConfig.model_validate(
+        {"profiles": {"coding": {"model": {"primary": "a", "fallback": ["b", "c"]}}}}
+    )
+    assert settings.profiles["coding"].model.primary == "a"
+    assert settings.profiles["coding"].model.fallback == ["b", "c"]
+
+
+def test_model_routing_policy_validates_all_complexity_preferences():
+    settings = HarnessConfig.model_validate(
+        {
+            "models": {
+                "routing": {
+                    "tier_preferences": {
+                        "low": [
+                            "local",
+                            "economical",
+                            "standard",
+                            "advanced",
+                            "premium",
+                        ],
+                        "medium": [
+                            "standard",
+                            "local",
+                            "economical",
+                            "advanced",
+                            "premium",
+                        ],
+                        "high": [
+                            "advanced",
+                            "standard",
+                            "premium",
+                            "economical",
+                            "local",
+                        ],
+                        "critical": [
+                            "premium",
+                            "advanced",
+                            "standard",
+                            "economical",
+                            "local",
+                        ],
+                    },
+                    "profile_tier_preferences": {
+                        "coding": {
+                            "critical": [
+                                "premium",
+                                "advanced",
+                                "standard",
+                                "economical",
+                                "local",
+                            ]
+                        }
+                    },
+                }
+            },
+            "profiles": {"coding": {"model": {"primary": "model"}}},
+        }
+    )
+    assert [str(tier) for tier in settings.models.routing.tier_preferences["low"]] == [
+        "local",
+        "economical",
+        "standard",
+        "advanced",
+        "premium",
+    ]
+    assert (
+        settings.models.routing.profile_tier_preferences["coding"]["critical"][0]
+        == "premium"
+    )
+
+
+@pytest.mark.parametrize(
+    "preferences",
+    [
+        {
+            "low": ["local", "local"],
+            "medium": ["standard"],
+            "high": ["advanced"],
+            "critical": ["premium"],
+        },
+        {
+            "low": ["unknown"],
+            "medium": ["standard"],
+            "high": ["advanced"],
+            "critical": ["premium"],
+        },
+        {"low": ["local"], "medium": ["standard"], "high": ["advanced"]},
+        {"low": []},
+    ],
+)
+def test_model_routing_policy_rejects_duplicate_unknown_or_missing_preferences(
+    preferences,
+):
+    with pytest.raises(ValidationError):
+        HarnessConfig.model_validate(
+            {"models": {"routing": {"tier_preferences": preferences}}}
+        )
+
+
+def test_model_routing_profile_override_requires_known_profile():
+    with pytest.raises(ValidationError):
+        HarnessConfig.model_validate(
+            {
+                "models": {
+                    "routing": {
+                        "profile_tier_preferences": {
+                            "missing": {
+                                "low": [
+                                    "local",
+                                    "economical",
+                                    "standard",
+                                    "advanced",
+                                    "premium",
+                                ]
+                            }
+                        }
+                    }
+                }
+            }
+        )
+
+
 @pytest.mark.parametrize(
     "payload,path",
     [

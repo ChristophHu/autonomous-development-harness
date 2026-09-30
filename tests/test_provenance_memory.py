@@ -303,6 +303,7 @@ def test_context_is_isolated_between_parallel_tasks(tmp_path):
 
 def test_vault_symlinks_absolute_paths_and_nested_append(tmp_path):
     notes = ObsidianMemory(tmp_path / "vault")
+    notes.vault.mkdir()
     outside = tmp_path / "outside.md"
     outside.write_text("PRIVATE")
     (notes.vault / "linked.md").symlink_to(outside)

@@ -112,9 +112,9 @@ def test_docker_actions_require_correct_permissions_and_use_broker(monkeypatch):
 
 def test_registry_schema_events_and_failure(tmp_path):
     events = []
-    tool = ToolRegistry(
-        Permissions(Config()), lambda kind, payload: events.append(kind)
-    )
+    config = Config()
+    config.data["tools"]["mcp"]["servers"]["vault"]["enabled"] = False
+    tool = ToolRegistry(Permissions(config), lambda kind, payload: events.append(kind))
     tool.register(
         ToolSpec(
             "value",
@@ -164,7 +164,9 @@ def test_registry_denies_write_without_permission():
 
 
 def test_registry_rejects_native_tool_output_schema_violation():
-    registry = ToolRegistry(Permissions(Config()))
+    config = Config()
+    config.data["tools"]["mcp"]["servers"]["vault"]["enabled"] = False
+    registry = ToolRegistry(Permissions(config))
     registry.register(
         ToolSpec(
             "bad-output",
@@ -331,7 +333,9 @@ def test_shell_wrappers_and_registry_without_sink(monkeypatch, tmp_path):
     )
     assert tool.test(["pytest"], tmp_path).stdout == "ok"
     assert tool.lint(["ruff"], tmp_path).stdout == "ok"
-    registry = ToolRegistry(Permissions(Config()), workspace=tmp_path)
+    config = Config()
+    config.data["tools"]["mcp"]["servers"]["vault"]["enabled"] = False
+    registry = ToolRegistry(Permissions(config), workspace=tmp_path)
     assert registry.list()
     assert registry.git_status(str(tmp_path)) == "ok"
     registry.register(

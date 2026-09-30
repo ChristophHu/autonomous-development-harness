@@ -7,6 +7,8 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
+from .structured_output import parse_model_output
+
 
 class RequirementAssessment(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -41,8 +43,11 @@ class RecoveryScope(BaseModel):
                     "report": report.model_dump(mode="json"),
                 }
             ),
+            complexity=task.complexity,
         )
-        assessment = RecoveryAssessment.model_validate_json(answer)
+        assessment = parse_model_output(
+            RecoveryAssessment, answer, agent="recovery_validator"
+        )
         if set(assessment.requirements) != set(task.requirements):
             raise ValueError("recovery assessment must cover exact requirements")
         targets = [

@@ -30,6 +30,13 @@ def test_api_all_routes_and_errors(client):
     task = http.post("/api/tasks", json={"title": "API test"}).json()
     task_id = task["id"]
     assert http.patch(f"/api/tasks/{task_id}", json={"unknown": "x"}).status_code == 422
+    assert (
+        http.patch(f"/api/tasks/{task_id}", json={"complexity": "urgent"}).status_code
+        == 422
+    )
+    updated = http.patch(f"/api/tasks/{task_id}", json={"complexity": "CRITICAL"})
+    assert updated.status_code == 200
+    assert updated.json()["complexity"] == "CRITICAL"
     assert http.get("/api/tasks/999").status_code == 404
     assert http.get("/api/tasks/999/result").status_code == 404
     assert http.post("/api/tasks/999/start").status_code == 404
@@ -65,6 +72,19 @@ def test_api_all_routes_and_errors(client):
         http.get("/api/events", params={"since": "9999-01-01T00:00:00Z"}).json() == []
     )
     assert http.delete("/api/tasks/999").status_code == 404
+
+
+def test_api_exposes_durable_metrics_and_event_catalogue(client):
+    http, _store, _orchestrator = client
+    created = http.post("/api/tasks", json={"title": "metrics task"}).json()
+    report = http.get("/api/metrics").json()
+    assert report["tasks"]["total"] == 1
+    assert report["tasks"]["by_status"]["pending"] == 1
+    catalogue = http.get("/api/event-kinds").json()["event_kinds"]
+    assert "task.created" in catalogue
+    assert report["events"]["catalogue"] == catalogue
+    assert report["events"]["total"] == 0
+    assert created["status"] == "pending"
 
 
 def test_api_task_and_question_surfaces_do_not_expose_secret_canary(client):

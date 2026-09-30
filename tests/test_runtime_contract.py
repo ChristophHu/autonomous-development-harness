@@ -103,6 +103,7 @@ def test_required_question_blocks_even_a_failed_task(tmp_path):
         "workspace": str(tmp_path / "workspace"),
         "obsidian_vault": str(tmp_path / "vault"),
     }
+    config.data["tools"]["mcp"]["servers"]["vault"]["enabled"] = False
     store = Store(config)
     task = store.create(Task(title="blocked"))
     store.ask(task.id, "Required?", "requirements", required=True)

@@ -992,20 +992,52 @@ class ModelRunRepository:
             )
             return cur.lastrowid
 
+    @staticmethod
+    def _usage_totals(row):
+        runs = row["runs"]
+        totals = {"runs": runs}
+        for field in (
+            "prompt_tokens",
+            "completion_tokens",
+            "cached_tokens",
+            "reasoning_tokens",
+            "cost",
+        ):
+            reported = row[f"{field}_reported"]
+            totals[field] = row[field]
+            totals[f"{field}_reported"] = reported
+            totals[f"{field}_missing"] = runs - reported
+        return totals
+
     def usage_report(
         self,
         *,
         task_id=None,
+        agent=None,
+        profile=None,
         provider=None,
         model=None,
+        group_by=None,
         since=None,
         until=None,
         limit=50,
         offset=0,
     ):
+        grouping = {
+            "task_id": "task_id",
+            "agent": "agent",
+            "profile": "profile",
+            "provider": "provider",
+            "model": "model",
+            "day": "date(COALESCE(started_at,created_at))",
+        }
+        if group_by is not None and group_by not in grouping:
+            raise ValueError("invalid group_by dimension")
         clauses, parameters = [], []
         for column, value in (
             ("task_id", task_id),
+            ("agent", agent),
+            ("profile", profile),
             ("provider", provider),
             ("model", model),
         ):
@@ -1019,30 +1051,35 @@ class ModelRunRepository:
             clauses.append("COALESCE(started_at,created_at)<=?")
             parameters.append(until)
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        aggregates = (
+            "COUNT(*) AS runs, "
+            "SUM(prompt_tokens) AS prompt_tokens, "
+            "COUNT(prompt_tokens) AS prompt_tokens_reported, "
+            "SUM(completion_tokens) AS completion_tokens, "
+            "COUNT(completion_tokens) AS completion_tokens_reported, "
+            "SUM(cached_tokens) AS cached_tokens, "
+            "COUNT(cached_tokens) AS cached_tokens_reported, "
+            "SUM(reasoning_tokens) AS reasoning_tokens, "
+            "COUNT(reasoning_tokens) AS reasoning_tokens_reported, "
+            "SUM(cost) AS cost, COUNT(cost) AS cost_reported"
+        )
         with self.db.connect() as connection:
             totals_row = connection.execute(
-                "SELECT COUNT(*) AS runs, SUM(prompt_tokens) AS prompt_tokens, "
-                "COUNT(prompt_tokens) AS prompt_tokens_reported, "
-                "SUM(completion_tokens) AS completion_tokens, "
-                "COUNT(completion_tokens) AS completion_tokens_reported, "
-                "SUM(cost) AS cost, COUNT(cost) AS cost_reported "
-                f"FROM model_runs{where}",
+                f"SELECT {aggregates} FROM model_runs{where}",
                 parameters,
             ).fetchone()
-            total = totals_row["runs"]
-            totals = {
-                "runs": total,
-                "prompt_tokens": totals_row["prompt_tokens"],
-                "prompt_tokens_reported": totals_row["prompt_tokens_reported"],
-                "prompt_tokens_missing": total - totals_row["prompt_tokens_reported"],
-                "completion_tokens": totals_row["completion_tokens"],
-                "completion_tokens_reported": totals_row["completion_tokens_reported"],
-                "completion_tokens_missing": total
-                - totals_row["completion_tokens_reported"],
-                "cost": totals_row["cost"],
-                "cost_reported": totals_row["cost_reported"],
-                "cost_missing": total - totals_row["cost_reported"],
-            }
+            totals = self._usage_totals(totals_row)
+            groups = []
+            if group_by is not None:
+                expression = grouping[group_by]
+                groups = [
+                    {"value": row["value"], "totals": self._usage_totals(row)}
+                    for row in connection.execute(
+                        f"SELECT {expression} AS value, {aggregates} "
+                        f"FROM model_runs{where} GROUP BY {expression} ORDER BY value",
+                        parameters,
+                    ).fetchall()
+                ]
             rows = connection.execute(
                 "SELECT id,task_id,agent,profile,complexity,provider,model,status,"
                 "started_at,finished_at,latency_ms,fallback_index,prompt_tokens,"
@@ -1051,7 +1088,13 @@ class ModelRunRepository:
                 "ORDER BY COALESCE(started_at,created_at) DESC,id DESC LIMIT ? OFFSET ?",
                 [*parameters, limit, offset],
             ).fetchall()
-        return {"total": total, "totals": totals, "items": [dict(row) for row in rows]}
+        return {
+            "total": totals["runs"],
+            "totals": totals,
+            "items": [dict(row) for row in rows],
+            "group_by": group_by,
+            "groups": groups,
+        }
 
 
 class AuditRepository:

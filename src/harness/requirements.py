@@ -3,8 +3,29 @@
 import hashlib
 import json
 
+from pydantic import BaseModel, ConfigDict, StrictStr, model_validator
+
 from .decisions import DecisionEvidence, DecisionService
 from .domain import EventKind, Task
+from .structured_output import parse_model_output
+
+
+class RequirementProposal(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    fields: dict[str, object]
+    rationale: StrictStr
+    evidence: dict[str, list[DecisionEvidence]]
+
+    @model_validator(mode="after")
+    def restrict_proposed_fields(self):
+        if not self.rationale.strip():
+            raise ValueError("requirement rationale must not be blank")
+        allowed = set(FIELDS)
+        if not set(self.fields) <= allowed or not set(self.evidence) <= allowed:
+            raise ValueError("requirement output contains an unknown field")
+        return self
+
 
 FIELDS = (
     "goal",
@@ -133,30 +154,26 @@ class RequirementCompleter:
                 )
             )
             try:
-                response = json.loads(self.router.complete("planner", prompt))
-                fields = response.get("fields", {})
-                citations = response.get("evidence", {})
-                rationale = response.get("rationale")
-                if not isinstance(fields, dict) or not isinstance(citations, dict):
-                    raise TypeError("requirement evidence must be a mapping")
+                response = parse_model_output(
+                    RequirementProposal,
+                    self.router.complete("planner", prompt, complexity=task.complexity),
+                    agent="requirements",
+                )
+                fields = response.fields
+                citations = response.evidence
+                rationale = response.rationale
                 updates = {}
                 evidence_by_field = {}
                 for name in missing:
-                    if name not in fields or not isinstance(citations.get(name), list):
+                    if name not in fields:
                         continue
-                    refs = [
-                        DecisionEvidence.model_validate(item)
-                        for item in citations[name]
-                    ]
+                    refs = citations.get(name, [])
                     if not refs or any(
                         known_evidence.get(item.ref) != item.source for item in refs
                     ):
                         continue
                     updates[name] = fields[name]
                     evidence_by_field[name] = refs
-                if not isinstance(rationale, str) or not rationale.strip():
-                    updates = {}
-                    evidence_by_field = {}
                 if updates:
                     updated = Task.model_validate(task.model_dump() | updates)
                     changed_fields = [

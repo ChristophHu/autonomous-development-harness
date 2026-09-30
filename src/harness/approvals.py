@@ -12,6 +12,16 @@ from pathlib import Path
 _SEAL = object()
 
 
+class ApprovalRequired(RuntimeError):
+    def __init__(self, question_id):
+        super().__init__("human approval is required for this exact tool action")
+        self.question_id = question_id
+
+
+class ApprovalDenied(PermissionError):
+    pass
+
+
 @dataclass(frozen=True)
 class GitApprovalTarget:
     task_id: int
@@ -42,12 +52,59 @@ class GitApprovalTarget:
 
 
 @dataclass(frozen=True)
+class ToolApprovalTarget:
+    """Approval bound to one task, tool, canonical argument set and affected paths."""
+
+    task_id: int
+    tool: str
+    arguments: str
+    paths: tuple[str, ...] = ()
+
+    def __post_init__(self):
+        if self.task_id < 1 or not self.tool.strip():
+            raise ValueError("approval requires a task and exact tool")
+        payload = json.loads(self.arguments)
+        object.__setattr__(
+            self,
+            "arguments",
+            json.dumps(payload, sort_keys=True, separators=(",", ":")),
+        )
+        object.__setattr__(
+            self,
+            "paths",
+            tuple(sorted({str(Path(path).resolve()) for path in self.paths})),
+        )
+
+    @classmethod
+    def create(cls, task_id, tool, arguments, paths=()):
+        return cls(
+            task_id,
+            tool,
+            json.dumps(arguments, sort_keys=True, separators=(",", ":")),
+            tuple(paths),
+        )
+
+    @property
+    def action(self):
+        return "tool:" + self.tool
+
+    def reason(self):
+        payload = json.dumps(self.__dict__, sort_keys=True, separators=(",", ":"))
+        return (
+            "approval:"
+            + self.action
+            + ":"
+            + hashlib.sha256(payload.encode()).hexdigest()
+        )
+
+
+@dataclass(frozen=True)
 class ApprovalGrant:
     task_id: int
     action: str
     question_id: int
     _seal: object = field(repr=False, compare=False)
-    target: GitApprovalTarget
+    target: GitApprovalTarget | ToolApprovalTarget
     _used: bool = field(default=False, repr=False, compare=False)
     _consume: Callable[[int], bool] | None = field(
         default=None, repr=False, compare=False
@@ -67,12 +124,19 @@ class ApprovalGrant:
             raise PermissionError(
                 "approval grants can only be issued by ApprovalService"
             )
-        if (
-            not isinstance(target, GitApprovalTarget)
-            or target.task_id != task_id
-            or target.action != action
-        ):
-            raise PermissionError("approval requires a matching immutable Git target")
+        valid = (
+            isinstance(target, GitApprovalTarget)
+            and target.task_id == task_id
+            and target.action == action
+        ) or (
+            isinstance(target, ToolApprovalTarget)
+            and target.task_id == task_id
+            and target.action == action
+        )
+        if not valid:
+            raise PermissionError(
+                "approval requires a matching immutable action target"
+            )
         return cls(task_id, action, question_id, seal, target, _consume=consumer)
 
     def permits(self, action: str, target=None) -> bool:
@@ -100,21 +164,65 @@ class ApprovalService:
     def request(self, target, required=False):
         if self.store is None:
             raise ValueError("approval requests require a task store")
+        if isinstance(target, ToolApprovalTarget):
+            safe_target = {
+                "tool": target.tool,
+                "arguments_sha256": hashlib.sha256(
+                    target.arguments.encode()
+                ).hexdigest(),
+                "paths": target.paths,
+            }
+            label = "Tool-Freigabe: "
+        else:
+            safe_target = target.__dict__
+            label = "Git-Freigabe: "
         return self.store.ask(
             target.task_id,
-            "Git-Freigabe: " + json.dumps(target.__dict__),
+            label + json.dumps(safe_target, sort_keys=True),
             target.reason(),
             ["approve", "deny"],
             required=required,
         )
 
+    def request_tool(self, target: ToolApprovalTarget, required=True):
+        if not isinstance(target, ToolApprovalTarget):
+            raise TypeError("tool approval requires ToolApprovalTarget")
+        return self.request(target, required)
+
+    def grant_tool_for_target(self, target: ToolApprovalTarget):
+        """Return the exact answered grant, create a question, or fail on denial/replay."""
+        if not isinstance(target, ToolApprovalTarget):
+            raise TypeError("tool approval requires ToolApprovalTarget")
+        matches = [
+            row
+            for row in self.questions.list(target.task_id)
+            if row["reason"] == target.reason()
+        ]
+        if not matches:
+            raise ApprovalRequired(self.request_tool(target))
+        question = matches[-1]
+        if question["status"] == "open":
+            raise ApprovalRequired(question["id"])
+        if question["status"] == "answered":
+            if question["answer"] != "approve":
+                raise ApprovalDenied("human denied this exact tool action")
+            return self.issue_tool(target.task_id, question["id"], target)
+        if question["status"] in {"consumed", "executed"}:
+            raise PermissionError(
+                "approval for this exact tool action was already consumed"
+            )
+        raise PermissionError("approval is not available for this exact tool action")
+
+    def issue_tool(self, task_id, question_id, target):
+        if not isinstance(target, ToolApprovalTarget):
+            raise PermissionError("exact tool action target is required")
+        return self.issue(task_id, question_id, target.action, target)
+
     def issue(
         self, task_id: int, question_id: int, action: str, target=None
     ) -> ApprovalGrant:
-        if (
-            not isinstance(target, GitApprovalTarget)
-            or target.task_id != task_id
-            or target.action != action
+        if not isinstance(target, (GitApprovalTarget, ToolApprovalTarget)) or (
+            target.task_id != task_id or target.action != action
         ):
             raise PermissionError(
                 "matching recorded human approval requires an exact target"

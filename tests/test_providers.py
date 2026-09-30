@@ -306,7 +306,13 @@ def test_cost_unknown_model_and_usage_tracker():
     assert CostCalculator().calculate(usage) is None
     tracker = UsageTracker()
     tracker.record(usage)
-    assert tracker.total() == 0
+    assert tracker.total() is None
+    tracker.record(ModelUsage("p", "known", 1, 1, cost=0.0))
+    assert tracker.total() is None
+    complete = UsageTracker()
+    assert complete.total() is None
+    complete.record(ModelUsage("p", "free", 1, 1, cost=0.0))
+    assert complete.total() == 0.0
 
 
 def test_provider_decodes_function_tool_calls():

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import re
 from typing import Annotated, Any, Literal, TypeAlias
+from urllib.parse import urlsplit
 
 from pydantic import (
     BaseModel,
@@ -58,6 +60,7 @@ class RetrySettings(ExtensibleSettings):
     max_attempts: StrictInt = Field(default=3, ge=1, le=5)
     base_delay: Number = Field(default=0.25, ge=0, le=60)
     max_delay: Number = Field(default=4.0, ge=0, le=60)
+    max_elapsed: Number = Field(default=300, gt=0, le=3600)
 
 
 class ObsidianSettings(ExtensibleSettings):
@@ -100,10 +103,13 @@ class ModelDefaults(ExtensibleSettings):
     model: StrictStr | None = None
 
 
+ModelTier = Literal["premium", "advanced", "standard", "economical", "local"]
+
+
 class ModelDefinition(ExtensibleSettings):
     provider: StrictStr
     model: StrictStr
-    tier: StrictStr | None = None
+    tier: ModelTier | None = None
     capabilities: list[StrictStr] = Field(default_factory=list)
 
 
@@ -120,17 +126,59 @@ class ModelRate(BaseModel):
     output: Annotated[Number, Field(ge=0)]
 
 
+class ModelRoutingSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    tier_preferences: dict[
+        Literal["low", "medium", "high", "critical"], list[ModelTier]
+    ] = Field(default_factory=dict)
+    profile_tier_preferences: dict[
+        StrictStr, dict[Literal["low", "medium", "high", "critical"], list[ModelTier]]
+    ] = Field(default_factory=dict)
+    fallback: RetrySettings = Field(default_factory=RetrySettings)
+
+    @staticmethod
+    def _validate_orders(preferences):
+        tiers = {"premium", "advanced", "standard", "economical", "local"}
+        for order in preferences.values():
+            if len(order) != len(set(order)) or set(order) != tiers:
+                raise ValueError("tier preference must order every tier exactly once")
+
+    @model_validator(mode="after")
+    def valid_preferences(self):
+        complexities = {"low", "medium", "high", "critical"}
+        if self.tier_preferences and set(self.tier_preferences) != complexities:
+            raise ValueError("global tier preferences must define every complexity")
+        self._validate_orders(self.tier_preferences)
+        for preferences in self.profile_tier_preferences.values():
+            self._validate_orders(preferences)
+        return self
+
+
 class ModelSettings(ExtensibleSettings):
     defaults: ModelDefaults = Field(default_factory=ModelDefaults)
     providers: dict[StrictStr, ProviderSettings] = Field(default_factory=dict)
     registry: dict[StrictStr, ModelDefinition] = Field(default_factory=dict)
     rates: dict[StrictStr, ModelRate] = Field(default_factory=dict)
     strategies: dict[StrictStr, ModelStrategy] = Field(default_factory=dict)
+    routing: ModelRoutingSettings = Field(default_factory=ModelRoutingSettings)
 
 
 class ProfileModelSettings(ExtensibleSettings):
     primary: StrictStr | None = None
     fallback: list[StrictStr] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def valid_candidates(self):
+        candidates = [self.primary, *self.fallback]
+        if any(
+            candidate is not None and not candidate.strip() for candidate in candidates
+        ):
+            raise ValueError("model strategy candidates must not be blank")
+        configured = [candidate for candidate in candidates if candidate is not None]
+        if len(configured) != len(set(configured)):
+            raise ValueError("model strategy candidates must be unique")
+        return self
 
 
 class ProfileSettings(ExtensibleSettings):
@@ -167,6 +215,8 @@ class APISettings(ExtensibleSettings):
 class LoggingSettings(ExtensibleSettings):
     level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     file: StrictStr = "./logs/harness.log"
+    max_bytes: StrictInt = Field(default=10_485_760, ge=1024, le=104_857_600)
+    backup_count: StrictInt = Field(default=3, ge=0, le=10)
 
 
 class TestingCoverageSettings(ExtensibleSettings):
@@ -239,8 +289,12 @@ class MCPServerSettings(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     enabled: StrictBool = True
+    transport: Literal["stdio", "streamable_http"] = "stdio"
     builtin: Literal["filesystem", "obsidian"] | None = None
     command: list[StrictStr] = Field(default_factory=list)
+    url: StrictStr | None = None
+    allowed_hosts: list[StrictStr] = Field(default_factory=list)
+    auth_secret: StrictStr | None = None
     allow_tools: list[StrictStr] = Field(default_factory=list)
     read_only: StrictBool = True
     allow_delete: StrictBool = False
@@ -249,16 +303,62 @@ class MCPServerSettings(BaseModel):
 
     @model_validator(mode="after")
     def valid_source(self):
-        if (self.builtin is None) == (not self.command):
-            raise ValueError("exactly one MCP server source is required")
+        if self.transport == "stdio":
+            if (self.builtin is None) == (not self.command):
+                raise ValueError("exactly one MCP server source is required")
+            if (
+                self.url is not None
+                or self.allowed_hosts
+                or self.auth_secret is not None
+            ):
+                raise ValueError("stdio MCP server cannot declare remote settings")
+        else:
+            if (
+                self.builtin is not None
+                or self.command
+                or self.url is None
+                or not self.allowed_hosts
+            ):
+                raise ValueError("remote MCP requires URL and host allowlist only")
+            parsed = urlsplit(self.url)
+            try:
+                port = parsed.port
+            except ValueError:
+                raise ValueError("remote MCP URL is invalid") from None
+            if (
+                parsed.scheme != "https"
+                or not parsed.hostname
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.query
+                or parsed.fragment
+                or (port is not None and not 1 <= port <= 65535)
+                or parsed.hostname.casefold()
+                not in {host.casefold() for host in self.allowed_hosts}
+                or len({host.casefold() for host in self.allowed_hosts})
+                != len(self.allowed_hosts)
+            ):
+                raise ValueError("remote MCP URL must be HTTPS and host-allowlisted")
+            if self.auth_secret is not None and not re.fullmatch(
+                r"[A-Z0-9_]{1,128}", self.auth_secret
+            ):
+                raise ValueError("remote MCP auth_secret must be a secret reference")
+            if self.allow_delete or not self.read_only:
+                raise ValueError("remote MCP tools cannot bypass approval policy")
         if self.builtin and self.allow_tools:
             raise ValueError("builtin MCP tools are fixed")
         if not self.builtin and not self.allow_tools:
             raise ValueError("external MCP server needs an explicit tool allowlist")
-        if self.builtin is None and not self.trusted_local:
+        if (
+            self.builtin is None
+            and self.transport == "stdio"
+            and not self.trusted_local
+        ):
             raise ValueError(
                 "external MCP server needs explicit trusted_local acknowledgement"
             )
+        if self.transport == "streamable_http" and self.trusted_local:
+            raise ValueError("remote MCP server cannot use trusted_local")
         if self.builtin and self.trusted_local:
             raise ValueError("builtin MCP server must not use trusted_local")
         if self.read_only and self.allow_delete:
@@ -296,3 +396,10 @@ class HarnessConfig(ExtensibleSettings):
     testing: TestingSettings = Field(default_factory=TestingSettings)
     tools: ToolsSettings = Field(default_factory=ToolsSettings)
     secrets: dict[StrictStr, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def valid_profile_routing(self):
+        unknown = set(self.models.routing.profile_tier_preferences) - set(self.profiles)
+        if unknown:
+            raise ValueError("routing policy references an unknown profile")
+        return self

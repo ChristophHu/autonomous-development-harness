@@ -69,6 +69,42 @@ class TaskService:
     def list(self, status=None):
         return [self.get(row["id"]) for row in self.store.tasks.list(status)]
 
+    def status_counts(self):
+        return {
+            status.value: len(self.store.tasks.list(status.value)) for status in Status
+        }
+
+    def events(self, task_id, *filters):
+        self.get(task_id)
+        return self.store.list_events(task_id, *filters)
+
+    def event_feed(self, *filters):
+        return self.store.list_events(*filters)
+
+    def events_after(self, cursor, task_id=None):
+        if task_id is not None:
+            self.get(task_id)
+        return self.store.events.after(cursor, task_id)
+
+    def questions(self, task_id):
+        self.get(task_id)
+        return self.store.list_questions(task_id)
+
+    def plan(self, task_id):
+        self.get(task_id)
+        return self.store.latest_plan(task_id)
+
+    def validation(self, task_id):
+        self.get(task_id)
+        return self.store.latest_validation(task_id)
+
+    def ask_question(self, task_id, question, reason, options=None, required=True):
+        self.get(task_id)
+        return self.store.ask(task_id, question, reason, options, required)
+
+    def model_usage(self, **filters):
+        return self.store.model_usage.report(**filters)
+
     def abort(self, task_id):
         self.get(task_id)
         self.store.tasks.transition(task_id, Status.CANCELLED)

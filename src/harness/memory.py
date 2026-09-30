@@ -35,7 +35,6 @@ def validate_vector(vector, dimension=None):
 class ObsidianMemory:
     def __init__(self, vault: Path):
         self.vault = vault.resolve()
-        vault.mkdir(parents=True, exist_ok=True)
 
     def write(self, name: str, content: str):
         p = self.path(name)
@@ -129,6 +128,7 @@ class QdrantMemory:
         embedder=None,
         client=None,
         timeout=5,
+        api_key=None,
     ):
         if not re.fullmatch(r"[A-Za-z0-9_-]+", collection) or dimension < 1:
             raise ValueError("invalid collection or embedding dimension")
@@ -138,6 +138,20 @@ class QdrantMemory:
         self.embedder = embedder
         self.client = client or httpx
         self.timeout = timeout
+        self.api_key = api_key
+
+    def _request(self, method, url, **kwargs):
+        headers = dict(kwargs.pop("headers", {}) or {})
+        if self.api_key:
+            headers["api-key"] = self.api_key
+        return request(
+            method,
+            url,
+            client=self.client,
+            timeout=self.timeout,
+            headers=headers,
+            **kwargs,
+        )
 
     def _vector(self, text):
         if self.embedder is None:
@@ -147,30 +161,72 @@ class QdrantMemory:
 
     def health(self):
         try:
-            return request(
-                "GET", f"{self.url}/healthz", client=self.client, timeout=self.timeout
-            ).is_success
+            return self._request("GET", f"{self.url}/healthz").is_success
         except httpx.HTTPError:
             return False
 
+    def health_report(self):
+        """Return a bounded, secret-free view of service and collection health."""
+        report = {
+            "healthy": False,
+            "service": "unavailable",
+            "collection": self.collection,
+            "collection_exists": False,
+            "collection_status": None,
+            "points_count": None,
+            "indexed_vectors_count": None,
+            "dimension": self.dimension,
+            "distance": None,
+            "errors": [],
+        }
+        try:
+            health_response = self._request("GET", f"{self.url}/healthz")
+            health_response.raise_for_status()
+            report["service"] = "available"
+            collection_response = self._request(
+                "GET", f"{self.url}/collections/{self.collection}"
+            )
+            if collection_response.status_code == 404:
+                report["errors"].append("collection_missing")
+                return report
+            collection_response.raise_for_status()
+            body = collection_response.json()
+            result = body.get("result") if isinstance(body, dict) else None
+            config = result.get("config") if isinstance(result, dict) else None
+            params = config.get("params") if isinstance(config, dict) else None
+            vectors = params.get("vectors") if isinstance(params, dict) else None
+            if not isinstance(vectors, dict):
+                report["errors"].append("collection_contract_invalid")
+                return report
+            report.update(
+                collection_exists=True,
+                collection_status=result.get("status"),
+                points_count=result.get("points_count"),
+                indexed_vectors_count=result.get("indexed_vectors_count"),
+                distance=vectors.get("distance"),
+            )
+            if (
+                vectors.get("size") != self.dimension
+                or vectors.get("distance") != "Cosine"
+            ):
+                report["errors"].append("collection_contract_mismatch")
+            if result.get("status") not in {"green", "yellow"}:
+                report["errors"].append("collection_not_ready")
+            report["healthy"] = not report["errors"]
+        except (httpx.HTTPError, KeyError, TypeError, ValueError):
+            report["errors"].append("qdrant_probe_failed")
+        return report
+
     def collection_exists(self):
         try:
-            return request(
-                "GET",
-                f"{self.url}/collections/{self.collection}",
-                client=self.client,
-                timeout=self.timeout,
+            return self._request(
+                "GET", f"{self.url}/collections/{self.collection}"
             ).is_success
         except httpx.HTTPError:
             return False
 
     def ensure_collection(self):
-        response = request(
-            "GET",
-            f"{self.url}/collections/{self.collection}",
-            client=self.client,
-            timeout=self.timeout,
-        )
+        response = self._request("GET", f"{self.url}/collections/{self.collection}")
         if response.is_success:
             vectors = response.json()["result"]["config"]["params"]["vectors"]
             if (
@@ -181,12 +237,10 @@ class QdrantMemory:
             return True
         if response.status_code != 404:
             response.raise_for_status()
-        response = request(
+        response = self._request(
             "PUT",
             f"{self.url}/collections/{self.collection}",
-            client=self.client,
             json={"vectors": {"size": self.dimension, "distance": "Cosine"}},
-            timeout=self.timeout,
         )
         response.raise_for_status()
         return True
@@ -238,35 +292,29 @@ class QdrantMemory:
             )
         ]
         body = {"points": body_points}
-        response = request(
+        response = self._request(
             "PUT",
             f"{self.url}/collections/{self.collection}/points",
-            client=self.client,
             json=body,
-            timeout=self.timeout,
         )
         response.raise_for_status()
         return True
 
     def search(self, query: str, limit: int = 5):
         body = {"vector": self._vector(query), "limit": limit, "with_payload": True}
-        response = request(
+        response = self._request(
             "POST",
             f"{self.url}/collections/{self.collection}/points/search",
-            client=self.client,
             json=body,
-            timeout=self.timeout,
         )
         response.raise_for_status()
         return response.json()["result"]
 
     def delete(self, point_ids):
-        response = request(
+        response = self._request(
             "POST",
             f"{self.url}/collections/{self.collection}/points/delete",
-            client=self.client,
             json={"points": point_ids},
-            timeout=self.timeout,
         )
         response.raise_for_status()
         return True
@@ -285,12 +333,10 @@ class QdrantMemory:
             body["filter"] = {"must": [{"key": "source", "match": {"value": source}}]}
         if offset is not None:
             body["offset"] = offset
-        response = request(
+        response = self._request(
             "POST",
             f"{self.url}/collections/{self.collection}/points/scroll",
-            client=self.client,
             json=body,
-            timeout=self.timeout,
         )
         response.raise_for_status()
         try:

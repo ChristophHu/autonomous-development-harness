@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 
 import httpx
 
 from .http_control import request
 from .process_control import current_run_control
+from .retry_budget import current_retry_budget
 
 
 @dataclass
@@ -31,7 +35,32 @@ class ToolCall:
 
 
 class ProviderError(RuntimeError):
-    pass
+    def __init__(
+        self, message, *, category="provider_permanent", fallback_allowed=False
+    ):
+        super().__init__(message)
+        self.category = category
+        self.fallback_allowed = fallback_allowed
+
+
+def parse_retry_after(value, *, now=None):
+    """Parse RFC delta-seconds or HTTP-date; invalid/negative values are ignored."""
+    if value is None:
+        return None
+    try:
+        seconds = float(value)
+        return seconds if math.isfinite(seconds) and seconds >= 0 else None
+    except (TypeError, ValueError):
+        try:
+            retry_at = parsedate_to_datetime(value)
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=UTC)
+            current = now or datetime.now(UTC)
+            if current.tzinfo is None:
+                current = current.replace(tzinfo=UTC)
+            return max(0.0, (retry_at - current).total_seconds())
+        except (TypeError, ValueError, OverflowError):
+            return None
 
 
 @dataclass(frozen=True)
@@ -98,6 +127,22 @@ class OpenAICompatibleProvider:
 
     def headers(self):
         return {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+
+    def _wait_retry(self, attempt, retry_after=None):
+        budget = current_retry_budget()
+        if budget is not None and not budget.claim():
+            return False
+        delay = min(self.retry["base_delay"] * (2**attempt), self.retry["max_delay"])
+        if retry_after is not None:
+            delay = min(max(delay, retry_after), self.retry["max_delay"])
+        control = current_run_control()
+        if budget is not None:
+            budget.wait(delay)
+        elif control is None:
+            time.sleep(delay)
+        elif control.stop_event.wait(delay):
+            control.check()
+        return True
 
     def health(self):
         return self.health_report().status == "available"
@@ -235,25 +280,20 @@ class OpenAICompatibleProvider:
             if r.is_success:
                 break
             if r.status_code not in retryable_statuses:
-                raise ProviderError(f"{self.name}: HTTP {r.status_code}")
-            if attempt + 1 < self.retry["max_attempts"]:
-                delay = min(
-                    self.retry["base_delay"] * (2**attempt), self.retry["max_delay"]
+                raise ProviderError(
+                    f"{self.name}: HTTP {r.status_code}",
+                    category="provider_permanent",
                 )
-                retry_after = r.headers.get("Retry-After")
-                if retry_after is not None:
-                    try:
-                        delay = min(
-                            max(delay, float(retry_after)), self.retry["max_delay"]
-                        )
-                    except ValueError:
-                        pass
-                if control is None:
-                    time.sleep(delay)
-                elif control.stop_event.wait(delay):
-                    control.check()
+            if attempt + 1 < self.retry["max_attempts"]:
+                retry_after = parse_retry_after(r.headers.get("Retry-After"))
+                if not self._wait_retry(attempt, retry_after):
+                    break
         if not r.is_success:
-            raise ProviderError(f"{self.name}: HTTP {r.status_code}")
+            raise ProviderError(
+                f"{self.name}: HTTP {r.status_code}",
+                category="transient_http",
+                fallback_allowed=True,
+            )
         try:
             data = r.json()
             message = data["choices"][0]["message"]
@@ -300,7 +340,9 @@ class UsageTracker:
         self.runs.append(usage)
 
     def total(self):
-        return sum(u.cost or 0 for u in self.runs)
+        if not self.runs or any(usage.cost is None for usage in self.runs):
+            return None
+        return sum(usage.cost for usage in self.runs)
 
 
 class CostCalculator:

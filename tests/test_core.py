@@ -205,7 +205,9 @@ def test_question_repository(tmp_path):
 def test_completed_task_cannot_be_restarted(tmp_path):
     store, orchestrator, task = ready_runtime(tmp_path)
     created = store.create(task)
-    assert asyncio.run(orchestrator.run(created.id)).status == "completed"
+    completed = asyncio.run(orchestrator.run(created.id))
+    assert completed.status == "completed"
+    assert completed.complexity == "LOW"
     with pytest.raises(ValueError, match="terminal"):
         asyncio.run(orchestrator.run(created.id))
 
@@ -460,6 +462,7 @@ def test_orchestrator_audits_tool_events(tmp_path):
         "workspace": str(tmp_path / "workspace"),
         "obsidian_vault": str(tmp_path / "vault"),
     }
+    config.data["tools"]["mcp"]["servers"]["vault"]["enabled"] = False
     store = Store(config)
     orchestrator = Orchestrator(store, config)
     orchestrator.tools.execute(
@@ -638,6 +641,7 @@ def test_configuration_service_maps_documented_dotenv_names(tmp_path, monkeypatc
     (tmp_path / ".env").write_text(
         "HARNESS_WORKSPACE=./work\nOBSIDIAN_VAULT_PATH=./notes\n"
         "QDRANT_URL=http://qdrant.test:6333\nQDRANT_COLLECTION=dev-memory\n"
+        "QDRANT__SERVICE__API_KEY=qdrant-fixture-secret\n"
         "LLM_PROVIDER=openai\nLLM_MODEL=fixture-v1\n"
         "LLM_API_URL=https://api.example.test/v1\nGIT_REMOTE_URL=https://git.test/repo\n"
         "API_HOST=localhost\nAPI_PORT=8090\nOPENAI_MODEL=another-model\n"
@@ -655,6 +659,13 @@ def test_configuration_service_maps_documented_dotenv_names(tmp_path, monkeypatc
         "url": "http://qdrant.test:6333",
         "collection": "dev-memory",
     }
+    assert resolved["secrets"]["QDRANT__SERVICE__API_KEY"] == ("qdrant-fixture-secret")
+    assert (
+        ConfigurationService(tmp_path / "missing.yaml").redacted(resolved=True)[
+            "secrets"
+        ]["QDRANT__SERVICE__API_KEY"]
+        == "********"
+    )
     assert resolved["models"]["defaults"] == {
         "provider": "openai",
         "model": "fixture-v1",
@@ -882,6 +893,7 @@ def test_core_missing_config_branches_and_agent_usage(tmp_path):
 
     c = Config()
     c.data["paths"]["database"] = str(tmp_path / "branches.db")
+    c.data["tools"]["mcp"]["servers"]["vault"]["enabled"] = False
     store = Store(c)
     item = store.create(Task(title="optional question"))
     assert store.get(999) is None and store.ask(

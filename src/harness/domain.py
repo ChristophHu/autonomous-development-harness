@@ -23,6 +23,26 @@ class Status(StrEnum):
     CANCELLED = "cancelled"
 
 
+class TaskComplexity(StrEnum):
+    LOW = "LOW"
+    MEDIUM = "MEDIUM"
+    HIGH = "HIGH"
+    CRITICAL = "CRITICAL"
+
+    SIMPLE = LOW
+    MODERATE = MEDIUM
+    COMPLEX = HIGH
+
+    @classmethod
+    def _missing_(cls, value):
+        if isinstance(value, str):
+            normalized = value.strip().upper()
+            legacy = {"SIMPLE": "LOW", "MODERATE": "MEDIUM", "COMPLEX": "HIGH"}
+            normalized = legacy.get(normalized, normalized)
+            return next((item for item in cls if item.value == normalized), None)
+        return None
+
+
 class EventKind(StrEnum):
     """Supported event names for new writes; historic database values stay readable."""
 
@@ -41,6 +61,7 @@ class EventKind(StrEnum):
     RECOVERY_INSPECTED = "recovery.inspected"
     RECOVERY_SCOPE = "recovery.scope"
     MEMORY_INDEX_FAILED = "memory.index_failed"
+    MEMORY_PROJECTION_FAILED = "memory.projection_failed"
     TESTS_COMPLETED = "tests.completed"
     CORRECTION_STARTED = "correction.started"
     CORRECTION_ITEM_RECORDED = "correction.item_recorded"
@@ -139,7 +160,11 @@ class Task(BaseModel):
     dependencies: list[int] = Field(default_factory=list)
     assigned_agent: str | None = None
     assigned_profile: str | None = None
-    complexity: str | None = None
+    complexity: TaskComplexity | None = None
+    model_cost_budget: float | None = Field(
+        default=None, ge=0, allow_inf_nan=False, strict=True
+    )
+    model_token_budget: int | None = Field(default=None, ge=0, strict=True)
     context: dict[str, Any] = Field(default_factory=dict)
     decisions: list[dict[str, Any]] = Field(default_factory=list)
     plan: dict[str, Any] | None = None
