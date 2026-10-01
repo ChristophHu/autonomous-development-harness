@@ -4,8 +4,151 @@ import asyncio
 import threading
 import uuid
 
+import httpx
+
 from .domain import EventKind, Status, Task
 from .process_control import RunControl, TaskCancelled, use_run_control
+from .providers import ProviderHealth
+
+
+class ConfigurationApplicationService:
+    """Safe configuration operations shared by the CLI and HTTP API."""
+
+    def __init__(self, configuration):
+        self.configuration = configuration
+
+    def view(self, *, resolved=False):
+        return self.configuration.redacted(resolved=resolved)
+
+    def validate(self):
+        self.configuration.validate()
+        settings = self.configuration.settings
+        return {
+            "valid": True,
+            "environment": settings.harness.environment,
+            "max_parallel_steps": settings.harness.max_parallel_steps,
+        }
+
+
+class ModelOperationsService:
+    """Shared provider-health and model-inventory application operations."""
+
+    def __init__(self, registry, snapshots=None):
+        self.registry = registry
+        self.snapshots = snapshots
+
+    @staticmethod
+    def probe_provider(provider):
+        if hasattr(provider, "health_report"):
+            try:
+                return provider.health_report()
+            except (OSError, RuntimeError, ValueError, TypeError, httpx.HTTPError):
+                return "unavailable"
+        try:
+            health = getattr(provider, "health", None)
+            return (
+                "available" if health is not None and bool(health()) else "unavailable"
+            )
+        except (OSError, RuntimeError, ValueError, TypeError, httpx.HTTPError):
+            return "unavailable"
+
+    @staticmethod
+    def provider_status(report):
+        return report.status if isinstance(report, ProviderHealth) else report
+
+    @staticmethod
+    def model_available(report, model_id, discovered):
+        if isinstance(report, ProviderHealth):
+            return report.model_available(model_id)
+        return report == "available" and model_id in discovered
+
+    def provider_health(self):
+        return self.providers_health(self.registry.providers)
+
+    @classmethod
+    def providers_health(cls, providers):
+        return {
+            name: cls.provider_status(cls.probe_provider(provider))
+            for name, provider in sorted(providers.items())
+        }
+
+    def model_inventory(self):
+        definitions = self.registry.models
+        names = set(self.registry.providers) | {
+            item.get("provider") for item in definitions.values()
+        }
+        inventory = []
+        for name in sorted(item for item in names if isinstance(item, str)):
+            provider = self.registry.providers.get(name)
+            report = (
+                self.probe_provider(provider) if provider is not None else "unavailable"
+            )
+            discovered = []
+            discovery_failed = False
+            if isinstance(report, ProviderHealth):
+                discovered = list(report.models)
+                self.registry.discovered[name] = tuple(sorted(set(discovered)))
+                discovery_failed = not report.api_available
+            elif provider is not None:
+                try:
+                    discovered = list(self.registry.discover(name))
+                except (OSError, RuntimeError, ValueError, httpx.HTTPError):
+                    discovery_failed = True
+            if self.snapshots is not None:
+                if discovery_failed:
+                    previous = self.snapshots.latest_model_discovery(name)
+                    if previous is not None:
+                        discovered = previous["models"]
+                self.snapshots.record_model_discovery(
+                    name, self.provider_status(report), discovery_failed, discovered
+                )
+            configured = {
+                alias: definition
+                for alias, definition in definitions.items()
+                if definition.get("provider") == name
+            }
+            models = []
+            for alias, definition in sorted(configured.items()):
+                model_id = definition.get("model") or "-"
+                models.append(
+                    {
+                        "id": model_id,
+                        "alias": alias,
+                        "tier": definition.get("tier") or "unknown",
+                        "status": (
+                            "stale"
+                            if discovery_failed and model_id in discovered
+                            else "available"
+                            if self.model_available(report, model_id, discovered)
+                            else "unavailable"
+                        ),
+                    }
+                )
+            configured_ids = {item.get("model") for item in configured.values()}
+            for model_id in sorted(set(discovered) - configured_ids):
+                models.append(
+                    {
+                        "id": model_id,
+                        "alias": "-",
+                        "tier": "unknown",
+                        "status": (
+                            "stale"
+                            if discovery_failed
+                            else "available"
+                            if self.model_available(report, model_id, discovered)
+                            else "unavailable"
+                        ),
+                    }
+                )
+            inventory.append(
+                {
+                    "provider": name,
+                    "status": self.provider_status(report),
+                    "discovery_failed": discovery_failed,
+                    "models": models,
+                }
+            )
+        return inventory
 
 
 class TaskService:
@@ -97,6 +240,33 @@ class TaskService:
     def validation(self, task_id):
         self.get(task_id)
         return self.store.latest_validation(task_id)
+
+    def save_artifact(self, task_id, key, content, expected_version=None):
+        self.get(task_id)
+        return self.store.save_artifact(task_id, key, content, expected_version)
+
+    def artifacts(self, task_id):
+        self.get(task_id)
+        return self.store.artifacts_for_task(task_id)
+
+    def artifact(self, task_id, key):
+        self.get(task_id)
+        return self.store.artifact(task_id, key)
+
+    def artifact_history(self, task_id, key):
+        self.get(task_id)
+        return self.store.artifact_history(task_id, key)
+
+    def corrections(self, task_id, status=None):
+        self.get(task_id)
+        return self.store.corrections.list_for_task(task_id, status)
+
+    def update_correction(self, task_id, item_id, status):
+        self.get(task_id)
+        item = self.store.corrections.get(item_id)
+        if item is None or item["task_id"] != task_id:
+            raise ValueError("correction not found")
+        return self.store.corrections.set_status(item_id, status)
 
     def ask_question(self, task_id, question, reason, options=None, required=True):
         self.get(task_id)

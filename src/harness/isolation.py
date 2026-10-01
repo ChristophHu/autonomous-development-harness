@@ -11,6 +11,15 @@ import sys
 from pathlib import Path
 
 
+def _stat_if_present(path):
+    try:
+        return path.stat()
+    except FileNotFoundError:
+        # SQLite journals and other transient workspace files may disappear
+        # between rglob/is_file and stat while independent tasks run in parallel.
+        return None
+
+
 def git_metadata(root):
     """Include linked worktrees, symlinks, nested and bare repositories."""
     root = Path(root).resolve()
@@ -38,12 +47,16 @@ def git_metadata(root):
         files = metadata.rglob("*") if metadata.is_dir() else (metadata,)
         for file in files:
             if file.is_file():
-                info = file.stat()
+                info = _stat_if_present(file)
+                if info is None:
+                    continue
                 if info.st_nlink > 1:
                     shared.add((info.st_dev, info.st_ino))
     for file in root.rglob("*"):
         if file.is_file():
-            info = file.stat()
+            info = _stat_if_present(file)
+            if info is None:
+                continue
             if (info.st_dev, info.st_ino) in shared:
                 protected.add(file.resolve())
     return protected

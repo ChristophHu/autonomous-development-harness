@@ -72,6 +72,17 @@ class ObsidianMemory:
         documents = []
         for path in self.vault.rglob("*.md"):
             relative = path.relative_to(self.vault)
+            if any(
+                part.startswith(".") or part == "_harness" for part in relative.parts
+            ):
+                continue
+            if (
+                len(relative.parts) == 3
+                and relative.parts[0] == "tasks"
+                and relative.parts[1].isdecimal()
+                and relative.name == "plan.md"
+            ):
+                continue
             current = self.vault
             unsafe = False
             for part in relative.parts:

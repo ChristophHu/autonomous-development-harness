@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+from jsonschema import ValidationError
 from test_evidence_workflow import ready_runtime, runtime, specification
 
 from harness.agents import (
@@ -552,6 +553,72 @@ def test_validator_failure_gates_and_executable_criteria(tmp_path):
     assert validator.run_tests(task)["coverage"] is None
 
 
+def test_tester_profile_contract_rejects_invalid_test_input_and_output(tmp_path):
+    from harness.agents import AgentProfile
+
+    _store, orchestrator = runtime(tmp_path)
+    validator = orchestrator.validator
+    validator.tester_profile = AgentProfile(
+        name="test-engineer",
+        instructions="test",
+        model="fixture",
+        input_schema={"type": "object", "required": ["trusted_test_context"]},
+        output_schema={
+            "type": "object",
+            "required": ["commands", "coverage"],
+            "properties": {"commands": {"type": "array", "minItems": 1}},
+        },
+    )
+    task = specification()
+    task.test_commands = []
+    task.lint_commands = []
+    task.coverage_command = []
+    with pytest.raises(ValidationError):
+        validator.run_tests(task)
+
+    validator.tester_profile.input_schema = None
+    with pytest.raises(ValidationError):
+        validator.run_tests(task)
+
+
+def test_validator_profile_contract_rejects_incomplete_runtime_payload(tmp_path):
+    from harness.agents import AgentProfile
+
+    _store, orchestrator = runtime(tmp_path)
+    validator = orchestrator.validator
+    validator.validator_profile = AgentProfile(
+        name="validator",
+        instructions="validate",
+        model="fixture",
+        input_schema={"type": "object", "required": ["trusted_observation"]},
+    )
+    with pytest.raises(ValidationError):
+        validator.validate(specification(), [], {"commands": [], "coverage": None})
+
+    validator.validator_profile.input_schema = None
+    validator.validator_profile.output_schema = {
+        "type": "object",
+        "required": ["valid"],
+        "properties": {"valid": {"const": True}},
+    }
+    task = specification()
+    task.requirements = []
+    task.acceptance_criteria = []
+    task.test_commands = []
+    task.coverage_command = []
+    validator.router.complete = lambda *_args, **_kwargs: json.dumps(
+        {
+            "requirements": {},
+            "criteria": {},
+            "evidence": "reviewed",
+            "requirement_evidence": {},
+            "criterion_evidence": {},
+        }
+    )
+    with pytest.raises(ValidationError):
+        validator.validate(task, [], {"commands": [], "coverage": None})
+
+
 def test_executor_observation_and_failure_paths(tmp_path):
     from harness.agents import ModelResponse
 
@@ -642,7 +709,12 @@ def test_remaining_validator_paths(tmp_path):
         ]
     }
     task.acceptance_criteria = [
-        AcceptanceCriterion(id="sum", description="independent review")
+        AcceptanceCriterion(
+            id="sum",
+            description="independent review",
+            kind="command",
+            command=["/usr/bin/true"],
+        )
     ]
     report = {
         "commands": [],
@@ -668,6 +740,31 @@ def test_remaining_validator_paths(tmp_path):
         workspace_before=snapshot,
         workspace_after=snapshot,
     ).valid
+
+
+def test_manual_acceptance_criterion_has_no_automatic_observation(tmp_path):
+    _, orchestrator = runtime(tmp_path)
+    task = specification()
+    task.acceptance_criteria = [
+        AcceptanceCriterion(id="manual", description="requires human judgment")
+    ]
+    report = {
+        "commands": [],
+        "coverage": {
+            "totals": {
+                "percent_covered": 100,
+                "missing_lines": 0,
+                "missing_branches": 0,
+            }
+        },
+    }
+
+    result = orchestrator.validator.validate(
+        task, [], report, verify_workspace_changes=False
+    )
+
+    assert not result.valid
+    assert any("independent review" in error for error in result.errors)
 
 
 def test_validator_fails_closed_on_malformed_coverage_and_review(tmp_path):
@@ -733,7 +830,11 @@ def test_validator_coverage_threshold_and_branch_gate(
 
     outputs = [ExecutorOutput(subtask_id="planned", success=True, output="done")]
     task.test_commands = [["true"]]
-    task.acceptance_criteria = [AcceptanceCriterion(id="sum", description="review")]
+    task.acceptance_criteria = [
+        AcceptanceCriterion(
+            id="sum", description="review", kind="command", command=["/usr/bin/true"]
+        )
+    ]
     task.coverage_threshold = threshold
     report = {
         "commands": [],

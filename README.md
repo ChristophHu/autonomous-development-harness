@@ -2,6 +2,20 @@
 
 Lokales, macOS-orientiertes Harness für zustandsbehaftete Entwicklungsaufgaben.
 
+## Unterstützte Laufzeit
+
+Die Zielplattform ist macOS auf Apple Silicon (`arm64`) mit Python 3.11 oder
+neuer. Das Harness nutzt POSIX-Prozesse und
+macOS-Keychain; isolierte Prozess- und Gitfunktionen setzen die native
+macOS-Kernelisolation (`sandbox-exec`) voraus und scheitern geschlossen, wenn
+sie nicht verfügbar ist. `harness doctor` meldet Plattform, Architektur und
+Python-Laufzeit separat. Andere macOS-Versionen, Intel-Macs und Linux/Windows
+sind nicht als vollständig unterstützte Laufzeit zugesichert.
+
+GitHub-Actions führt die Vollverifikation zusätzlich auf einem macOS-14-ARM64-
+Runner mit Python 3.11 (Mindestversion) und 3.14 aus. Die lokale Umgebung bleibt
+für provider-/dienstabhängige Abnahmen maßgeblich.
+
 ## Schnellstart
 
 ```zsh
@@ -26,6 +40,10 @@ curl -N http://127.0.0.1:8080/events/stream
 Konfiguration wird mit der Priorität Defaults < `config.yaml` < `.env` < Environment < macOS Keychain aufgelöst. `config show` zeigt gesetzte Werte, `config resolved` zusätzlich wirksame Defaults; sensible Werte werden in beiden Ausgaben maskiert. `harness config validate` prüft Schema und lokale Betriebsgrenzen. Niemals Secrets in `config.yaml` eintragen.
 
 `config.example.yaml` zeigt die vollständige editierbare Struktur mit fünf Modelltiers, sieben Rollenprofilen, Git-Workflows, Memory/Qdrant, Docker, API, Tests und Toolrechten. Die `<EXACT-...>`-Modell-IDs müssen durch tatsächlich verfügbare IDs ersetzt werden; API-Keys gehören in die Keychain oder als Entwicklungs-Fallback in `.env`. Dynamische Modellrates und Git-HTTPS-/SSH-Credentials werden typisiert und bei `config validate` geprüft. Das aktive `config.yaml` bleibt unabhängig davon sicher local-first.
+
+Das Completion-Gate kann externe Evidence optional erzwingen: `verification.required_evidence` akzeptiert `ci`, `provider`, `qdrant`, `embedding` und `http_tls`; `verification.max_age_hours` legt das Frischefenster fest. Standardmäßig ist die Liste leer und das bisherige Gate bleibt unverändert. Verpflichtende Evidence muss explizit in SQLite importiert sein, erfolgreich sein und zum aktuellen Quellhash passen. Modellinventar-Refreshes werden bei CLI/API-Abfrage in SQLite protokolliert; nach einem Fehler bleibt das letzte bekannte Modellinventar als `stale` sichtbar. `harness memory qdrant-status` führt eine explizite Probe aus und speichert nur einen redigierten Snapshot für JSON-/Prometheus-Metriken; es gibt weder Polling noch Änderungen am Qdrant-Container.
+
+`agents.contract_mode` steuert Profilverträge: `required` leitet für alle eingebauten Rollen Input-/Output-Schemas aus den Harness-Datentypen ab; benutzerdefinierte Rollen benötigen eigene Schemas. Ein Profil kann nur mit `contract_mode: legacy` ausdrücklich ausgenommen werden. Provider erlauben optional die sicheren Metadatenheader `HTTP-Referer` und `X-Title`; Authentifizierungs-, Cookie- und sonstige Header können damit nicht überschrieben werden. `harness memory audit` prüft neben Taxonomie und Reviewdatum auch pro kuratierter Notiz deklarierte relative Quellpfade und deren SHA-256; Traversal, Symlinks, fehlende oder geänderte Dateien werden read-only gemeldet.
 
 Secrets lassen sich mit `harness secrets set NAME`, `list`, `exists NAME` und `delete NAME` verwalten. `set` fragt den Wert verdeckt samt Bestätigung ab. Namen müssen dem Format `[A-Z0-9_]{1,128}` entsprechen. `list` zeigt ausschließlich gültige Account-Namen des Harness-Keychain-Dienstes; `exists` prüft den Keychain- oder Prozessumgebungswert, ohne den Wert auszugeben. Setzen und Löschen betreffen nur den Harness-Dienst in der macOS-Keychain. Secretwerte werden weder gelistet noch in Fehlerausgaben wiederholt.
 
@@ -53,11 +71,17 @@ Ein Task mit lediglich einem Titel wird zur Anforderungsklärung pausiert. Für 
 
 `harness tasks create "Titel" "Beschreibung"` bleibt für einfache Aufgaben verfügbar. Für vollständige strukturierte Aufgaben akzeptiert `harness tasks create --file task.yaml` alternativ eine YAML- oder JSON-Datei mit Taskfeldern wie `title`, `goal`, `requirements` und `acceptance_criteria`. Lifecycle-, ID- und Ergebnisfelder dürfen darin nicht vorgegeben werden; die Datei ist auf 1 MB begrenzt. `harness tasks watch <id>` verfolgt die Taskereignisse über den lokalen SSE-Endpunkt, nimmt nach Verbindungsabbruch anhand der Event-ID wieder auf und endet bei abgeschlossenem, fehlgeschlagenem oder abgebrochenem Task. Dafür muss `harness start` laufen.
 
-Die Beispielkonfiguration erlaubt Dateiänderungen und Shellprozesse für das Codingprofil. H1c erzwingt auf macOS `sandbox-exec`: Shell-, Test-, Lint- und Dockerprozesse samt Nachkommen dürfen nur im CWD schreiben, keine Git-Metadaten verändern und keine Netzwerk-/Daemonverbindung öffnen. Kontrolliertes Git darf nur sein kanonisches Binary starten; Hooks und externe Filter-/Transporthelfer sind gesperrt. Es gibt keinen Fallback ohne Isolation. Leserechte für lokale Laufzeitbibliotheken bleiben breit; dies ist keine vollständige Geheimnis-/Lesepfadisolation. Destruktive Dateilöschung bleibt deaktiviert. Live-Provider und Qdrant sind nicht live abgenommen.
+Plan-Schritte mit explizit deklarierten, voneinander unabhängigen `write_paths` können gleichzeitig laufen. `harness.max_parallel_steps` begrenzt die Parallelität (Standard 4, zulässig 1–32). Überlappende, fehlende oder unklare Schreibpfade werden seriell ausgeführt. Schrittstatus und versioniertes Agent-Artefakt werden nach jedem Ergebnis gespeichert; Abhängigkeiten warten auf erfolgreiche Vorgänger.
+
+Agentprofile können optional JSON-Schema-Objekte `input_schema` und `output_schema` deklarieren. Der Planner prüft damit den Taskinput vor dem Aufruf und den strukturierten Planausgang nach dem Parsen; nicht gesetzte Verträge bleiben für Legacyprofile kompatibel. Alle Profile werden beim Laden auf gültige JSON-Schema-Definitionen geprüft.
+
+Die Beispielkonfiguration erlaubt Dateiänderungen und Shellprozesse für das Codingprofil. H1c erzwingt auf macOS `sandbox-exec`: Shell-, Test-, Lint- und Dockerprozesse samt Nachkommen dürfen nur im CWD schreiben, keine Git-Metadaten verändern und keine Netzwerk-/Daemonverbindung öffnen. Kontrolliertes Git darf nur sein kanonisches Binary starten; Hooks und externe Filter-/Transporthelfer sind gesperrt. Eingebaute MCP-Prozesse dürfen zusätzlich ihre Python-Basisinstallation lesen, wenn Python in einer extern gespeicherten Venv läuft. Es gibt keinen Fallback ohne Isolation. Leserechte für lokale Laufzeitbibliotheken bleiben breit; dies ist keine vollständige Geheimnis-/Lesepfadisolation. Destruktive Dateilöschung bleibt deaktiviert. Live-Provider und Qdrant sind nicht live abgenommen.
 
 Für Workspace-Recherchen stehen `search.files`, `search.text` und `search.symbols` mit Unterverzeichnis und Ergebnislimit bereit. Die Symbolsuche erkennt gängige Deklarationsschlüsselwörter in Python, JavaScript/TypeScript, Go, Rust und Java; sie ist kein vollständiger Compilerindex. Test- und Qualitätsaktionen heißen `test.run_tests`, `test.run_file`, `test.run_coverage`, `quality.lint`, `quality.format` und `quality.typecheck`. Sie erwarten explizite Argumentlisten; `test.run_file` hängt einen geprüften Workspace-Dateipfad an. Alle Prozessaktionen erfordern `shell: write` und laufen unter derselben Isolation wie `shell.execute`.
 
 ## Vault-Status und Abschlussaudit
+
+Der JSON-Bericht von `harness memory audit` enthält SHA-256-Fingerprints lesbarer kuratierter Notizen, jedoch keine Notizinhalte; der Audit bleibt read-only.
 
 `harness memory status` prüft den konfigurierten Obsidian-Pfad read-only und zeigt sichtbare Markdownnotizen, manifestverwaltete Harness-Entscheidungen, zusätzliche verschachtelte `.obsidian`-Wurzeln sowie den getrennten MCP-Status. `harness memory audit` kontrolliert Pflichtnotizen, lokale Wiki-Links und `last_reviewed`-Daten, ohne Vaultdateien zu verändern; versteckte Pfade, Symlinks, `_harness/`-Projektionen und historische `tasks/<id>/plan.md`-Snapshots werden ausgeschlossen. Ein fehlender Vault wird nicht angelegt. `harness memory sync` bleibt ein ausdrücklicher SQLite→Obsidian-Projektionslauf. Der eingebaute Obsidian-MCP ist in der aktiven `config.yaml` read-only aktiviert. `harness memory qdrant-status` zeigt Service-/Collection-Gesundheit, Vektordimension und gespeicherte Punktzahlen. `harness memory qdrant-init --confirm` legt die konfigurierte Collection nur nach ausdrücklicher Bestätigung an oder validiert deren Dimensions-/Distanzvertrag. `harness memory qdrant-search QUERY` sucht über den konfigurierten Embeddingprovider; `harness memory qdrant-reconcile --confirm` indexiert Vaultnotizen und entfernt nur verwaiste Harness-eigene Punkte. Eine optionale Qdrant-Authentifizierung wird aus `QDRANT__SERVICE__API_KEY` in `.env` geladen; der Wert wird redigiert und als `api-key`-Header gesendet. `harness qdrant-smoke --confirm` prüft einen isolierten Compose-Stack inklusive Neustartpersistenz und räumt ausschließlich diesen Stack wieder ab.
 
@@ -69,9 +93,18 @@ harness memory qdrant-init --confirm
 
 Ohne `--confirm` nimmt der Befehl keine Änderung vor. Eine bereits vorhandene Collection bleibt unverändert; Dimension und Distanz werden gegen die Harness-Konfiguration geprüft.
 
-`harness metrics` und `/api/metrics` liefern dauerhafte Task-, Eventkatalog- und Modellnutzungszähler aus SQLite. `/api/event-kinds` veröffentlicht den typisierten Eventkatalog.
+`harness metrics` und `/api/metrics` liefern dauerhafte Task-, Eventkatalog- und Modellnutzungszähler aus SQLite. `harness metrics --format prometheus` und `/api/metrics/prometheus` liefern denselben aggregierten Prometheus-Text ohne dynamische Datenbankwerte als Labels. `/api/event-kinds` veröffentlicht den typisierten Eventkatalog.
 
 `harness completion` auditiert fail-closed, ob die GAP-Matrix exakt alle Punkte 1–109 enthält, und listet erfüllte/teilweise/offene Punkte. Ein sauberer Audit bedeutet nur, dass die Matrix strukturell vollständig ist; er erklärt das Harness nicht automatisch für fertig.
+
+Externe Verifikationsbelege lassen sich als streng typisierte JSON-Datei mit `harness evidence import evidence.json` append-only in SQLite aufnehmen. `harness evidence list --kind ci` zeigt nur freigegebene Metadaten; `harness evidence audit --subject-sha256 <sha256>` markiert Belege bei abweichendem Quellhash, Fehlern oder Alter über sieben Tage als ungültig. Belege beeinflussen den Completion-Status nicht automatisch. Rohlogs, Geheimnisse und externe Schreibzugriffe sind nicht Teil dieses Imports.
+
+`harness decisions` listet Entscheidungen. Exakte Filter lassen sich kombinieren,
+zum Beispiel `harness decisions --task-id 42 --category architecture --tag storage`;
+`harness decisions --id 7` liest einen einzelnen Eintrag. Die REST-API bietet
+dieselben Filter über `GET /decisions` und eine Einzelabfrage über
+`GET /decisions/{id}`. Decisions bleiben append-only; Korrekturen werden als
+neue Entscheidungen erfasst statt historische Einträge zu überschreiben.
 
 ## MCP-Toolschicht
 
@@ -84,6 +117,8 @@ Lokale MCP-Server können unter `tools.mcp.servers` explizit konfiguriert werden
 Der mitgelieferte Filesystem-Server ist in `config.yaml` absichtlich deaktiviert. Für read-only Nutzung `tools.mcp.servers.files.enabled: true` setzen und dem gewünschten Profil passende Tools aus `mcp.files.read_file`, `mcp.files.list_directory`, `mcp.files.search`, `mcp.files.exists` und `mcp.files.glob` sowie `filesystem` als Permission geben. Schreibende Tools einschließlich `copy_file` benötigen `filesystem: write` und `read_only: false`; `delete_file` und `move_file` zusätzlich `filesystem.delete: write` und `allow_delete: true`. Der Server arbeitet mit relativem Workspacepfad, verweigert `.git`, absolute/aufsteigende Pfade und Symlinks und begrenzt Datei-/Nachrichtengrößen sowie Such-/Globtreffer. Copy erstellt nur ein noch nicht vorhandenes Ziel und belässt die Quelle. Er kann separat mit `harness-filesystem-mcp /absoluter/workspace/pfad --read-only` gestartet werden; `stdout` ist ausschließlich für MCP-Nachrichten reserviert.
 
 Der integrierte Obsidian-MCP ist in der aktiven `config.yaml` read-only aktiviert (im Beispielprofil standardmäßig deaktiviert); er verlangt einen existierenden `paths.obsidian_vault`, `obsidian: read` in den globalen und Profilrechten sowie Profilfreigaben für `mcp.vault.read_note`, `mcp.vault.list_notes` und `mcp.vault.search_notes`. Planner, Coding und Validator erhalten diese drei Lese-Tools. Der Server liefert ausschließlich sichtbare `.md`-Notizen aus dem Vault, überspringt versteckte Pfade und Symlinks und begrenzt Scans und Treffer. Schreiboperationen werden nicht angeboten. Separater Start: `harness-obsidian-mcp /absoluter/vault/pfad`. Externe Tools erfordern eine explizite `allow_tools`-Liste und `mcp.<server>: write` mit Profilfreigabe; sie werden konservativ als destruktiv eingestuft. Remote-HTTPS-Tools verwenden keine `trusted_local`-Ausnahme und benötigen für jede Hochrisikoaktion eine taskgebundene Approval.
+
+Agent-Profile können `capabilities` aus `plan`, `requirements`, `execute`, `test`, `review`, `recovery` und `architecture` deklarieren. Bekannte Rollen verlangen ihre jeweilige Capability; eine explizite, unvollständige Deklaration wird beim Dispatch abgewiesen. Für ältere Profile ohne Feld gelten eng begrenzte Kompatibilitätsdefaults; Werkzeug- und Permission-Allowlisten bleiben die tatsächlichen Laufzeitgrenzen.
 
 ## Verifikation und Umfang
 
@@ -109,8 +144,12 @@ HTTPS- und SSH-Push/Branchlöschung brauchen persistierte, zielgebundene Freigab
 
 `push -u`/`--set-upstream` ist für genau einen expliziten lokalen Quellbranch und ein konkretes Remote-Ziel freigegeben. Der Broker entfernt das Flag vor dem FD-/URL-Transport und schreibt den Upstream erst nach erfolgreichem Push und Trackingabgleich als `remote/branch`; Deletes, `HEAD` und mehrdeutige Quellen werden abgewiesen. Der Fetch-Broker unterstützt nun transportübergreifend mehrere explizite Branch-Refs, Tags und Prune nur im Remote-Tracking-Namespace; mehrere Push-Refs und weitere Git-Optionen bleiben offen. HTTPS unterstützt derzeit Basic-Auth über das Secret-Broker-Mapping, aber noch keine Token-Erneuerung oder andere Auth-Schemata. Bei Task-Abort oder Leaseverlust beendet RunControl taskeigene Prozessgruppen erst mit SIGTERM und eskaliert nötigenfalls zu SIGKILL. Taskeigene Provider-, Tool-HTTP-, Embedding- und Qdrant-Requests nutzen abbrechbare AsyncClient-I/O mit konfigurierbaren Gesamt-/Connect-/Read-Grenzen (`timeout: {total: 30, connect: 5, read: 30}` im jeweiligen Abschnitt). Eigene synchrone Client-Injektionen werden nur vor und nach dem Aufruf geprüft; serverseitig bereits angenommene Requests können dort weiterlaufen. Der SSH-Agent-/Host-Key-Vertrag und die lokale SSH-Server-/Agent-Clone-/Push-E2E bestehen nativ.
 
+Das HTTP-Tool löst den Host vor dem Request auf, verwirft leere Antworten und blockiert private/nichtglobale IPs standardmäßig. `tools.http.private_hosts` ist eine bewusste Host-Ausnahme. In beiden Fällen wird die tatsächlich verwendete TCP-Verbindung auf eine Adresse aus genau dieser DNS-Antwort gepinnt; HTTP-Host und TLS-SNI bleiben der URL-Hostname. Redirects werden nicht automatisch verfolgt, und Proxy-Umgebungsvariablen werden für gepinnte Toolrequests ignoriert.
+
 ## Begrenzter Docker-/Compose-Broker
 
-`docker.execute` akzeptiert nur `status`, `logs`, `start` und `stop` für den Harness-eigenen Qdrant-Dienst. Beliebige Docker-Argumente, Container-Exec, Build, Compose-Overrides, fremde Images, Bind-Mounts, TCP-Daemonendpunkte und `down`/Volume-Löschung sind nicht verfügbar. Der Broker validiert die Compose-Datei auf exakt das erlaubte Service-/Volume-/Portschema, schreibt für jeden Lauf einen unveränderlichen temporären Snapshot, nutzt einen lokalen Unix-Socket und begrenzte Prozesszeit/-ausgabe. Qdrant ist auf `v1.19.0` festgelegt, bindet HTTP nur an Loopback und verwendet ein persistentes Named Volume. Docker ist in der Beispielkonfiguration standardmäßig verweigert; erst `tools.permissions.docker: write` aktiviert auch Start/Stop. Die CLI-/Daemonintegration ist nicht live abgenommen; der Broker ist durch gemockte Prozessverträge getestet.
+`docker.execute` akzeptiert nur `status`, `logs`, `start` und `stop` für den Harness-eigenen Qdrant-Dienst. Beliebige Docker-Argumente, Container-Exec, Build, Compose-Overrides, fremde Images, Bind-Mounts, TCP-Daemonendpunkte und `down`/Volume-Löschung sind nicht verfügbar. Der Broker validiert die Compose-Datei auf exakt das erlaubte Service-/Volume-/Portschema, schreibt für jeden Lauf einen unveränderlichen temporären Snapshot, nutzt einen lokalen Unix-Socket und begrenzte Prozesszeit/-ausgabe. Qdrant ist auf `v1.19.0` festgelegt, bindet HTTP nur an Loopback und verwendet ein persistentes Named Volume. Docker ist in der Beispielkonfiguration standardmäßig verweigert; erst `tools.permissions.docker: write` aktiviert auch Start/Stop. Der isolierte Health-/Restart-/Persistenz-/Cleanup-Smoke wurde live bestätigt. Qdrant-VM-Backups und Wiederherstellung werden über Proxmox oder den VM-Provider verwaltet und sind kein Harness-Betriebspfad.
+
+Qdrant status and the explicit read-only embedding acceptance command are documented with the VM-provider backup boundary, upgrade, and operator-owned monitoring procedures in [docs/QDRANT_OPERATIONS.md](docs/QDRANT_OPERATIONS.md). The Harness does not perform or schedule Qdrant server backups.
 
 Gitfehler pausieren mit Pflichtfrage. Vor einem Task-Commit speichert der Harness dessen Parent-ID, erlaubte Dateipfade und erwartete Commitnachricht. Nach einem Prozessabbruch wird ein vorhandener Commit nur dann zugeordnet, wenn Parent, Nachricht und geänderte Pfade dazu passen. Nach jedem Merge laufen Tests und die unabhängige Validation erneut auf dem Zielbranch; Hotfix und Release prüfen zusätzlich den synchronisierten `dev`-Branch. Ein fehlgeschlagener Zielbranch bleibt wartend und wird nicht als abgeschlossen gemeldet. Bereits erfolgte Merges werden über Git-Abstammung erkannt, Release-Tags auf Zielcommit und annotierte Form geprüft. Kein automatischer Reset, Stash, Konfliktentscheid oder Tag-Overwrite. Veränderte Branches/Tags bleiben gesperrt. Autorisierte Repair-Operationen binden Task, Zielcommit und erlaubte Dateipfade; nach Reparatur erfolgen erneut Tests und unabhängige Abnahme.

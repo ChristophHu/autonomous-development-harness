@@ -1,12 +1,16 @@
 import json
+import multiprocessing
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
+from pathlib import Path
 
 import pytest
 
 from harness.database import (
     AgentRunRepository,
+    ArtifactRepository,
     CorrectionRepository,
     Database,
     DecisionRepository,
@@ -20,6 +24,64 @@ from harness.database import (
 )
 from harness.domain import EventKind
 from harness.providers import ModelUsage
+
+
+def _initialize_database_process(path, barrier, queue):
+    barrier.wait(timeout=10)
+    Database(Path(path), timeout=10)
+    queue.put("ok")
+
+
+def test_failed_artifact_migration_does_not_record_version(tmp_path):
+    path = tmp_path / "migration.sqlite"
+    Database(path)
+    with closing(sqlite3.connect(path)) as connection, connection:
+        connection.execute("DROP INDEX artifacts_task_key")
+        connection.execute("DROP TABLE artifacts")
+        connection.execute("DELETE FROM schema_versions WHERE version=7")
+        connection.execute(
+            "CREATE TABLE artifacts(id INTEGER PRIMARY KEY, task_id INTEGER)"
+        )
+
+    with pytest.raises(sqlite3.OperationalError):
+        Database(path)
+
+    with closing(sqlite3.connect(path)) as connection, connection:
+        assert (
+            connection.execute(
+                "SELECT 1 FROM schema_versions WHERE version=7"
+            ).fetchone()
+            is None
+        )
+        assert (
+            connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='index' AND name='artifacts_task_key'"
+            ).fetchone()
+            is None
+        )
+
+
+def test_simultaneous_process_database_initialization_is_serialized(tmp_path):
+    path = str(tmp_path / "multiprocess-init.sqlite")
+    context = multiprocessing.get_context("spawn")
+    barrier = context.Barrier(3)
+    queue = context.Queue()
+    processes = [
+        context.Process(
+            target=_initialize_database_process, args=(path, barrier, queue)
+        )
+        for _ in range(2)
+    ]
+    for process in processes:
+        process.start()
+    barrier.wait(timeout=10)
+    for process in processes:
+        process.join(timeout=20)
+    assert [process.exitcode for process in processes] == [0, 0]
+    assert sorted(queue.get(timeout=2) for _ in processes) == ["ok", "ok"]
+    with closing(sqlite3.connect(path)) as connection:
+        versions = connection.execute("SELECT version FROM schema_versions").fetchall()
+    assert [row[0] for row in versions] == list(range(1, 11))
 
 
 def test_legacy_migration(tmp_path):
@@ -51,11 +113,13 @@ def test_legacy_migration(tmp_path):
             for row in connection.execute(
                 "SELECT version FROM schema_versions ORDER BY version"
             )
-        ] == [1, 2, 3, 4, 5]
+        ] == list(range(1, 11))
     legacy_decision = DecisionRepository(db).get(3)
     assert legacy_decision["decision"] == "old decision"
     assert legacy_decision["category"] == legacy_decision["source"] == "legacy"
     assert legacy_decision["evidence"] == legacy_decision["field_names"] == []
+    assert legacy_decision["alternatives"] == legacy_decision["tags"] == []
+    assert legacy_decision["outcome"] is None
 
 
 def test_database_rollback_and_repository_lifecycle(tmp_path):
@@ -90,6 +154,72 @@ def test_database_rollback_and_repository_lifecycle(tmp_path):
     )
     usage = ModelUsage("local", "m", 2, 3, 0.1)
     assert ModelRunRepository(db).record(usage, run_id)
+
+
+def test_database_busy_timeout_serializes_concurrent_writers(tmp_path):
+    path = tmp_path / "busy.sqlite"
+    db = Database(path, timeout=1)
+    with db.connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        started = time.monotonic()
+
+        def contend():
+            with db.connect() as contender:
+                contender.execute("BEGIN IMMEDIATE")
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(contend)
+            time.sleep(0.05)
+            connection.commit()
+            future.result(timeout=2)
+        assert time.monotonic() - started >= 0.04
+
+
+def test_database_rejects_invalid_busy_timeout(tmp_path):
+    for timeout in (-1, True, "1"):
+        with pytest.raises(ValueError, match="non-negative number"):
+            Database(tmp_path / f"invalid-{timeout}.sqlite", timeout=timeout)
+
+
+def test_artifact_repository_versions_hashes_history_and_conflicts(tmp_path):
+    db = Database(tmp_path / "artifacts.sqlite")
+    task_id = TaskRepository(db).create("artifact")
+    artifacts = ArtifactRepository(db)
+    first = artifacts.save(task_id, "plan/step-1", "draft")
+    second = artifacts.save(task_id, "plan/step-1", "final", expected_version=1)
+    latest = artifacts.latest(task_id, "plan/step-1")
+    assert latest["id"] == second["id"] and latest["version"] == 2
+    assert latest["sha256"] == __import__("hashlib").sha256(b"final").hexdigest()
+    assert [item["id"] for item in artifacts.history(task_id, "plan/step-1")] == [
+        first["id"],
+        second["id"],
+    ]
+    assert artifacts.latest(task_id, "missing") is None
+    assert artifacts.history(task_id, "missing") == []
+    with pytest.raises(ValueError, match="version conflict"):
+        artifacts.save(task_id, "plan/step-1", "stale", expected_version=1)
+    with pytest.raises(ValueError, match="task not found"):
+        artifacts.save(task_id + 999, "missing-task", "content")
+
+
+@pytest.mark.parametrize(
+    "task_id,key,content,expected,message",
+    [
+        (0, "x", "y", None, "task_id"),
+        (True, "x", "y", None, "task_id"),
+        (1, "", "y", None, "artifact key"),
+        (1, "x" * 201, "y", None, "artifact key"),
+        (1, "x", 4, None, "content"),
+        (1, "x", "y", -1, "expected_version"),
+        (1, "x", "y", True, "expected_version"),
+    ],
+)
+def test_artifact_repository_rejects_invalid_inputs(
+    tmp_path, task_id, key, content, expected, message
+):
+    artifacts = ArtifactRepository(Database(tmp_path / "invalid.sqlite"))
+    with pytest.raises((ValueError, TypeError), match=message):
+        artifacts.save(task_id, key, content, expected)
 
 
 def test_event_catalog_rejects_unknown_writes_and_keeps_legacy_reads(tmp_path):

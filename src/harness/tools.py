@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import fnmatch
+import ipaddress
 import os
 import re
 import shlex
+import socket
 import subprocess
 import sys
 import uuid
@@ -37,12 +39,26 @@ class ToolExecutionError(RuntimeError):
     pass
 
 
+def resolve_http_addresses(host, port):
+    """Resolve a destination once for policy inspection; transports may resolve again."""
+    try:
+        return [ipaddress.ip_address(host)]
+    except ValueError:
+        try:
+            records = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        except OSError as exc:
+            raise PermissionError("HTTP destination could not be resolved") from exc
+        return list({ipaddress.ip_address(record[4][0]) for record in records})
+
+
 class ToolExecutor:
     def __init__(
         self,
         permissions,
         *,
         http_allow_hosts=(),
+        http_private_hosts=(),
+        http_resolver=resolve_http_addresses,
         http_timeout=30,
         git_allow_hosts=(),
         git_ca_bundle=None,
@@ -57,6 +73,8 @@ class ToolExecutor:
     ):
         self.permissions = permissions
         self.http_allow_hosts = set(http_allow_hosts)
+        self.http_private_hosts = {host.casefold() for host in http_private_hosts}
+        self.http_resolver = http_resolver
         self.http_timeout = http_timeout
         self.git_allow_hosts = set(git_allow_hosts)
         self.git_ca_bundle = git_ca_bundle
@@ -320,6 +338,10 @@ class ToolExecutor:
             or parsed.hostname not in self.http_allow_hosts
         ):
             raise PermissionError("HTTP destination is not allowlisted")
+        try:
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        except ValueError as exc:
+            raise PermissionError("HTTP destination has an invalid port") from exc
         secret_name = kwargs.pop("secret_name", None)
         if secret_name:
             from .security import SecretResolver
@@ -328,9 +350,25 @@ class ToolExecutor:
             if not secret:
                 raise PermissionError(f"secret '{secret_name}' is unavailable")
             kwargs.setdefault("headers", {})["Authorization"] = f"Bearer {secret}"
+        try:
+            addresses = self.http_resolver(parsed.hostname, port)
+        except (OSError, ValueError) as exc:
+            raise PermissionError("HTTP destination could not be resolved") from exc
+        if not addresses:
+            raise PermissionError("HTTP destination resolved to no addresses")
+        if parsed.hostname.casefold() not in self.http_private_hosts and any(
+            not address.is_global for address in addresses
+        ):
+            raise PermissionError("HTTP destination resolves to a non-public address")
         from .http_control import request
 
-        return request(method, url, timeout=self.http_timeout, **kwargs)
+        return request(
+            method,
+            url,
+            timeout=self.http_timeout,
+            pinned_addresses=[(parsed.hostname, port, addresses)],
+            **kwargs,
+        )
 
     def filesystem(
         self, action, path, *, workspace, content=None, destination=None, query=None
@@ -428,6 +466,7 @@ class ToolRegistry:
         self.executor = ToolExecutor(
             permissions,
             http_allow_hosts=http.get("allowed_hosts", []),
+            http_private_hosts=http.get("private_hosts", []),
             http_timeout=http.get("timeout", 30),
             git_allow_hosts=git.get("allowed_hosts", []),
             git_ca_bundle=git.get("ca_bundle"),
@@ -746,9 +785,15 @@ class ToolRegistry:
                 command = settings.command
             read_roots = (
                 (self.workspace, Path(__file__).resolve().parents[1], Path(sys.prefix))
+                + (Path(sys.base_prefix),)
                 + ((vault,) if vault is not None else ())
                 if settings.builtin
-                else None
+                else tuple(
+                    (self.workspace / path).resolve()
+                    if not Path(path).is_absolute()
+                    else Path(path).resolve()
+                    for path in settings.read_roots
+                )
             )
             if settings.transport == "stdio":
                 client = MCPClient(

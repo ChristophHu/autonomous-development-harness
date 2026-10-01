@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time  # noqa: F401 - compatibility clock hook used by routing tests
 from contextlib import nullcontext
+from typing import ClassVar
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -132,6 +134,89 @@ class PlannerOutput(BaseModel):
         return ordered
 
 
+async def execute_plan_dag(subtasks, worker, *, max_parallel_steps=4, on_complete=None):
+    """Execute ready, write-disjoint DAG steps concurrently and return plan order."""
+    if (
+        not isinstance(max_parallel_steps, int)
+        or isinstance(max_parallel_steps, bool)
+        or not 1 <= max_parallel_steps <= 32
+    ):
+        raise ValueError("max_parallel_steps must be between 1 and 32")
+    pending = list(subtasks)
+    results = {}
+
+    def normalized(path):
+        value = path.replace("\\", "/")
+        parts = [part for part in value.split("/") if part]
+        if value.startswith("/") or not parts or ".." in parts:
+            return ""
+        return "/".join(parts).casefold()
+
+    def conflicts(left, right):
+        for a in left:
+            for b in right:
+                if a == b or a.startswith(b + "/") or b.startswith(a + "/"):
+                    return True
+        return False
+
+    while pending:
+        ready = [step for step in pending if set(step.dependencies) <= results.keys()]
+        if not ready:
+            raise ValueError("plan dependency graph cannot make progress")
+        selected = []
+        claimed = []
+        for step in ready:
+            paths = [normalized(path) for path in step.write_paths]
+            if not all(paths):
+                paths = []
+            if len(selected) >= max_parallel_steps:
+                break
+            failed_dependency = any(
+                not results[dependency].success for dependency in step.dependencies
+            )
+            if failed_dependency:
+                selected.append((step, paths, True))
+                continue
+            if not paths and selected:
+                continue
+            if not paths:
+                selected.append((step, paths, False))
+                break
+            if any(conflicts(paths, prior) for prior in claimed):
+                continue
+            selected.append((step, paths, False))
+            claimed.append(paths)
+            if len(selected) >= max_parallel_steps:
+                break
+
+        async def run(item):
+            step, _paths, failed_dependency = item
+            if failed_dependency:
+                output = ExecutorOutput(
+                    subtask_id=step.id, success=False, output="dependency failed"
+                )
+            else:
+                output = await worker(step)
+            if on_complete is not None:
+                completed = on_complete(step, output)
+                if asyncio.iscoroutine(completed):
+                    await completed
+            return output
+
+        outcomes = await asyncio.gather(
+            *(run(item) for item in selected), return_exceptions=True
+        )
+        error = next(
+            (item for item in outcomes if isinstance(item, BaseException)), None
+        )
+        if error is not None:
+            raise error
+        for (step, _paths, _failed), output in zip(selected, outcomes, strict=True):
+            results[step.id] = output
+            pending.remove(step)
+    return [results[step.id] for step in subtasks]
+
+
 class ExecutorOutput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -206,7 +291,12 @@ class TaskClassificationOutput(BaseModel):
 
 
 class ModelProvider:
-    """Minimal provider interface; adapters must implement completion."""
+    """Provider adapter contract accepted by ModelRouter.
+
+    Adapters may return plain text for legacy/local fixtures or a typed
+    ModelResponse carrying text, tool calls, and optional usage. The historic
+    two-/three-tuple response remains accepted at this boundary.
+    """
 
     def complete(self, prompt, **kwargs):
         raise NotImplementedError("provider completion is not implemented")
@@ -217,6 +307,29 @@ class ModelResponse(BaseModel):
 
     text: str
     tool_calls: list[ToolCall] = Field(default_factory=list)
+    usage: ModelUsage | None = None
+
+
+def normalize_provider_response(result):
+    """Normalize legacy adapter results to text, usage, and tool calls."""
+    if isinstance(result, ModelResponse):
+        text, usage, calls = result.text, result.usage, result.tool_calls
+    elif isinstance(result, tuple):
+        if len(result) not in {2, 3}:
+            raise TypeError("provider tuple response must have two or three items")
+        text, usage = result[:2]
+        calls = result[2] if len(result) == 3 else []
+    elif isinstance(result, str):
+        text, usage, calls = result, None, []
+    else:
+        raise TypeError("provider response must be text, ModelResponse, or tuple")
+    if usage is not None and not isinstance(usage, ModelUsage):
+        raise TypeError("provider response usage must be ModelUsage or None")
+    if not isinstance(calls, list) or any(
+        not isinstance(call, ToolCall) for call in calls
+    ):
+        raise TypeError("provider response tool_calls must be a ToolCall list")
+    return text, usage, calls
 
 
 class ModelRegistry:
@@ -236,6 +349,7 @@ class ModelRegistry:
                     timeout=data.get("timeout", 120),
                     retry=data.get("retry"),
                     kind=data.get("kind", "openai_compatible"),
+                    headers=data.get("headers"),
                 )
 
     def register(self, name: str, provider: ModelProvider):
@@ -304,25 +418,389 @@ class AgentProfile(BaseModel):
     model: str
     permissions: list[str] = Field(default_factory=list)
     tools: list[str] = Field(default_factory=list)
+    capabilities: list[str] | None = None
+    input_schema: dict | None = None
+    output_schema: dict | None = None
     max_steps: int = Field(default=20, ge=1, le=200)
+
+    @staticmethod
+    def _validate_contract(schema, value):
+        if schema is None:
+            return value
+        from jsonschema import Draft202012Validator
+
+        Draft202012Validator(schema).validate(value)
+        return value
+
+    def validate_input(self, value):
+        return self._validate_contract(self.input_schema, value)
+
+    def validate_output(self, value):
+        return self._validate_contract(self.output_schema, value)
 
 
 class ProfileRegistry:
+    ROLE_CAPABILITIES: ClassVar[dict[str, frozenset[str]]] = {
+        "planner": frozenset({"plan"}),
+        "requirements": frozenset({"requirements"}),
+        "executor": frozenset({"execute"}),
+        "tester": frozenset({"test"}),
+        "validator": frozenset({"review"}),
+        "recovery-inspector": frozenset({"recovery"}),
+        "independent-review": frozenset({"review"}),
+    }
+    DEFAULT_ROLE_PROFILES: ClassVar[dict[str, str]] = {
+        "planner": "planner",
+        "requirements": "planner",
+        "executor": "coding",
+        "tester": "test-engineer",
+        "validator": "validator",
+        "recovery-inspector": "validator",
+        "independent-review": "validator",
+    }
+
     def __init__(self, config):
         self.config = config
 
+    @staticmethod
+    def _role_contracts(role):
+        """Build role-specific JSON contracts from runtime input/output models."""
+        from .domain import Task
+
+        obj = {"type": "object"}
+        if role == "planner":
+            return Task.model_json_schema(), PlannerOutput.model_json_schema()
+        if role == "requirements":
+            from .requirements import RequirementProposal
+
+            return (
+                {
+                    "type": "object",
+                    "required": ["task", "sources"],
+                    "properties": {
+                        "task": Task.model_json_schema(),
+                        "sources": {"type": "array", "items": obj},
+                    },
+                },
+                RequirementProposal.model_json_schema(),
+            )
+        if role == "executor":
+            return (
+                {
+                    "type": "object",
+                    "required": ["subtask", "context"],
+                    "properties": {
+                        "subtask": Subtask.model_json_schema(),
+                        "context": {"type": "string"},
+                    },
+                },
+                ExecutorReport.model_json_schema(),
+            )
+        if role == "tester":
+            return (
+                {
+                    "type": "object",
+                    "required": [
+                        "task_id",
+                        "test_commands",
+                        "lint_commands",
+                        "coverage_command",
+                    ],
+                    "properties": {
+                        "task_id": {"type": ["integer", "null"]},
+                        "test_commands": {
+                            "type": "array",
+                            "items": {"type": "array", "items": {"type": "string"}},
+                        },
+                        "lint_commands": {
+                            "type": "array",
+                            "items": {"type": "array", "items": {"type": "string"}},
+                        },
+                        "coverage_command": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                    },
+                },
+                {
+                    "type": "object",
+                    "required": ["commands", "coverage"],
+                    "properties": {
+                        "commands": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "required": [
+                                    "command",
+                                    "returncode",
+                                    "stdout",
+                                    "stderr",
+                                ],
+                                "properties": {
+                                    "command": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    },
+                                    "returncode": {"type": "integer"},
+                                    "stdout": {"type": "string"},
+                                    "stderr": {"type": "string"},
+                                },
+                                "additionalProperties": False,
+                            },
+                        },
+                        "coverage": {"type": ["object", "null"]},
+                    },
+                    "additionalProperties": False,
+                },
+            )
+        if role == "validator":
+            return (
+                {
+                    "type": "object",
+                    "required": ["task", "outputs", "tests"],
+                    "properties": {
+                        "task": Task.model_json_schema(),
+                        "outputs": {
+                            "type": "array",
+                            "items": ExecutorOutput.model_json_schema(),
+                        },
+                        "tests": obj,
+                    },
+                },
+                ValidatorOutput.model_json_schema(),
+            )
+        if role == "recovery-inspector":
+            from .reconciliation import RecoveryAssessment
+
+            return (
+                {
+                    "type": "object",
+                    "required": ["task", "report"],
+                    "properties": {"task": Task.model_json_schema(), "report": obj},
+                },
+                RecoveryAssessment.model_json_schema(),
+            )
+        if role == "independent-review":
+            from .validation import IndependentReviewOutput
+
+            return (
+                {
+                    "type": "object",
+                    "required": [
+                        "task",
+                        "observations",
+                        "tests",
+                        "artifacts",
+                        "plan_findings",
+                        "workspace_findings",
+                        "workspace_before",
+                        "workspace_after",
+                        "observed_changes",
+                        "available_evidence_ids",
+                    ],
+                    "properties": {
+                        "task": Task.model_json_schema(),
+                        "observations": {"type": "array"},
+                        "tests": obj,
+                        "artifacts": {"type": "array"},
+                        "plan_findings": {"type": "array"},
+                        "workspace_findings": {"type": "array"},
+                        "workspace_before": {"type": ["object", "null"]},
+                        "workspace_after": {"type": ["object", "null"]},
+                        "observed_changes": {"type": "array"},
+                        "available_evidence_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                    },
+                },
+                IndependentReviewOutput.model_json_schema(),
+            )
+        return None
+
+    @staticmethod
+    def _lift_schema_definitions(schema):
+        """Promote nested Pydantic $defs and rewrite local references."""
+        from copy import deepcopy
+
+        definitions = {}
+
+        def visit(value, prefix, references=None):
+            references = references or {}
+            if isinstance(value, list):
+                return [
+                    visit(item, f"{prefix}_{index}", references)
+                    for index, item in enumerate(value)
+                ]
+            if not isinstance(value, dict):
+                return value
+            node = deepcopy(value)
+            local = node.pop("$defs", {})
+            renamed = {name: f"{prefix}_{name}" for name in local}
+            references = {**references, **renamed}
+            for name, definition in local.items():
+                definitions[renamed[name]] = visit(
+                    definition, renamed[name], references
+                )
+            for key, child in tuple(node.items()):
+                if (
+                    key == "$ref"
+                    and isinstance(child, str)
+                    and child.startswith("#/$defs/")
+                ):
+                    name = child.removeprefix("#/$defs/")
+                    node[key] = f"#/$defs/{references.get(name, name)}"
+                else:
+                    safe_key = "".join(char if char.isalnum() else "_" for char in key)
+                    node[key] = visit(child, f"{prefix}_{safe_key}", references)
+            return node
+
+        result = visit(schema, "role")
+        if definitions:
+            result["$defs"] = definitions
+        return result
+
+    def _enforce_contract_mode(self, profile, role=None):
+        agents = self.config.data.get("agents", {})
+        mode = (
+            agents.get("contract_mode", "optional")
+            if isinstance(agents, dict)
+            else "optional"
+        )
+        configured_profile = self.config.data.get("profiles", {}).get(profile.name, {})
+        profile_mode = configured_profile.get("contract_mode")
+        required = mode == "required" and profile_mode != "legacy"
+        required = required or profile_mode == "strict"
+        if required and profile_mode != "legacy":
+            defaults = self._role_contracts(role) if role is not None else None
+            if defaults:
+                defaults = tuple(
+                    self._lift_schema_definitions(item) for item in defaults
+                )
+            input_schema = (
+                profile.input_schema
+                if profile.input_schema is not None
+                else defaults[0]
+                if defaults
+                else None
+            )
+            output_schema = (
+                profile.output_schema
+                if profile.output_schema is not None
+                else defaults[1]
+                if defaults
+                else None
+            )
+            if input_schema is None or output_schema is None:
+                raise ValueError(
+                    f"agent profile {profile.name} requires input_schema and output_schema"
+                )
+            profile = profile.model_copy(
+                update={"input_schema": input_schema, "output_schema": output_schema}
+            )
+        return profile
+
+    def catalog(self):
+        """Return configured agent profiles, validating each before exposure."""
+        profiles = self.config.data.get("profiles", {})
+        if not isinstance(profiles, dict):
+            raise TypeError("agent profiles must be a mapping")
+        return {name: self.get(name) for name in sorted(profiles)}
+
+    def role_profiles(self):
+        """Resolve configured role assignments over the built-in role catalog."""
+        result = dict(self.DEFAULT_ROLE_PROFILES)
+        configured = self.config.data.get("agent_roles", {})
+        if not isinstance(configured, dict):
+            raise TypeError("agent_roles must be a mapping")
+        result.update(configured)
+        for role, profile in configured.items():
+            if not isinstance(role, str) or not role.strip():
+                raise ValueError("agent role names must be non-empty strings")
+            if not isinstance(profile, str) or not profile.strip():
+                raise ValueError(f"agent role {role} has an invalid profile")
+            self.get(profile)
+        return result
+
+    def for_role(self, role):
+        """Load the profile assigned to a role, with an actionable error."""
+        mapping = self.role_profiles()
+        try:
+            name = mapping[role]
+        except KeyError:
+            raise ValueError(f"unknown agent role: {role}") from None
+        if name not in self.config.data.get("profiles", {}):
+            name = {
+                "tester": "validator",
+                "independent-review": "validator",
+                "recovery-inspector": "validator",
+                "requirements": "planner",
+            }.get(role, name)
+        profile = self.get(name)
+        required = self.ROLE_CAPABILITIES.get(role, frozenset())
+        if profile.capabilities is None:
+            profile = profile.model_copy(update={"capabilities": sorted(required)})
+        elif not required <= set(profile.capabilities):
+            raise ValueError(
+                f"agent profile {name} lacks required capabilities for {role}"
+            )
+        return self._enforce_contract_mode(profile, role)
+
+    def for_agent(self, role, requested_profile):
+        """Resolve a plan's agent/profile pair without allowing role escalation."""
+        configured = self.config.data.get("agent_roles", {})
+        if role in configured:
+            selected = self.for_role(role)
+            if requested_profile != selected.name:
+                raise ValueError(
+                    "agent role profile does not match configured dispatch policy"
+                )
+            return selected
+        if role in self.DEFAULT_ROLE_PROFILES:
+            selected_name = self.DEFAULT_ROLE_PROFILES[role]
+            if selected_name not in self.config.data.get("profiles", {}):
+                selected_name = {
+                    "tester": "validator",
+                    "independent-review": "validator",
+                    "recovery-inspector": "validator",
+                    "requirements": "planner",
+                }.get(role, selected_name)
+            if selected_name in self.config.data.get("profiles", {}):
+                selected = self.for_role(role)
+                if requested_profile != selected.name:
+                    raise ValueError(
+                        "agent role profile does not match dispatch policy"
+                    )
+                return selected
+        return self._enforce_contract_mode(
+            self.get(requested_profile),
+            role if role in self.ROLE_CAPABILITIES else None,
+        )
+
     def get(self, name: str):
+        from jsonschema import Draft202012Validator
+
         profiles = self.config.data.get("profiles", {})
         primary = profiles.get(name, {}).get("model", {}).get("primary")
         if not isinstance(primary, str) or not primary.strip():
             raise ValueError(f"unknown or invalid agent profile: {name}")
         data = profiles[name]
+        for contract in ("input_schema", "output_schema"):
+            if contract in data:
+                if not isinstance(data[contract], dict):
+                    raise ValueError(
+                        f"agent profile {name} {contract} must be an object"
+                    )
+                Draft202012Validator.check_schema(data[contract])
         return AgentProfile(
             name=name,
             instructions=data.get("instructions", f"Act as {name}"),
             model=data["model"]["primary"],
             permissions=data.get("permissions", []),
             tools=data.get("tools", []),
+            capabilities=data.get("capabilities"),
+            input_schema=data.get("input_schema"),
+            output_schema=data.get("output_schema"),
             max_steps=data.get("max_steps", 20),
         )
 
@@ -541,11 +1019,8 @@ class ModelRouter:
                         result = provider.complete(prompt, **kwargs)
                     if control is not None:
                         control.check()
-                    if isinstance(result, tuple):
-                        text, usage = result[:2]
-                        calls = result[2] if len(result) > 2 else []
-                        if not isinstance(usage, ModelUsage):
-                            raise TypeError("invalid usage response")
+                    text, usage, calls = normalize_provider_response(result)
+                    if usage is not None:
                         CostCalculator(
                             self.config.data.get("models", {}).get("rates", {})
                         ).calculate(usage)
@@ -589,7 +1064,6 @@ class ModelRouter:
                         if self.usage_callback:
                             self.usage_callback(usage)
                     else:
-                        text, calls = result, []
                         if (
                             run_context.get("model_cost_budget") is not None
                             or run_context.get("model_token_budget") is not None
@@ -601,7 +1075,7 @@ class ModelRouter:
                         raise ValueError("empty or invalid model response")
                     if control is not None:
                         control.check()
-                    response = ModelResponse(text=text, tool_calls=calls)
+                    response = ModelResponse(text=text, tool_calls=calls, usage=usage)
                     if tools is not None:
                         return response
                     if calls:
@@ -632,11 +1106,14 @@ class ModelRouter:
 class Planner:
     def __init__(self, router: ModelRouter):
         self.router = router
+        self.profiles = ProfileRegistry(router.config)
 
     def plan(self, task, context="") -> PlannerOutput:
         payload = task.model_dump(mode="json")
+        profile = self.profiles.for_role("planner")
+        profile.validate_input(payload)
         answer = self.router.complete(
-            "planner",
+            profile.name,
             "PLAN: Return JSON matching this schema:\n"
             + json.dumps(PlannerOutput.model_json_schema())
             + "\nFor every step that may change workspace files, declare the narrowest possible write_paths."
@@ -648,12 +1125,14 @@ class Planner:
             complexity=task.complexity,
         )
         plan = parse_model_output(PlannerOutput, answer, agent="planner")
+        profile.validate_output(plan.model_dump(mode="json"))
         for step in plan.subtasks:
             if not step.expected_result or not step.acceptance_criteria:
                 raise ValueError(
                     "plan steps require expected results and acceptance criteria"
                 )
-            profile = ProfileRegistry(self.router.config).get(step.profile)
+            profile = self.profiles.for_agent(step.assigned_agent, step.profile)
+            step.profile = profile.name
             if not set(step.required_tools) <= set(profile.tools):
                 raise ValueError("plan requests tools not granted to profile")
         required_requirements = required_criteria = None
@@ -698,7 +1177,10 @@ class Executor:
     ) -> ExecutorOutput:
         changed, evidence = [], []
         try:
-            profile = self.profiles.get(subtask.profile)
+            profile = self.profiles.for_agent(subtask.assigned_agent, subtask.profile)
+            profile.validate_input(
+                {"subtask": subtask.model_dump(mode="json"), "context": context}
+            )
             schemas = self.tools.schemas(profile.tools) if self.tools else []
             if not set(subtask.required_tools) <= set(profile.tools):
                 raise PermissionError("required tool is not granted to profile")
@@ -716,7 +1198,7 @@ class Executor:
             ]
             for _ in range(profile.max_steps):
                 response = self.router.complete(
-                    subtask.profile,
+                    profile.name,
                     messages,
                     tools=schemas,
                     complexity=complexity,
@@ -729,6 +1211,7 @@ class Executor:
                     report = parse_model_output(
                         ExecutorReport, response.text, agent="executor"
                     )
+                    profile.validate_output(report.model_dump(mode="json"))
                     return ExecutorOutput(
                         subtask_id=subtask.id,
                         success=True,

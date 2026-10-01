@@ -94,6 +94,7 @@ def test_http_tool_cancels_active_request(monkeypatch):
         tool = ToolExecutor(
             SimpleNamespace(require=lambda *a, **k: None),
             http_allow_hosts=["localhost"],
+            http_private_hosts=["localhost"],
         )
         tool.http("GET", "http://localhost/data")
 
@@ -253,3 +254,29 @@ def test_timeout_validation_covers_every_http_section():
     config.data["tools"]["http"]["timeout"] = -1
     with pytest.raises(ValueError, match="tools.http.timeout"):
         config.validate()
+
+
+def test_http_request_does_not_follow_redirects_by_default():
+    def redirect(_request):
+        return httpx.Response(302, headers={"Location": "http://foreign.test/"})
+
+    client = httpx.Client(transport=httpx.MockTransport(redirect))
+    try:
+        response = request("GET", "http://allowed.test/", timeout=1, client=client)
+        assert response.status_code == 302
+        assert response.history == []
+    finally:
+        client.close()
+
+
+def test_http_request_forwards_redirect_policy_to_default_client(monkeypatch):
+    response = httpx.Response(200)
+    observed = {}
+
+    def fake_request(method, url, **kwargs):
+        observed.update(method=method, url=url, **kwargs)
+        return response
+
+    monkeypatch.setattr(httpx, "request", fake_request)
+    assert request("GET", "https://allowed.test/", timeout=2) is response
+    assert observed["follow_redirects"] is False

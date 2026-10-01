@@ -305,3 +305,17 @@ def test_decision_projection_propagates_temporary_file_creation_failure(
     )
     with pytest.raises(OSError, match="disk full"):
         projection._atomic_write(projection.manifest_path, "{}")
+
+
+def test_decision_projection_cleans_temporary_file_after_replace_failure(
+    tmp_path, monkeypatch
+):
+    import harness.memory_projection as module
+
+    projection = DecisionProjection(tmp_path / "vault")
+    monkeypatch.setattr(
+        module.os, "replace", lambda *_args: (_ for _ in ()).throw(OSError("replace"))
+    )
+    with pytest.raises(OSError, match="replace"):
+        projection._atomic_write(projection.manifest_path, "{}")
+    assert list(projection.manifest_path.parent.iterdir()) == []

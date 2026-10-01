@@ -3,6 +3,7 @@
 harness:
   name: autonomous-development-harness
   environment: development
+  max_parallel_steps: 4
 paths:
   workspace: ./workspace
   obsidian_vault: ./vault
@@ -10,6 +11,14 @@ paths:
   database: ./data/harness.db
 database:
   type: sqlite
+agents:
+  # Built-in roles receive Harness-defined input/output schemas automatically.
+  # Set contract_mode: legacy on a profile only for an explicit compatibility exception.
+  contract_mode: required
+verification:
+  # External evidence is optional unless kinds are explicitly listed here.
+  required_evidence: []
+  max_age_hours: 168
 memory:
   obsidian:
     enabled: true
@@ -33,6 +42,8 @@ models:
     openrouter:
       enabled: true
       base_url: https://openrouter.ai/api/v1
+      # Optional attribution headers; API keys remain in the environment/.env.
+      headers: {HTTP-Referer: https://example.invalid, X-Title: Autonomous Harness}
     lmstudio:
       enabled: true
       kind: lmstudio
@@ -65,26 +76,31 @@ models:
 profiles:
   software-architect:
     model: {primary: openai_astra, fallback: [openai_sol, deepseek_flash]}
+    capabilities: [architecture]
     instructions: Design the architecture and explain tradeoffs.
     tools: [filesystem.read, search.text]
     permissions: [filesystem]
   planner:
     model: {primary: openai_sol, fallback: [openai_luna, deepseek_flash]}
+    capabilities: [plan, requirements]
     instructions: Produce grounded, executable plans.
     tools: [filesystem.read, search.text]
     permissions: [filesystem]
   coding:
     model: {primary: openai_sol, fallback: [deepseek_flash, qwen_local]}
+    capabilities: [execute]
     instructions: Implement approved steps and report observed results.
     tools: [filesystem.read, filesystem.write, shell.execute]
     permissions: [filesystem, shell]
   validator:
     model: {primary: openai_astra, fallback: [openai_sol]}
+    capabilities: [review, recovery]
     instructions: Independently validate artifacts and evidence.
     tools: [filesystem.read, test.run_tests]
     permissions: [filesystem, shell]
   test-engineer:
     model: {primary: openai_luna, fallback: [qwen_local]}
+    capabilities: [test]
     instructions: Write and run tests.
     tools: [filesystem.read, test.run_tests]
     permissions: [filesystem, shell]
@@ -98,6 +114,14 @@ profiles:
     instructions: Classify task complexity.
     tools: []
     permissions: []
+agent_roles:
+  planner: planner
+  requirements: planner
+  executor: coding
+  tester: test-engineer
+  validator: validator
+  recovery-inspector: validator
+  independent-review: validator
 git:
   enabled: false
   branches: {main: main, development: dev}
@@ -120,7 +144,7 @@ testing:
   coverage: {statements: 100, branches: 100, functions: 100, lines: 100}
 tools:
   permissions: {filesystem: write, filesystem.delete: denied, shell: write, git: read, docker: denied, obsidian: denied}
-  http: {allowed_hosts: []}
+  http: {allowed_hosts: [], private_hosts: []}
   docker: {compose_file: ./docker-compose.yml}
   git:
     allowed_hosts: []

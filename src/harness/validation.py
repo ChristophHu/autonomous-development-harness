@@ -10,7 +10,7 @@ from pathlib import Path, PurePosixPath
 
 from pydantic import BaseModel, ConfigDict, StrictBool, StrictStr
 
-from .agents import ValidatorOutput
+from .agents import ProfileRegistry, ValidatorOutput
 from .structured_output import parse_model_output
 
 
@@ -20,12 +20,18 @@ class IndependentReviewOutput(BaseModel):
     requirements: dict[StrictStr, StrictBool]
     criteria: dict[StrictStr, StrictBool]
     evidence: StrictStr
+    requirement_evidence: dict[StrictStr, list[StrictStr]]
+    criterion_evidence: dict[StrictStr, list[StrictStr]]
 
 
 class EvidenceValidator:
     def __init__(self, tools, router):
         self.tools = tools
         self.router = router
+        profiles = ProfileRegistry(router.config)
+        self.profile = profiles.for_role("independent-review")
+        self.tester_profile = profiles.for_role("tester")
+        self.validator_profile = profiles.for_role("validator")
 
     def path(self, name):
         path = (self.tools.workspace / name).resolve()
@@ -391,6 +397,13 @@ class EvidenceValidator:
         return errors, sorted(observed)
 
     def run_tests(self, task):
+        test_input = {
+            "task_id": task.id,
+            "test_commands": task.test_commands,
+            "lint_commands": task.lint_commands,
+            "coverage_command": task.coverage_command,
+        }
+        self.tester_profile.validate_input(test_input)
         reports = []
         commands = [(command, "test.run_tests") for command in task.test_commands]
         commands.extend((command, "quality.lint") for command in task.lint_commands)
@@ -415,7 +428,9 @@ class EvidenceValidator:
                     coverage = json.loads(path.read_text())
                 except (OSError, UnicodeDecodeError, json.JSONDecodeError):
                     coverage = None
-        return {"commands": reports, "coverage": coverage}
+        result = {"commands": reports, "coverage": coverage}
+        self.tester_profile.validate_output(result)
+        return result
 
     def validate(
         self,
@@ -427,6 +442,13 @@ class EvidenceValidator:
         workspace_after=None,
         verify_workspace_changes=True,
     ):
+        self.validator_profile.validate_input(
+            {
+                "task": task.model_dump(mode="json"),
+                "outputs": [item.model_dump(mode="json") for item in outputs],
+                "tests": tests,
+            }
+        )
         failed_subtasks = [output for output in outputs if not output.success]
         errors = [
             f"subtask {output.subtask_id} failed: {output.output}"
@@ -579,6 +601,15 @@ class EvidenceValidator:
                 and not observations[criterion.id]["passed"]
             ):
                 acceptance_errors.append(f"acceptance criterion failed: {criterion.id}")
+        evidence_catalog = {
+            *(f"file:{name}" for name in artifacts),
+            *(f"criterion:{name}" for name in observations),
+            *(
+                f"test:{report['command']}"
+                for report in tests["commands"]
+                if report["returncode"] == 0
+            ),
+        }
         errors.extend(acceptance_errors)
         add_findings(
             "acceptance",
@@ -598,8 +629,8 @@ class EvidenceValidator:
             review = parse_model_output(
                 IndependentReviewOutput,
                 self.router.complete(
-                    "validator",
-                    "REVIEW: Independently verify every requirement and acceptance criterion against these observations. Return JSON with requirements (exact requirement strings mapped to booleans), criteria (criterion IDs mapped to booleans), and evidence (nonempty string).\n"
+                    self.profile.name,
+                    "REVIEW: Independently verify every requirement and acceptance criterion against these observations. Return JSON with requirements (exact requirement strings mapped to booleans), criteria (criterion IDs mapped to booleans), requirement_evidence (each exact requirement string mapped to one or more available evidence IDs), criterion_evidence (each criterion ID mapped to one or more available evidence IDs), and evidence (nonempty summary string). Evidence IDs are exactly file:<path>, criterion:<id>, or test:<command> from the supplied observations. Do not invent IDs.\n"
                     + json.dumps(
                         {
                             "task": task.model_dump(mode="json"),
@@ -611,17 +642,19 @@ class EvidenceValidator:
                             "workspace_before": workspace_before,
                             "workspace_after": workspace_after,
                             "observed_changes": observed_changes,
+                            "available_evidence_ids": sorted(evidence_catalog),
                         }
                     ),
                     complexity=task.complexity,
                 ),
                 agent="independent_review",
             )
+            self.profile.validate_output(review.model_dump(mode="json"))
             review = review.model_dump()
         except (TypeError, ValueError):
             review = None
             review_parse_failed = True
-        if not self._review_confirms(review, task):
+        if not self._review_confirms(review, task, evidence_catalog):
             review_error = (
                 "independent review response is invalid"
                 if review_parse_failed or not isinstance(review, dict)
@@ -634,7 +667,7 @@ class EvidenceValidator:
                 [review_error],
                 source="independent_reviewer",
             )
-        return ValidatorOutput(
+        result = ValidatorOutput(
             valid=not errors,
             checks=[
                 "actual tests",
@@ -650,14 +683,19 @@ class EvidenceValidator:
                 finding for finding in findings_by_rule.values() if finding is not None
             ],
         )
+        self.validator_profile.validate_output(result.model_dump(mode="json"))
+        return result
 
     @staticmethod
-    def _review_confirms(review, task):
+    def _review_confirms(review, task, available_evidence=None):
         if not isinstance(review, dict):
             return False
         evidence = review.get("evidence")
         requirements = review.get("requirements")
         criteria = review.get("criteria")
+        requirement_evidence = review.get("requirement_evidence")
+        criterion_evidence = review.get("criterion_evidence")
+        available = set(available_evidence or ())
         return (
             isinstance(evidence, str)
             and bool(evidence.strip())
@@ -665,6 +703,23 @@ class EvidenceValidator:
             and isinstance(criteria, dict)
             and set(requirements) == set(task.requirements)
             and set(criteria) == {item.id for item in task.acceptance_criteria}
+            and isinstance(requirement_evidence, dict)
+            and set(requirement_evidence) == set(task.requirements)
+            and isinstance(criterion_evidence, dict)
+            and set(criterion_evidence)
+            == {item.id for item in task.acceptance_criteria}
+            and all(
+                isinstance(references, list)
+                and bool(references)
+                and all(
+                    isinstance(reference, str) and reference in available
+                    for reference in references
+                )
+                for references in (
+                    *requirement_evidence.values(),
+                    *criterion_evidence.values(),
+                )
+            )
             and all(requirements.get(value) is True for value in task.requirements)
             and all(
                 criteria.get(value.id) is True for value in task.acceptance_criteria

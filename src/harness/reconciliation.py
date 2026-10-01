@@ -7,6 +7,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
+from .agents import ProfileRegistry
 from .structured_output import parse_model_output
 
 
@@ -29,8 +30,14 @@ class RecoveryScope(BaseModel):
 
     @classmethod
     def assess(cls, task, report, router, validator):
+        profile = ProfileRegistry(router.config).for_role("recovery-inspector")
+        payload = {
+            "task": task.model_dump(mode="json"),
+            "report": report.model_dump(mode="json"),
+        }
+        profile.validate_input(payload)
         answer = router.complete(
-            "validator",
+            profile.name,
             "RECOVERY_REVIEW: Independently classify every exact requirement using ONLY "
             "current observations. Return JSON matching this schema. Completed claims "
             "must cite confirmed criterion IDs and concrete evidence. Historical flags "
@@ -39,8 +46,7 @@ class RecoveryScope(BaseModel):
             + "\n"
             + json.dumps(
                 {
-                    "task": task.model_dump(mode="json"),
-                    "report": report.model_dump(mode="json"),
+                    **payload,
                 }
             ),
             complexity=task.complexity,
@@ -48,6 +54,7 @@ class RecoveryScope(BaseModel):
         assessment = parse_model_output(
             RecoveryAssessment, answer, agent="recovery_validator"
         )
+        profile.validate_output(assessment.model_dump(mode="json"))
         if set(assessment.requirements) != set(task.requirements):
             raise ValueError("recovery assessment must cover exact requirements")
         targets = [

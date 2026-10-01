@@ -108,11 +108,25 @@ class Provider:
                     }
                 }
             )
+        payload = json.loads(prompt.split("\n", 1)[1])
+        available = payload["available_evidence_ids"]
+        reference = available[0] if available else None
+        requirements = payload["task"]["requirements"]
+        criteria = [item["id"] for item in payload["task"]["acceptance_criteria"]]
         return json.dumps(
             {
-                "requirements": {"add integers": True, "multiply integers": True},
-                "criteria": {"add": True, "multiply": True},
-                "evidence": "Observed current source artifacts and fresh real passing arithmetic tests and coverage.",
+                "requirements": dict.fromkeys(requirements, True),
+                "criteria": dict.fromkeys(criteria, True),
+                "evidence": "Observed current source artifacts and fresh test reports.",
+                "requirement_evidence": {
+                    name: [reference] if reference else [] for name in requirements
+                },
+                "criterion_evidence": {
+                    name: [f"criterion:{name}"]
+                    if f"criterion:{name}" in available
+                    else ([reference] if reference else [])
+                    for name in criteria
+                },
             }
         )
 

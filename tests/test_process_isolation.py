@@ -7,7 +7,8 @@ import tempfile
 
 import pytest
 
-from harness.isolation import git_metadata, isolated_command
+from harness import isolation
+from harness.isolation import _stat_if_present, git_metadata, isolated_command
 
 
 def test_profile_confines_descendants_and_metadata(tmp_path):
@@ -16,6 +17,37 @@ def test_profile_confines_descendants_and_metadata(tmp_path):
     assert "deny file-write*" in command[2]
     assert "deny process-exec" in command[2]
     assert command[3:] == [sys.executable, "-c", "pass"]
+
+
+def test_stat_of_transient_workspace_file_can_race_with_sqlite_journal_cleanup(
+    tmp_path,
+):
+    assert _stat_if_present(tmp_path / "db.sqlite-journal") is None
+
+
+def test_git_metadata_skips_files_removed_during_both_snapshot_passes(
+    tmp_path, monkeypatch
+):
+    workspace = tmp_path / "workspace"
+    metadata = workspace / ".git"
+    metadata.mkdir(parents=True)
+    protected_transient = metadata / "protected-transient"
+    protected_transient.write_text("short-lived")
+    workspace_transient = workspace / "db.sqlite-journal"
+    workspace_transient.write_text("short-lived")
+    original = isolation._stat_if_present
+    calls = {protected_transient: 0}
+
+    def racing_stat(path):
+        if path == protected_transient and calls[path] == 0:
+            calls[path] += 1
+            return None
+        if path == workspace_transient:
+            return None
+        return original(path)
+
+    monkeypatch.setattr(isolation, "_stat_if_present", racing_stat)
+    assert git_metadata(workspace) == {metadata}
 
 
 def test_restricted_mcp_profile_lists_read_roots_without_global_read(tmp_path):
@@ -55,7 +87,7 @@ def test_native_restricted_mcp_profile_denies_outside_read(tmp_path):
             [sys.executable, "-c", code],
             workspace,
             read_only=True,
-            read_roots=(workspace, sys.prefix),
+            read_roots=(workspace, sys.prefix, sys.base_prefix),
         ),
         cwd=workspace,
         capture_output=True,

@@ -1,2 +1,4 @@
 [console_scripts]
 harness = harness.cli:app
+harness-filesystem-mcp = harness.mcp_servers.filesystem:main
+harness-obsidian-mcp = harness.mcp_servers.obsidian:main

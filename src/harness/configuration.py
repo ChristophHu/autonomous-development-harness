@@ -14,6 +14,7 @@ from pydantic import (
     StrictFloat,
     StrictInt,
     StrictStr,
+    field_validator,
     model_validator,
 )
 
@@ -30,6 +31,7 @@ class ExtensibleSettings(BaseModel):
 class HarnessSettings(ExtensibleSettings):
     name: StrictStr = "autonomous-development-harness"
     environment: StrictStr = "development"
+    max_parallel_steps: StrictInt = Field(default=4, ge=1, le=32)
 
 
 class PathSettings(ExtensibleSettings):
@@ -41,6 +43,13 @@ class PathSettings(ExtensibleSettings):
 
 class DatabaseSettings(ExtensibleSettings):
     type: Literal["sqlite"] = "sqlite"
+
+
+class VerificationSettings(ExtensibleSettings):
+    required_evidence: list[
+        Literal["ci", "provider", "qdrant", "embedding", "http_tls"]
+    ] = Field(default_factory=list)
+    max_age_hours: StrictInt = Field(default=168, ge=1, le=8760)
 
 
 class TimeoutSettings(ExtensibleSettings):
@@ -94,8 +103,24 @@ class ProviderSettings(ExtensibleSettings):
     kind: Literal["openai_compatible", "lmstudio"] = "openai_compatible"
     base_url: StrictStr | None = None
     model: StrictStr | None = None
+    headers: dict[StrictStr, StrictStr] = Field(default_factory=dict)
     timeout: TimeoutValue = 120
     retry: RetrySettings = Field(default_factory=RetrySettings)
+
+    @field_validator("headers")
+    @classmethod
+    def validate_provider_headers(cls, value, info):
+        allowed = {"http-referer", "x-title"}
+        for name, header_value in value.items():
+            if name.lower() not in allowed:
+                raise ValueError("provider header is not in the safe allowlist")
+            if not header_value.strip() or any(c in header_value for c in "\r\n"):
+                raise ValueError(
+                    "provider header values must be non-empty and single-line"
+                )
+        if info.data.get("kind") == "lmstudio" and value:
+            raise ValueError("custom provider headers are not supported for LM Studio")
+        return value
 
 
 class ModelDefaults(ExtensibleSettings):
@@ -104,6 +129,9 @@ class ModelDefaults(ExtensibleSettings):
 
 
 ModelTier = Literal["premium", "advanced", "standard", "economical", "local"]
+AgentCapability = Literal[
+    "plan", "requirements", "execute", "test", "review", "recovery", "architecture"
+]
 
 
 class ModelDefinition(ExtensibleSettings):
@@ -186,7 +214,17 @@ class ProfileSettings(ExtensibleSettings):
     instructions: StrictStr | None = None
     tools: list[StrictStr] = Field(default_factory=list)
     permissions: list[StrictStr] = Field(default_factory=list)
+    capabilities: list[AgentCapability] | None = None
+    input_schema: dict[str, Any] | None = None
+    output_schema: dict[str, Any] | None = None
     max_steps: StrictInt = Field(default=20, ge=1)
+    contract_mode: Literal["strict", "legacy"] | None = None
+
+
+class AgentRuntimeSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    contract_mode: Literal["optional", "required"] = "optional"
 
 
 class GitSettings(ExtensibleSettings):
@@ -233,6 +271,7 @@ class TestingSettings(ExtensibleSettings):
 
 class HTTPToolSettings(ExtensibleSettings):
     allowed_hosts: list[StrictStr] = Field(default_factory=list)
+    private_hosts: list[StrictStr] = Field(default_factory=list)
     timeout: TimeoutValue = 30
 
 
@@ -299,6 +338,7 @@ class MCPServerSettings(BaseModel):
     read_only: StrictBool = True
     allow_delete: StrictBool = False
     trusted_local: StrictBool = False
+    read_roots: list[StrictStr] = Field(default_factory=list)
     timeout: Annotated[Number, Field(gt=0, le=30)] = 10
 
     @model_validator(mode="after")
@@ -357,6 +397,14 @@ class MCPServerSettings(BaseModel):
             raise ValueError(
                 "external MCP server needs explicit trusted_local acknowledgement"
             )
+        if self.builtin is None and self.transport == "stdio" and not self.read_roots:
+            raise ValueError("external stdio MCP server requires explicit read_roots")
+        if any(not root.strip() for root in self.read_roots):
+            raise ValueError("MCP read_roots must contain non-empty paths")
+        if self.transport == "streamable_http" and self.read_roots:
+            raise ValueError("remote MCP servers cannot declare filesystem read_roots")
+        if self.builtin and self.read_roots:
+            raise ValueError("builtin MCP read_roots are controlled by the harness")
         if self.transport == "streamable_http" and self.trusted_local:
             raise ValueError("remote MCP server cannot use trusted_local")
         if self.builtin and self.trusted_local:
@@ -386,6 +434,8 @@ class HarnessConfig(ExtensibleSettings):
     harness: HarnessSettings = Field(default_factory=HarnessSettings)
     paths: PathSettings = Field(default_factory=PathSettings)
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)
+    verification: VerificationSettings = Field(default_factory=VerificationSettings)
+    agents: AgentRuntimeSettings = Field(default_factory=AgentRuntimeSettings)
     memory: MemorySettings = Field(default_factory=MemorySettings)
     git: GitSettings = Field(default_factory=GitSettings)
     docker: DockerSettings = Field(default_factory=DockerSettings)

@@ -24,6 +24,44 @@ def test_provider_no_auth_and_missing_usage():
     assert provider.headers() == {} and provider.complete("prompt")[0] == "ok"
 
 
+def test_provider_safe_metadata_headers_merge_with_auth():
+    provider = OpenAICompatibleProvider(
+        "remote",
+        "https://example.test/v1",
+        api_key="secret",
+        headers={"HTTP-Referer": "https://harness.test", "X-Title": "Harness"},
+    )
+    assert provider.headers() == {
+        "Authorization": "Bearer secret",
+        "HTTP-Referer": "https://harness.test",
+        "X-Title": "Harness",
+    }
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"Authorization": "Bearer forged"},
+        {"Cookie": "x=y"},
+        {"X-Title": "bad\r\ninjected: yes"},
+        {"X-Unknown": "value"},
+    ],
+)
+def test_provider_rejects_unsafe_custom_headers(headers):
+    with pytest.raises(ValueError, match="safe single-line allowlist"):
+        OpenAICompatibleProvider("remote", "https://example.test/v1", headers=headers)
+
+
+def test_lmstudio_provider_rejects_custom_headers():
+    with pytest.raises(ValueError, match="not supported for LM Studio"):
+        OpenAICompatibleProvider(
+            "local",
+            "http://127.0.0.1:1234/v1",
+            kind="lmstudio",
+            headers={"X-Title": "Harness"},
+        )
+
+
 def test_provider_merges_partial_retry_settings_with_defaults():
     provider = OpenAICompatibleProvider("p", "http://model", retry={"max_attempts": 1})
     assert provider.retry == {

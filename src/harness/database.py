@@ -13,16 +13,24 @@ from typing import ClassVar
 
 
 class Database:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, timeout: float = 5.0):
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or timeout < 0
+        ):
+            raise ValueError("SQLite timeout must be a non-negative number")
         self.path = path
+        self.timeout = float(timeout)
         path.parent.mkdir(parents=True, exist_ok=True)
         self.migrate()
 
     @contextmanager
     def connect(self):
-        c = sqlite3.connect(self.path)
+        c = sqlite3.connect(self.path, timeout=self.timeout)
         c.row_factory = sqlite3.Row
         c.execute("PRAGMA foreign_keys=ON")
+        c.execute(f"PRAGMA busy_timeout={int(self.timeout * 1000)}")
         try:
             yield c
             c.commit()
@@ -35,6 +43,7 @@ class Database:
     def migrate(self):
         with self.connect() as c:
             c.executescript("""
+            BEGIN IMMEDIATE;
             CREATE TABLE IF NOT EXISTS schema_versions(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS tasks(id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, result TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS subtasks(id INTEGER PRIMARY KEY AUTOINCREMENT, task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE, external_id TEXT NOT NULL, title TEXT NOT NULL, description TEXT NOT NULL, profile TEXT NOT NULL, status TEXT NOT NULL, output TEXT);
@@ -144,10 +153,147 @@ class Database:
                     "ON correction_items(task_id,status,created_at,id)"
                 )
                 c.execute("INSERT INTO schema_versions VALUES(5,?)", (self.now(),))
+            if not c.execute(
+                "SELECT 1 FROM schema_versions WHERE version=6"
+            ).fetchone():
+                for column, kind in (
+                    ("alternatives", "TEXT NOT NULL DEFAULT '[]'"),
+                    ("outcome", "TEXT"),
+                    ("tags", "TEXT NOT NULL DEFAULT '[]'"),
+                ):
+                    c.execute(f"ALTER TABLE decisions ADD COLUMN {column} {kind}")
+                c.execute("INSERT INTO schema_versions VALUES(6,?)", (self.now(),))
+            if not c.execute(
+                "SELECT 1 FROM schema_versions WHERE version=7"
+            ).fetchone():
+                c.execute(
+                    """CREATE TABLE artifacts(
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                        artifact_key TEXT NOT NULL,
+                        version INTEGER NOT NULL CHECK(version > 0),
+                        content TEXT NOT NULL,
+                        sha256 TEXT NOT NULL CHECK(length(sha256)=64),
+                        created_at TEXT NOT NULL,
+                        UNIQUE(task_id,artifact_key,version)
+                    )"""
+                )
+                c.execute(
+                    "CREATE INDEX artifacts_task_key ON artifacts(task_id,artifact_key,version)"
+                )
+                c.execute("INSERT INTO schema_versions VALUES(7,?)", (self.now(),))
+            if not c.execute(
+                "SELECT 1 FROM schema_versions WHERE version=8"
+            ).fetchone():
+                c.execute(
+                    "ALTER TABLE decisions ADD COLUMN supersedes_id INTEGER REFERENCES decisions(id)"
+                )
+                c.execute(
+                    "CREATE UNIQUE INDEX decisions_supersedes ON decisions(supersedes_id) WHERE supersedes_id IS NOT NULL"
+                )
+                c.execute("INSERT INTO schema_versions VALUES(8,?)", (self.now(),))
+            if not c.execute(
+                "SELECT 1 FROM schema_versions WHERE version=9"
+            ).fetchone():
+                c.execute(
+                    """CREATE TABLE verification_evidence(
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        kind TEXT NOT NULL CHECK(kind IN ('ci','provider','qdrant','embedding','http_tls')),
+                        source_id TEXT NOT NULL,
+                        observed_at TEXT NOT NULL,
+                        subject_sha256 TEXT NOT NULL CHECK(length(subject_sha256)=64),
+                        passed INTEGER NOT NULL CHECK(passed IN (0,1)),
+                        checks_json TEXT NOT NULL,
+                        digest TEXT NOT NULL UNIQUE CHECK(length(digest)=64)
+                    )"""
+                )
+                c.execute(
+                    "CREATE INDEX verification_evidence_kind_time ON verification_evidence(kind,observed_at DESC)"
+                )
+                c.execute(
+                    "CREATE TRIGGER verification_evidence_no_update BEFORE UPDATE ON verification_evidence BEGIN SELECT RAISE(ABORT,'verification evidence is append-only'); END"
+                )
+                c.execute(
+                    "CREATE TRIGGER verification_evidence_no_delete BEFORE DELETE ON verification_evidence BEGIN SELECT RAISE(ABORT,'verification evidence is append-only'); END"
+                )
+                c.execute("INSERT INTO schema_versions VALUES(9,?)", (self.now(),))
+            if not c.execute(
+                "SELECT 1 FROM schema_versions WHERE version=10"
+            ).fetchone():
+                c.execute("""CREATE TABLE model_discovery_snapshots(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, provider TEXT NOT NULL,
+                    observed_at TEXT NOT NULL, status TEXT NOT NULL,
+                    discovery_failed INTEGER NOT NULL CHECK(discovery_failed IN (0,1)),
+                    models_json TEXT NOT NULL)""")
+                c.execute(
+                    "CREATE INDEX model_discovery_latest ON model_discovery_snapshots(provider,id DESC)"
+                )
+                c.execute("""CREATE TABLE qdrant_probe_snapshots(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, observed_at TEXT NOT NULL,
+                    healthy INTEGER NOT NULL CHECK(healthy IN (0,1)), status TEXT NOT NULL,
+                    latency_ms REAL NOT NULL CHECK(latency_ms >= 0),
+                    collection_exists INTEGER NOT NULL CHECK(collection_exists IN (0,1)),
+                    vector_size INTEGER, points INTEGER, error_category TEXT)""")
+                c.execute("INSERT INTO schema_versions VALUES(10,?)", (self.now(),))
 
     @staticmethod
     def now():
         return datetime.now(UTC).isoformat()
+
+
+class OperationalSnapshotRepository:
+    """Persist bounded model discovery and Qdrant probe summaries."""
+
+    def __init__(self, database):
+        self.database = database
+
+    def record_model_discovery(self, provider, status, discovery_failed, models):
+        with self.database.connect() as connection:
+            connection.execute(
+                "INSERT INTO model_discovery_snapshots(provider,observed_at,status,discovery_failed,models_json) VALUES(?,?,?,?,?)",
+                (
+                    provider,
+                    Database.now(),
+                    str(status),
+                    int(discovery_failed),
+                    json.dumps(sorted(set(models))),
+                ),
+            )
+
+    def latest_model_discovery(self, provider):
+        with self.database.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM model_discovery_snapshots WHERE provider=? ORDER BY id DESC LIMIT 1",
+                (provider,),
+            ).fetchone()
+        return (
+            None
+            if row is None
+            else {
+                "status": row["status"],
+                "discovery_failed": bool(row["discovery_failed"]),
+                "models": json.loads(row["models_json"]),
+                "observed_at": row["observed_at"],
+            }
+        )
+
+    def record_qdrant_probe(self, report, latency_ms):
+        errors = report.get("errors", [])
+        category = str(errors[0])[:64] if errors else None
+        with self.database.connect() as connection:
+            connection.execute(
+                "INSERT INTO qdrant_probe_snapshots(observed_at,healthy,status,latency_ms,collection_exists,vector_size,points,error_category) VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    Database.now(),
+                    int(bool(report.get("healthy"))),
+                    str(report.get("service", "unknown"))[:32],
+                    max(0.0, float(latency_ms)),
+                    int(bool(report.get("collection_exists"))),
+                    report.get("dimension"),
+                    report.get("points_count"),
+                    category,
+                ),
+            )
 
 
 class TaskRepository:
@@ -398,6 +544,106 @@ class PlanRepository:
             result = dict(row)
             result["payload"] = json.loads(result["payload"])
             return result
+
+
+class ArtifactRepository:
+    """Append-only, content-addressed task artifacts with optimistic versions."""
+
+    def __init__(self, db):
+        self.db = db
+
+    def save(self, task_id, key, content, expected_version=None):
+        if not isinstance(task_id, int) or isinstance(task_id, bool) or task_id < 1:
+            raise ValueError("task_id must be a positive integer")
+        if not isinstance(key, str) or not key.strip() or len(key) > 200:
+            raise ValueError(
+                "artifact key must be a non-empty string of at most 200 characters"
+            )
+        if not isinstance(content, str):
+            raise TypeError("artifact content must be a string")
+        if expected_version is not None and (
+            not isinstance(expected_version, int)
+            or isinstance(expected_version, bool)
+            or expected_version < 0
+        ):
+            raise ValueError("expected_version must be a non-negative integer or null")
+        with self.db.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if (
+                connection.execute(
+                    "SELECT 1 FROM tasks WHERE id=?", (task_id,)
+                ).fetchone()
+                is None
+            ):
+                raise ValueError("task not found")
+            row = connection.execute(
+                "SELECT MAX(version) AS version FROM artifacts WHERE task_id=? AND artifact_key=?",
+                (task_id, key),
+            ).fetchone()
+            current = row["version"] or 0
+            if expected_version is not None and current != expected_version:
+                raise ValueError("artifact version conflict")
+            version = current + 1
+            cursor = connection.execute(
+                "INSERT INTO artifacts(task_id,artifact_key,version,content,sha256,created_at) VALUES(?,?,?,?,?,?)",
+                (
+                    task_id,
+                    key,
+                    version,
+                    content,
+                    hashlib.sha256(content.encode()).hexdigest(),
+                    self.db.now(),
+                ),
+            )
+            from .domain import EventKind
+
+            connection.execute(
+                "INSERT INTO events(task_id,kind,payload,created_at) VALUES(?,?,?,?)",
+                (
+                    task_id,
+                    EventKind.ARTIFACT_RECORDED.value,
+                    json.dumps(
+                        {
+                            "key": key,
+                            "version": version,
+                            "sha256": hashlib.sha256(content.encode()).hexdigest(),
+                        }
+                    ),
+                    self.db.now(),
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM artifacts WHERE id=?", (cursor.lastrowid,)
+            ).fetchone()
+            return dict(row)
+
+    def latest(self, task_id, key):
+        with self.db.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM artifacts WHERE task_id=? AND artifact_key=? ORDER BY version DESC LIMIT 1",
+                (task_id, key),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def history(self, task_id, key):
+        with self.db.connect() as connection:
+            return [
+                dict(row)
+                for row in connection.execute(
+                    "SELECT * FROM artifacts WHERE task_id=? AND artifact_key=? ORDER BY version",
+                    (task_id, key),
+                )
+            ]
+
+    def latest_for_task(self, task_id):
+        with self.db.connect() as connection:
+            return [
+                dict(row)
+                for row in connection.execute(
+                    "SELECT a.* FROM artifacts a JOIN (SELECT artifact_key,MAX(version) version FROM artifacts WHERE task_id=? GROUP BY artifact_key) latest ON latest.artifact_key=a.artifact_key AND latest.version=a.version WHERE a.task_id=? ORDER BY a.artifact_key",
+                    (task_id, task_id),
+                )
+            ]
 
 
 class ValidationRepository:
@@ -749,6 +995,10 @@ class DecisionRepository:
         evidence,
         field_names,
         question_id,
+        alternatives=(),
+        outcome=None,
+        tags=(),
+        supersedes_id=None,
     ):
         from .domain import EventKind
 
@@ -757,7 +1007,7 @@ class DecisionRepository:
         with self.db.connect() as c:
             c.execute("BEGIN IMMEDIATE")
             cur = c.execute(
-                "INSERT INTO decisions(task_id,decision,rationale,created_at,category,source,evidence,field_names,question_id) VALUES(?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO decisions(task_id,decision,rationale,created_at,category,source,evidence,field_names,question_id,alternatives,outcome,tags,supersedes_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     task_id,
                     decision,
@@ -768,6 +1018,10 @@ class DecisionRepository:
                     json.dumps(evidence),
                     json.dumps(field_names),
                     question_id,
+                    json.dumps(alternatives),
+                    outcome,
+                    json.dumps(tags),
+                    supersedes_id,
                 ),
             )
             decision_id = cur.lastrowid
@@ -783,7 +1037,15 @@ class DecisionRepository:
                             "source": source,
                             "question_id": question_id,
                             "field_names": field_names,
+                            "alternatives": alternatives,
+                            "outcome": outcome,
+                            "tags": tags,
                             "evidence_refs": [item["ref"] for item in evidence],
+                            **(
+                                {"supersedes_id": supersedes_id}
+                                if supersedes_id is not None
+                                else {}
+                            ),
                         }
                     ),
                     now,
@@ -798,6 +1060,8 @@ class DecisionRepository:
         result = dict(row)
         result["evidence"] = json.loads(result["evidence"])
         result["field_names"] = json.loads(result["field_names"])
+        result["alternatives"] = json.loads(result["alternatives"])
+        result["tags"] = json.loads(result["tags"])
         return result
 
     def get(self, decision_id):

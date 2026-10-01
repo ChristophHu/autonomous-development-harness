@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import json
 import logging
+import math
+import os
 import re
+import resource
+import sys
+import time
 from datetime import UTC, datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -85,6 +90,73 @@ class ObservabilityService:
     def __init__(self, database, event_kinds):
         self.database = database
         self.event_kinds = tuple(sorted(str(item.value) for item in event_kinds))
+        self.started_monotonic = time.monotonic()
+
+    def runtime_metrics(self):
+        """Return bounded process and local SQLite resource gauges."""
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        rss_bytes = int(rss if sys.platform == "darwin" else rss * 1024)
+        try:
+            database_bytes = os.stat(self.database.path).st_size
+        except OSError:
+            database_bytes = 0
+        return {
+            "uptime_seconds": round(
+                max(0.0, time.monotonic() - self.started_monotonic), 3
+            ),
+            "process_max_rss_bytes": rss_bytes,
+            "database_bytes": database_bytes,
+        }
+
+    @staticmethod
+    def _prometheus_number(value):
+        if value is None or not math.isfinite(float(value)):
+            return "NaN"
+        return format(float(value), ".12g")
+
+    def prometheus(self):
+        """Export aggregate metrics only; never turn persisted names into labels."""
+        report = self.metrics()
+        counters = {
+            "harness_tasks_total": report["tasks"]["total"],
+            "harness_events_total": report["events"]["total"],
+            "harness_model_runs_total": report["models"]["runs"],
+            "harness_prompt_tokens_total": report["models"]["prompt_tokens"],
+            "harness_completion_tokens_total": report["models"]["completion_tokens"],
+            "harness_tool_calls_total": report["tools"]["total"],
+            "harness_validations_total": sum(report["validations"].values()),
+            "harness_validations_valid_total": report["validations"]["valid"],
+            "harness_validations_invalid_total": report["validations"]["invalid"],
+        }
+        gauges = {
+            "harness_model_cost_total": report["models"]["cost"],
+            "harness_tool_call_duration_ms_average": report["tools"]["latency_ms"][
+                "average"
+            ],
+            "harness_tool_call_duration_ms_maximum": report["tools"]["latency_ms"][
+                "maximum"
+            ],
+            "harness_qdrant_probe_latency_ms": report["qdrant"]["latest_latency_ms"],
+            "harness_qdrant_collection_points": report["qdrant"]["points"],
+            "harness_qdrant_probe_age_seconds": report["qdrant"]["probe_age_seconds"],
+        }
+        counters["harness_qdrant_probes_total"] = report["qdrant"]["probes"]
+        gauges["harness_qdrant_healthy"] = report["qdrant"]["healthy"]
+        gauges["harness_process_uptime_seconds"] = report["runtime"]["uptime_seconds"]
+        gauges["harness_process_max_rss_bytes"] = report["runtime"][
+            "process_max_rss_bytes"
+        ]
+        gauges["harness_sqlite_database_bytes"] = report["runtime"]["database_bytes"]
+        lines = []
+        for name, value in (*counters.items(), *gauges.items()):
+            metric_type = "counter" if name in counters else "gauge"
+            lines.extend(
+                (
+                    f"# TYPE {name} {metric_type}",
+                    f"{name} {self._prometheus_number(value)}",
+                )
+            )
+        return "\n".join(lines) + "\n"
 
     def metrics(self):
         with self.database.connect() as connection:
@@ -107,7 +179,80 @@ class ObservabilityService:
                 "THEN 1 ELSE 0 END) AS missing_usage "
                 "FROM model_runs"
             ).fetchone()
+            qdrant = connection.execute(
+                "SELECT COUNT(*) AS probes, MAX(id) AS latest_id FROM qdrant_probe_snapshots"
+            ).fetchone()
+            latest_qdrant = (
+                connection.execute(
+                    "SELECT healthy,latency_ms,points,status,"
+                    "MAX(0,(julianday('now')-julianday(observed_at))*86400) AS age_seconds "
+                    "FROM qdrant_probe_snapshots WHERE id=?",
+                    (qdrant["latest_id"],),
+                ).fetchone()
+                if qdrant["latest_id"] is not None
+                else None
+            )
+            agent_runs = {
+                row["status"]: row["count"]
+                for row in connection.execute(
+                    "SELECT status, COUNT(*) AS count FROM agent_runs GROUP BY status"
+                )
+            }
+            tool_calls = {
+                row["status"]: row["count"]
+                for row in connection.execute(
+                    "SELECT status, COUNT(*) AS count FROM tool_calls GROUP BY status"
+                )
+            }
+            tool_rows = connection.execute(
+                "SELECT tool, status, COUNT(*) AS count, "
+                "AVG(CASE WHEN finished_at IS NOT NULL THEN "
+                "MAX(0, (julianday(finished_at)-julianday(started_at))*86400000) END) "
+                "AS average_ms, "
+                "MAX(CASE WHEN finished_at IS NOT NULL THEN "
+                "MAX(0, (julianday(finished_at)-julianday(started_at))*86400000) END) "
+                "AS maximum_ms, "
+                "SUM(CASE WHEN finished_at IS NOT NULL THEN 1 ELSE 0 END) AS samples "
+                "FROM tool_calls GROUP BY tool, status ORDER BY tool, status"
+            ).fetchall()
+            validations = {
+                "valid": connection.execute(
+                    "SELECT COUNT(*) FROM validations WHERE valid=1"
+                ).fetchone()[0],
+                "invalid": connection.execute(
+                    "SELECT COUNT(*) FROM validations WHERE valid=0"
+                ).fetchone()[0],
+            }
         model_runs = dict(model)
+        tools_by_name = {}
+        tools_by_transport = {}
+        latencies = []
+        for row in tool_rows:
+            summary = tools_by_name.setdefault(
+                row["tool"], {"total": 0, "by_status": {}}
+            )
+            summary["total"] += row["count"]
+            summary["by_status"][row["status"]] = row["count"]
+            transport = "mcp" if row["tool"].startswith("mcp.") else "native"
+            transport_summary = tools_by_transport.setdefault(
+                transport, {"total": 0, "by_status": {}}
+            )
+            transport_summary["total"] += row["count"]
+            transport_summary["by_status"][row["status"]] = row["count"]
+            if row["samples"]:
+                latencies.append(
+                    (
+                        row["average_ms"] * row["samples"],
+                        row["maximum_ms"],
+                        row["samples"],
+                    )
+                )
+        latency_samples = sum(item[2] for item in latencies)
+        latency_average = (
+            sum(item[0] for item in latencies) / latency_samples
+            if latency_samples
+            else None
+        )
         for key in ("prompt_tokens", "completion_tokens", "cost"):
             if model_runs[key] is None:
                 model_runs[key] = 0
@@ -119,4 +264,36 @@ class ObservabilityService:
                 "catalogue": list(self.event_kinds),
             },
             "models": model_runs,
+            "agents": {"total": sum(agent_runs.values()), "by_status": agent_runs},
+            "tools": {
+                "total": sum(tool_calls.values()),
+                "by_status": tool_calls,
+                "by_name": tools_by_name,
+                "by_transport": tools_by_transport,
+                "latency_ms": {
+                    "samples": latency_samples,
+                    "average": round(latency_average, 3)
+                    if latency_average is not None
+                    else None,
+                    "maximum": round(max((item[1] for item in latencies), default=0), 3)
+                    if latency_samples
+                    else None,
+                },
+            },
+            "validations": validations,
+            "qdrant": {
+                "probes": qdrant["probes"],
+                "healthy": int(latest_qdrant["healthy"]) if latest_qdrant else 0,
+                "latest_latency_ms": round(latest_qdrant["latency_ms"], 3)
+                if latest_qdrant
+                else None,
+                "points": latest_qdrant["points"]
+                if latest_qdrant and latest_qdrant["points"] is not None
+                else 0,
+                "status": latest_qdrant["status"] if latest_qdrant else "unknown",
+                "probe_age_seconds": round(latest_qdrant["age_seconds"], 3)
+                if latest_qdrant
+                else None,
+            },
+            "runtime": self.runtime_metrics(),
         }

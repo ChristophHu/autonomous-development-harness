@@ -1,3 +1,4 @@
+import hashlib
 import json
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -38,6 +39,12 @@ def harness_context(tmp_path, monkeypatch):
     cfg.data["profiles"] = {
         name: {"model": {"primary": "local"}}
         for name in ["planner", "software-architect", "coding", "validator"]
+    }
+    cfg.data.setdefault("tools", {})["mcp"] = {
+        "servers": {
+            "files": {"enabled": False, "builtin": "filesystem"},
+            "vault": {"enabled": False, "builtin": "obsidian"},
+        }
     }
     store = Store(cfg)
     orchestrator = Orchestrator(store, cfg)
@@ -391,7 +398,9 @@ def test_health_helpers_are_fail_safe_and_sqlite_check_is_read_only(
         def __exit__(self, *_args):
             return False
 
-        def execute(self, _query):
+        def execute(self, query):
+            if query == "PRAGMA foreign_key_check":
+                return SimpleNamespace(fetchall=list)
             return SimpleNamespace(fetchone=lambda: ("corrupt",))
 
         def close(self):
@@ -411,6 +420,68 @@ def test_health_helpers_are_fail_safe_and_sqlite_check_is_read_only(
     }
 
 
+def test_sqlite_health_rejects_foreign_key_violations(tmp_path):
+    database = tmp_path / "foreign-key.db"
+    connection = cli.sqlite3.connect(database)
+    connection.executescript(
+        "CREATE TABLE parent(id INTEGER PRIMARY KEY);"
+        "CREATE TABLE child(parent_id INTEGER REFERENCES parent(id));"
+        "INSERT INTO child VALUES(999);"
+    )
+    connection.close()
+    assert cli._sqlite_health(SimpleNamespace(db=database)) == "unhealthy"
+
+
+def test_decisions_cli_query_and_get(harness_context, monkeypatch):
+    from typer.testing import CliRunner
+
+    _config, store, orchestrator, _root = harness_context
+    task = store.create(Task(title="decision CLI"))
+    from harness.decisions import DecisionService
+
+    decision = DecisionService(store).record(
+        {
+            "task_id": task.id,
+            "category": "architecture",
+            "source": "agent",
+            "decision": "Use SQLite",
+            "rationale": "Local persistence",
+            "evidence": [{"source": "task", "ref": f"task:{task.id}"}],
+            "tags": ["storage"],
+        }
+    )
+    monkeypatch.setattr(cli, "build", lambda: (_config, store, orchestrator))
+    runner = CliRunner()
+    query = runner.invoke(
+        cli.app, ["decisions", "--task-id", str(task.id), "--tag", "storage"]
+    )
+    assert query.exit_code == 0 and json.loads(query.stdout)[0]["id"] == decision.id
+    get = runner.invoke(cli.app, ["decisions", "--id", str(decision.id)])
+    assert get.exit_code == 0 and json.loads(get.stdout)[0]["decision"] == "Use SQLite"
+    missing = runner.invoke(cli.app, ["decisions", "--id", "999"])
+    assert missing.exit_code == 1 and missing.stdout.strip() == "decision not found"
+
+
+def test_artifact_cli_lists_latest_and_history(harness_context, monkeypatch):
+    from typer.testing import CliRunner
+
+    _config, store, orchestrator, _root = harness_context
+    task = store.create(Task(title="artifact CLI"))
+    store.save_artifact(task.id, "agent/step-1", "first", expected_version=0)
+    store.save_artifact(task.id, "agent/step-1", "second", expected_version=1)
+    monkeypatch.setattr(cli, "build", lambda: (_config, store, orchestrator))
+    runner = CliRunner()
+    latest = runner.invoke(cli.app, ["artifacts", "list", "--task-id", str(task.id)])
+    assert latest.exit_code == 0
+    assert json.loads(latest.stdout)[0]["content"] == "second"
+    history = runner.invoke(
+        cli.app,
+        ["artifacts", "history", "--task-id", str(task.id), "--key", "agent/step-1"],
+    )
+    assert history.exit_code == 0
+    assert [row["version"] for row in json.loads(history.stdout)] == [1, 2]
+
+
 @pytest.mark.parametrize(
     ("result", "raise_error", "expected"),
     [
@@ -428,9 +499,11 @@ def test_sqlite_health_always_closes_read_only_connection(
 
     class Connection:
         def execute(self, statement):
-            assert statement == "PRAGMA quick_check"
+            assert statement in {"PRAGMA quick_check", "PRAGMA foreign_key_check"}
             if raise_error:
                 raise cli.sqlite3.OperationalError("database detail")
+            if statement == "PRAGMA foreign_key_check":
+                return SimpleNamespace(fetchall=list)
             return SimpleNamespace(fetchone=lambda: (result,))
 
         def close(self):
@@ -1380,22 +1453,16 @@ def test_memory_status_does_not_create_a_missing_vault(harness_context, capsys):
 
 
 def test_memory_audit_reports_read_only_health(tmp_path, monkeypatch, capsys):
+    from harness.vault_audit import CURATED_NOTE_TYPES
+
     vault = tmp_path / "vault"
     vault.mkdir()
-    for relative in (
-        "Willkommen.md",
-        "Vault-Übersicht.md",
-        "rules/Harness-Prinzipien.md",
-        "architecture/Systemarchitektur.md",
-        "architecture/Vault und Memory.md",
-        "decisions/Entscheidungsregister.md",
-        "agents/Agentenprofile.md",
-        "tasks/Task-Register.md",
-    ):
+    source_digest = hashlib.sha256((cli.ROOT / "README.md").read_bytes()).hexdigest()
+    for relative, note_type in CURATED_NOTE_TYPES.items():
         path = vault / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
-            f"---\nlast_reviewed: {datetime.now(UTC).date().isoformat()}\n---\n# Note",
+            f"---\ntype: {note_type}\nlast_reviewed: {datetime.now(UTC).date().isoformat()}\nsources:\n  - path: README.md\n    sha256: {source_digest}\n---\n# Note",
             encoding="utf-8",
         )
     monkeypatch.setattr(
@@ -1406,7 +1473,7 @@ def test_memory_audit_reports_read_only_health(tmp_path, monkeypatch, capsys):
 
     report = json.loads(capsys.readouterr().out)
     assert report["healthy"] is True
-    assert report["audited_notes"] == 8
+    assert report["audited_notes"] == 11
     assert all(
         (vault / relative).is_file()
         for relative in (
@@ -1420,6 +1487,41 @@ def test_memory_audit_reports_read_only_health(tmp_path, monkeypatch, capsys):
             "tasks/Task-Register.md",
         )
     )
+
+
+def test_memory_audit_compares_read_only_sqlite_decisions(
+    tmp_path, monkeypatch, capsys
+):
+    from harness.database import Database, DecisionRepository
+
+    vault = tmp_path / "vault"
+    database = tmp_path / "harness.sqlite"
+    repository = DecisionRepository(Database(database))
+    repository.record(
+        None,
+        "architecture",
+        "human",
+        "SQLite is authoritative",
+        "local state",
+        [],
+        [],
+        None,
+    )
+    monkeypatch.setattr(
+        cli,
+        "Config",
+        lambda: SimpleNamespace(
+            path=lambda name: database if name == "database" else vault
+        ),
+    )
+    with pytest.raises(cli.typer.Exit) as exc:
+        cli.memory_audit()
+    report = json.loads(capsys.readouterr().out)
+    assert exc.value.exit_code == 1
+    assert any(
+        item["code"] == "decision_projection_missing" for item in report["findings"]
+    )
+    assert not (vault / "_harness").exists()
 
 
 def test_memory_audit_fails_closed_for_missing_vault(tmp_path, monkeypatch, capsys):
@@ -1615,16 +1717,116 @@ def test_qdrant_search_reports_only_error_type(harness_context, monkeypatch, cap
     assert "private response body" not in output
 
 
+def test_qdrant_acceptance_requires_explicit_confirmation(capsys):
+    with pytest.raises(cli.typer.Exit) as result:
+        cli.qdrant_acceptance(confirm=False)
+    assert result.value.exit_code == 2
+    assert "No provider request sent" in capsys.readouterr().out
+
+
+def test_qdrant_acceptance_checks_enabled_health_and_read_only_search(
+    harness_context, monkeypatch, capsys
+):
+    cfg, store, orchestrator, _root = harness_context
+    cfg.data["memory"]["qdrant"]["enabled"] = True
+    cfg.data["memory"]["embeddings"].update(
+        {"model": "local-embed", "dimensions": 1024}
+    )
+    monkeypatch.setattr(cli, "build", lambda: (cfg, store, orchestrator))
+    calls = []
+    monkeypatch.setattr(orchestrator.qdrant, "health_report", lambda: {"healthy": True})
+    monkeypatch.setattr(
+        orchestrator.qdrant,
+        "search",
+        lambda query, limit: calls.append((query, limit)) or [{"id": "not-output"}],
+    )
+
+    cli.qdrant_acceptance(confirm=True)
+
+    report = json.loads(capsys.readouterr().out)
+    assert report == {
+        "healthy": True,
+        "read_only": True,
+        "stage": "embedding_search",
+        "collection": cfg.data["memory"]["qdrant"]["collection"],
+        "model": "local-embed",
+        "dimension": 1024,
+        "matches": 1,
+    }
+    assert calls == [("Harness live embedding acceptance probe", 1)]
+    assert "not-output" not in json.dumps(report)
+
+
+def test_qdrant_acceptance_fails_closed_when_service_is_disabled_or_unhealthy(
+    harness_context, monkeypatch, capsys
+):
+    cfg, store, orchestrator, _root = harness_context
+    cfg.data["memory"]["qdrant"]["enabled"] = False
+    monkeypatch.setattr(cli, "build", lambda: (cfg, store, orchestrator))
+    with pytest.raises(cli.typer.Exit) as result:
+        cli.qdrant_acceptance(confirm=True)
+    assert result.value.exit_code == 1
+    assert "disabled" in capsys.readouterr().out
+
+    cfg.data["memory"]["qdrant"]["enabled"] = True
+    monkeypatch.setattr(
+        orchestrator.qdrant,
+        "health_report",
+        lambda: {"healthy": False, "errors": ["collection_missing"]},
+    )
+    with pytest.raises(cli.typer.Exit) as result:
+        cli.qdrant_acceptance(confirm=True)
+    assert result.value.exit_code == 1
+    assert json.loads(capsys.readouterr().out)["stage"] == "qdrant_health"
+
+
+@pytest.mark.parametrize("search_result", [RuntimeError("private"), {"bad": "shape"}])
+def test_qdrant_acceptance_redacts_errors_and_rejects_invalid_results(
+    harness_context, monkeypatch, capsys, search_result
+):
+    cfg, store, orchestrator, _root = harness_context
+    cfg.data["memory"]["qdrant"]["enabled"] = True
+    monkeypatch.setattr(cli, "build", lambda: (cfg, store, orchestrator))
+    monkeypatch.setattr(orchestrator.qdrant, "health_report", lambda: {"healthy": True})
+    if isinstance(search_result, Exception):
+
+        def fail_search(*_args, **_kwargs):
+            raise search_result
+
+        search = fail_search
+    else:
+        search = lambda *_args, **_kwargs: search_result
+    monkeypatch.setattr(orchestrator.qdrant, "search", search)
+
+    with pytest.raises(cli.typer.Exit) as result:
+        cli.qdrant_acceptance(confirm=True)
+    assert result.value.exit_code == 1
+    output = capsys.readouterr().out
+    assert "embedding_search" in output
+    assert "private" not in output
+
+
 def test_metrics_command_prints_structured_durable_counters(harness_context, capsys):
     _cfg, store, _orchestrator, _root = harness_context
     task = store.create(Task(title="metrics"))
     store.event(task.id, "task.created", {})
 
-    cli.runtime_metrics()
+    cli.runtime_metrics(format="json")
 
     report = json.loads(capsys.readouterr().out)
     assert report["tasks"]["by_status"]["pending"] == 1
     assert report["events"]["total"] == 1
+
+
+def test_metrics_command_prints_prometheus_or_rejects_unknown_format(
+    harness_context, capsys
+):
+    cli.runtime_metrics(format="prometheus")
+    assert "harness_tasks_total 0" in capsys.readouterr().out
+    with pytest.raises(cli.typer.Exit) as error:
+        cli.runtime_metrics(format="xml")
+    assert error.value.exit_code == 2
+    assert "json or 'prometheus'" in capsys.readouterr().out
 
 
 def test_completion_command_reports_gap_count_and_returns_incomplete(
@@ -1649,8 +1851,10 @@ def test_completion_command_reports_gap_count_and_returns_incomplete(
     assert report["complete"] is False
 
 
-def test_completion_command_accepts_a_fully_satisfied_matrix(harness_context, capsys):
-    _cfg, _store, _orchestrator, root = harness_context
+def test_completion_command_accepts_a_fully_satisfied_matrix(
+    harness_context, monkeypatch, capsys
+):
+    cfg, store, _orchestrator, root = harness_context
     rows = "".join(
         f"| {number} | item | Erfüllt | evidence |\n" for number in range(1, 110)
     )
@@ -1669,10 +1873,29 @@ def test_completion_command_accepts_a_fully_satisfied_matrix(harness_context, ca
     write_verification_report(
         matrix_path, coverage_path, junit_path, root / "data" / "verification.json"
     )
+    from datetime import UTC, datetime
+
+    from harness.evidence import EvidenceInput, EvidenceRepository
+    from harness.verification import source_tree_sha256
+
+    cfg.data["verification"] = {"required_evidence": ["qdrant"]}
+    monkeypatch.setattr(cli, "Config", lambda: cfg)
+    EvidenceRepository(store.database).record(
+        EvidenceInput(
+            kind="qdrant",
+            source_id="test-qdrant",
+            observed_at=datetime.now(UTC),
+            subject_sha256=source_tree_sha256(root),
+            passed=True,
+            checks={"health": True},
+        )
+    )
 
     cli.completion_status()
 
-    assert json.loads(capsys.readouterr().out)["complete"] is True
+    result = json.loads(capsys.readouterr().out)
+    assert result["complete"] is True
+    assert result["evidence_policy_valid"] is True
 
 
 def test_completion_command_fails_closed_on_invalid_matrix(harness_context, capsys):
@@ -1686,3 +1909,34 @@ def test_completion_command_fails_closed_on_invalid_matrix(harness_context, caps
 
     assert error.value.exit_code == 2
     assert "unverifiable" in capsys.readouterr().out
+
+
+def test_completion_enforces_configured_evidence_policy(
+    harness_context, monkeypatch, capsys
+):
+    import typer
+    from test_completion import coverage_report
+
+    from harness.verification import write_verification_report
+
+    cfg, _store, _orchestrator, root = harness_context
+    cfg.data["verification"] = {"required_evidence": ["qdrant"], "max_age_hours": 168}
+    monkeypatch.setattr(cli, "Config", lambda: cfg)
+    matrix_path = root / "GAP_MATRIX.md"
+    rows = "".join(f"| {n} | item | Erfüllt | evidence |\n" for n in range(1, 110))
+    matrix_path.write_text(
+        "| Nr. | Name | Status | Tiefe |\n|---:|---|---|---|\n" + rows
+    )
+    coverage_path = root / "coverage.json"
+    coverage_path.write_text(json.dumps(coverage_report()))
+    junit_path = root / "junit.xml"
+    junit_path.write_text('<testsuite tests="1"><testcase name="ok" /></testsuite>')
+    write_verification_report(
+        matrix_path, coverage_path, junit_path, root / "data" / "verification.json"
+    )
+    with pytest.raises(typer.Exit) as error:
+        cli.completion_status()
+    report = json.loads(capsys.readouterr().out)
+    assert error.value.exit_code == 1
+    assert report["required_evidence"] == {"qdrant": False}
+    assert report["evidence_policy_valid"] is False

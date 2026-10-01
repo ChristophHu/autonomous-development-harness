@@ -66,6 +66,7 @@ class EventKind(StrEnum):
     CORRECTION_STARTED = "correction.started"
     CORRECTION_ITEM_RECORDED = "correction.item_recorded"
     CORRECTION_ITEM_STATUS = "correction.item_status"
+    ARTIFACT_RECORDED = "artifact.recorded"
     GIT_WORKFLOW = "git.workflow"
     GIT_WORKFLOW_CLASSIFIED = "git.workflow_classified"
     GIT_REPAIR_REQUESTED = "git.repair_requested"

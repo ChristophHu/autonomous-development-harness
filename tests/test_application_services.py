@@ -1,6 +1,8 @@
 import pytest
 from test_evidence_workflow import ready_runtime
 
+from harness.providers import ProviderHealth
+
 
 def test_task_service_shares_status_queries_and_sanitized_task_inspection(tmp_path):
     store, orchestrator, task = ready_runtime(tmp_path)
@@ -30,6 +32,131 @@ def test_task_service_routes_question_creation_and_unscoped_event_cursor(tmp_pat
     assert store.questions.get(question_id)["task_id"] == created.id
     store.event(created.id, "task.created", {})
     assert orchestrator.service.events_after(0) == store.events.after(0)
+
+
+def test_model_operations_service_shares_health_and_inventory_contracts(tmp_path):
+    from types import SimpleNamespace
+
+    _store, orchestrator, _task = ready_runtime(tmp_path)
+    registry = orchestrator.models
+    registry.providers = {}
+    registry.models = {
+        "configured": {"provider": "local", "model": "loaded", "tier": "local"},
+        "missing": {"provider": "offline", "model": "not-loaded"},
+    }
+    registry.register(
+        "local",
+        SimpleNamespace(
+            health_report=lambda: ProviderHealth(
+                "openai_compatible", True, True, ("loaded", "discovered")
+            )
+        ),
+    )
+    service = orchestrator.model_operations
+    inventory = service.model_inventory()
+    assert service.provider_health() == {"local": "available"}
+    assert inventory == [
+        {
+            "provider": "local",
+            "status": "available",
+            "discovery_failed": False,
+            "models": [
+                {
+                    "id": "loaded",
+                    "alias": "configured",
+                    "tier": "local",
+                    "status": "available",
+                },
+                {
+                    "id": "discovered",
+                    "alias": "-",
+                    "tier": "unknown",
+                    "status": "available",
+                },
+            ],
+        },
+        {
+            "provider": "offline",
+            "status": "unavailable",
+            "discovery_failed": False,
+            "models": [
+                {
+                    "id": "not-loaded",
+                    "alias": "missing",
+                    "tier": "unknown",
+                    "status": "unavailable",
+                }
+            ],
+        },
+    ]
+
+
+def test_model_operations_service_handles_failed_discovery_without_details(tmp_path):
+    from types import SimpleNamespace
+
+    _store, orchestrator, _task = ready_runtime(tmp_path)
+
+    def fail():
+        raise OSError("secret provider detail")
+
+    orchestrator.models.register(
+        "offline", SimpleNamespace(health=lambda: True, models=fail)
+    )
+    orchestrator.models.providers = {
+        "offline": orchestrator.models.providers["offline"]
+    }
+    orchestrator.models.models = {}
+    inventory = orchestrator.model_operations.model_inventory()
+    assert inventory == [
+        {
+            "provider": "offline",
+            "status": "available",
+            "discovery_failed": True,
+            "models": [],
+        }
+    ]
+
+
+def test_model_discovery_uses_last_good_inventory_marked_stale(tmp_path):
+    from types import SimpleNamespace
+
+    from harness.database import OperationalSnapshotRepository
+    from harness.services import ModelOperationsService
+
+    store, _orchestrator, _task = ready_runtime(tmp_path)
+    snapshots = OperationalSnapshotRepository(store.database)
+    provider = SimpleNamespace(
+        health_report=lambda: ProviderHealth(
+            "openai_compatible", True, True, ("cached-model",)
+        )
+    )
+    registry = SimpleNamespace(providers={"local": provider}, models={}, discovered={})
+    service = ModelOperationsService(registry, snapshots)
+    assert service.model_inventory()[0]["models"][0]["status"] == "available"
+    provider.health_report = lambda: ProviderHealth(
+        "openai_compatible", True, False, ()
+    )
+    stale = service.model_inventory()[0]
+    assert stale["discovery_failed"] is True
+    assert stale["models"] == [
+        {"id": "cached-model", "alias": "-", "tier": "unknown", "status": "stale"}
+    ]
+    assert snapshots.latest_model_discovery("local")["models"] == ["cached-model"]
+
+
+def test_model_inventory_can_run_without_persistence(tmp_path):
+    from types import SimpleNamespace
+
+    from harness.services import ModelOperationsService
+
+    provider = SimpleNamespace(
+        health_report=lambda: ProviderHealth(
+            "openai_compatible", True, True, ("model-a",)
+        )
+    )
+    registry = SimpleNamespace(providers={"local": provider}, models={}, discovered={})
+    result = ModelOperationsService(registry).model_inventory()
+    assert result[0]["models"][0]["id"] == "model-a"
 
 
 @pytest.mark.parametrize(

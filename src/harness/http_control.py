@@ -7,13 +7,113 @@ import threading
 from concurrent.futures import Future
 from contextlib import suppress
 
+import httpcore
 import httpx
 
 from .process_control import current_run_control
 
 
+def _host_key(host, port):
+    if isinstance(host, bytes):
+        host = host.decode("ascii")
+    return host.casefold(), port
+
+
+class _PinnedSyncBackend(httpcore.NetworkBackend):
+    def __init__(self, addresses):
+        self.addresses = addresses
+        self.backend = httpcore.SyncBackend()
+
+    def connect_tcp(
+        self,
+        host,
+        port,
+        timeout=None,
+        local_address=None,
+        socket_options=None,
+    ):
+        address = self.addresses.get(_host_key(host, port))
+        if address is None:
+            raise httpcore.ConnectError("HTTP destination was not pinned")
+        return self.backend.connect_tcp(
+            address,
+            port,
+            timeout=timeout,
+            local_address=local_address,
+            socket_options=socket_options,
+        )
+
+    def connect_unix_socket(self, path, timeout=None, socket_options=None):
+        raise httpcore.ConnectError("Unix sockets are not permitted for HTTP tools")
+
+    def sleep(self, seconds):
+        return self.backend.sleep(seconds)
+
+
+class _PinnedAsyncBackend(httpcore.AsyncNetworkBackend):
+    def __init__(self, addresses):
+        self.addresses = addresses
+        self.backend = httpcore.AnyIOBackend()
+
+    async def connect_tcp(
+        self,
+        host,
+        port,
+        timeout=None,
+        local_address=None,
+        socket_options=None,
+    ):
+        address = self.addresses.get(_host_key(host, port))
+        if address is None:
+            raise httpcore.ConnectError("HTTP destination was not pinned")
+        return await self.backend.connect_tcp(
+            address,
+            port,
+            timeout=timeout,
+            local_address=local_address,
+            socket_options=socket_options,
+        )
+
+    async def connect_unix_socket(self, path, timeout=None, socket_options=None):
+        raise httpcore.ConnectError("Unix sockets are not permitted for HTTP tools")
+
+    async def sleep(self, seconds):
+        return await self.backend.sleep(seconds)
+
+
+def _pinned_transport(pins, *, asynchronous):
+    pins = {
+        _host_key(host, port): str(resolved[0])
+        for host, port, resolved in pins
+        if resolved
+    }
+    if not pins:
+        raise ValueError("at least one pinned HTTP address is required")
+    transport = (
+        httpx.AsyncHTTPTransport(trust_env=False)
+        if asynchronous
+        else httpx.HTTPTransport(trust_env=False)
+    )
+    pool = getattr(transport, "_pool", None)
+    if pool is None or not hasattr(pool, "_network_backend"):
+        raise RuntimeError("HTTP transport does not support enforced IP pinning")
+    pool._network_backend = (
+        _PinnedAsyncBackend(pins) if asynchronous else _PinnedSyncBackend(pins)
+    )
+    return transport
+
+
 def request(
-    method, url, *, timeout, client=None, transport=None, owned_client=False, **kwargs
+    method,
+    url,
+    *,
+    timeout,
+    client=None,
+    transport=None,
+    owned_client=False,
+    follow_redirects=False,
+    pinned_addresses=None,
+    **kwargs,
 ):
     """Use the existing sync API outside tasks and cancellable I/O inside them."""
     if isinstance(timeout, dict):
@@ -32,10 +132,24 @@ def request(
         if control is not None:
             control.check()
         if client is None:
-            response = httpx.request(method, url, timeout=limits, **kwargs)
+            if pinned_addresses:
+                pinned_transport = _pinned_transport(
+                    pinned_addresses, asynchronous=False
+                )
+                with httpx.Client(transport=pinned_transport) as pinned_client:
+                    return pinned_client.request(
+                        method,
+                        url,
+                        timeout=limits,
+                        follow_redirects=follow_redirects,
+                        **kwargs,
+                    )
+            response = httpx.request(
+                method, url, timeout=limits, follow_redirects=follow_redirects, **kwargs
+            )
         else:
             response = getattr(sync_client, method.lower())(
-                url, timeout=limits, **kwargs
+                url, timeout=limits, follow_redirects=follow_redirects, **kwargs
             )
         if control is not None:
             control.check()
@@ -46,8 +160,20 @@ def request(
     running = {}
 
     async def perform():
-        async with httpx.AsyncClient(transport=transport) as async_client:
-            return await async_client.request(method, url, timeout=limits, **kwargs)
+        selected_transport = transport
+        if selected_transport is None and pinned_addresses:
+            selected_transport = _pinned_transport(pinned_addresses, asynchronous=True)
+        async with httpx.AsyncClient(
+            transport=selected_transport,
+            trust_env=not (pinned_addresses and transport is None),
+        ) as async_client:
+            return await async_client.request(
+                method,
+                url,
+                timeout=limits,
+                follow_redirects=follow_redirects,
+                **kwargs,
+            )
 
     async def main():
         control.check()

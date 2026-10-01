@@ -1,4 +1,5 @@
 import asyncio
+import ipaddress
 import json
 import uuid
 from types import SimpleNamespace
@@ -421,8 +422,14 @@ def test_http_tool_response_status_is_actually_checked(tmp_path, monkeypatch, st
     store, orchestrator = runtime(tmp_path)
     orchestrator.tools.permissions.rules["http"] = "write"
     orchestrator.tools.executor.http_allow_hosts.add("fixture")
+    orchestrator.tools.executor.http_resolver = lambda _host, _port: [
+        ipaddress.ip_address("93.184.216.34")
+    ]
     response = httpx.Response(status, request=httpx.Request("GET", "http://fixture"))
-    monkeypatch.setattr(httpx, "request", lambda *a, **kw: response)
+    monkeypatch.setattr(
+        "harness.http_control._pinned_transport",
+        lambda *_args, **_kwargs: httpx.MockTransport(lambda _request: response),
+    )
     if status == 200:
         assert (
             orchestrator.tools.execute(

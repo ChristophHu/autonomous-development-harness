@@ -3,12 +3,16 @@
 import hashlib
 import json
 import os
+import re
 import tempfile
 import xml.etree.ElementTree as ET
 from datetime import UTC, datetime
 from pathlib import Path
 
 from .coverage_gate import assert_full_coverage
+
+_MATRIX_REPORT_START = "<!-- VERIFY-RESULT:START -->"
+_MATRIX_REPORT_END = "<!-- VERIFY-RESULT:END -->"
 
 
 def source_tree_sha256(root):
@@ -48,22 +52,93 @@ def _counts(junit_path):
     }
 
 
+def _matrix_status_counts(content):
+    statuses = re.findall(
+        r"^\|\s*\d+\s*\|[^\n|]*\|\s*(Erfüllt|Teilweise|Offen)\s*\|",
+        content,
+        flags=re.MULTILINE,
+    )
+    return {
+        status: statuses.count(status) for status in ("Erfüllt", "Teilweise", "Offen")
+    }
+
+
+def _refresh_matrix(path, report_line):
+    content = path.read_text(encoding="utf-8")
+    block = f"{_MATRIX_REPORT_START}\n{report_line}\n{_MATRIX_REPORT_END}"
+    markers_present = _MATRIX_REPORT_START in content or _MATRIX_REPORT_END in content
+    if markers_present:
+        if (
+            content.count(_MATRIX_REPORT_START) != 1
+            or content.count(_MATRIX_REPORT_END) != 1
+        ):
+            raise ValueError("verification report markers are malformed")
+        start = content.index(_MATRIX_REPORT_START)
+        end = content.index(_MATRIX_REPORT_END) + len(_MATRIX_REPORT_END)
+        if end < start:
+            raise ValueError("verification report markers are malformed")
+        content = content[:start] + block + content[end:]
+    else:
+        heading_end = content.find("\n")
+        if heading_end < 0:
+            content = content + "\n\n" + block + "\n"
+        else:
+            content = (
+                content[: heading_end + 1]
+                + "\n"
+                + block
+                + "\n\n"
+                + content[heading_end + 1 :]
+            )
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=path.parent, delete=False
+    ) as stream:
+        temporary = Path(stream.name)
+        try:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+    return content
+
+
 def write_verification_report(matrix_path, coverage_path, junit_path, output_path):
     """Atomically write a report; caller invokes only after every verify check passes."""
-    matrix = Path(matrix_path).read_bytes()
+    matrix_file = Path(matrix_path)
     coverage = Path(coverage_path).read_bytes()
-    assert_full_coverage(json.loads(coverage))
+    modules = assert_full_coverage(json.loads(coverage))
     counts = _counts(junit_path)
     if not counts["total"]:
         raise ValueError("verification report requires at least one test")
     if counts["passed"] != counts["total"]:
         raise ValueError("verification report cannot record failed or skipped tests")
+    matrix_text = matrix_file.read_text(encoding="utf-8")
+    statuses = _matrix_status_counts(matrix_text)
+    coverage_data = json.loads(coverage)
+    statement_total = sum(
+        module["summary"]["num_statements"]
+        for module in coverage_data["files"].values()
+    )
+    branch_total = sum(
+        module["summary"]["num_branches"] for module in coverage_data["files"].values()
+    )
+    report_line = (
+        f"Aktueller automatischer Verifikationsstand: {counts['passed']} Tests bestanden, "
+        f"0 fehlgeschlagen/übersprungen; 100 % Statements/Branches/Funktionen "
+        f"({statement_total} Statements, {branch_total} Branches, {len(modules)} Module, "
+        f"{sum(module['functions'] for module in modules.values())} Funktionen); "
+        f"Ruff und Formatcheck bestanden. GAP-Zählung aus Matrixzeilen: "
+        f"{statuses['Erfüllt']} erfüllt, {statuses['Teilweise']} teilweise, {statuses['Offen']} offen."
+    )
+    matrix_text = _refresh_matrix(matrix_file, report_line)
     report = {
         "schema_version": 1,
         "passed": True,
         "checks": ["pytest", "coverage", "ruff", "format"],
         "completed_at": datetime.now(UTC).isoformat(),
-        "matrix_sha256": hashlib.sha256(matrix).hexdigest(),
+        "matrix_sha256": hashlib.sha256(matrix_text.encode()).hexdigest(),
         "coverage_sha256": hashlib.sha256(coverage).hexdigest(),
         "source_sha256": source_tree_sha256(Path(matrix_path).parent),
         "tests": counts,

@@ -20,6 +20,7 @@ from harness.configuration import HarnessConfig
 from harness.core import Config, Permissions
 from harness.mcp import MCPClient, MCPError, builtin_filesystem_command
 from harness.mcp_servers.filesystem import FilesystemServer, _response
+from harness.process_control import RunControl, TaskCancelled, use_run_control
 from harness.tools import ToolExecutionError, ToolRegistry
 
 
@@ -59,6 +60,7 @@ def test_external_server_requires_explicit_trusted_local_acknowledgement():
                             "command": ["/bin/echo"],
                             "allow_tools": ["echo"],
                             "trusted_local": True,
+                            "read_roots": ["."],
                         }
                     }
                 }
@@ -66,6 +68,71 @@ def test_external_server_requires_explicit_trusted_local_acknowledgement():
         }
     )
     assert settings.tools.mcp.servers["external"].trusted_local
+    with pytest.raises(ValidationError, match="requires explicit read_roots"):
+        HarnessConfig.model_validate(
+            {
+                "tools": {
+                    "mcp": {
+                        "servers": {
+                            "external": {
+                                "command": ["/bin/echo"],
+                                "allow_tools": ["echo"],
+                                "trusted_local": True,
+                            }
+                        }
+                    }
+                }
+            }
+        )
+
+
+def test_stdio_mcp_process_tree_is_registered_and_killed_on_task_abort(
+    tmp_path, monkeypatch
+):
+    from harness import mcp
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    child_started = tmp_path / "child-started"
+    child_survived = tmp_path / "child-survived"
+    child_code = (
+        "import time; from pathlib import Path; time.sleep(0.6); "
+        f"Path({str(child_survived)!r}).touch()"
+    )
+    server_code = (
+        "import signal,subprocess,sys,time; from pathlib import Path; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        f"subprocess.Popen([sys.executable,'-c',{child_code!r}]); "
+        f"Path({str(child_started)!r}).touch(); time.sleep(30)"
+    )
+    real_popen = subprocess.Popen
+    control = RunControl()
+
+    def start_server(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        deadline = time.monotonic() + 2
+        while not child_started.exists() and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert child_started.exists()
+        return process
+
+    monkeypatch.setattr(
+        mcp, "isolated_command", lambda command, *_args, **_kwargs: command
+    )
+    monkeypatch.setattr(mcp.subprocess, "Popen", start_server)
+    client = MCPClient([sys.executable, "-c", server_code], workspace)
+
+    def abort_before_first_rpc(process):
+        control.stop_event.set()
+        RunControl.register(control, process)
+
+    monkeypatch.setattr(control, "register", abort_before_first_rpc)
+    with use_run_control(control), pytest.raises(TaskCancelled):
+        client.discover()
+
+    time.sleep(0.7)
+    assert not control._processes
+    assert not child_survived.exists()
 
 
 def test_obsidian_server_reads_only_visible_markdown_in_vault(tmp_path):
@@ -191,6 +258,30 @@ def test_obsidian_registry_rejects_unexpected_builtin_tool(tmp_path, monkeypatch
     )
     with pytest.raises(ValueError, match="unknown tool"):
         ToolRegistry(Permissions(config), workspace=workspace)
+
+
+def test_builtin_mcp_isolation_includes_python_base_runtime(tmp_path, monkeypatch):
+    from harness import mcp
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    config = Config()
+    config.data["paths"]["obsidian_vault"] = str(vault)
+    config.data["tools"] = {"mcp": {"servers": {"vault": {"builtin": "obsidian"}}}}
+    captured = {}
+
+    class Client:
+        def __init__(self, _command, _workspace, *, read_roots, **_kwargs):
+            captured["read_roots"] = read_roots
+
+        def discover(self):
+            return []
+
+    monkeypatch.setattr(mcp, "MCPClient", Client)
+    ToolRegistry(Permissions(config), workspace=workspace)
+    assert Path(sys.base_prefix) in captured["read_roots"]
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="macOS sandbox-exec acceptance")
@@ -894,6 +985,7 @@ def test_external_mcp_requires_explicit_tool_and_write_grant(tmp_path, monkeypat
                     "command": [sys.executable, "-c", FAKE_SERVER, "ok"],
                     "allow_tools": ["echo"],
                     "trusted_local": True,
+                    "read_roots": ["."],
                 }
             }
         },
@@ -1015,6 +1107,7 @@ def test_mcp_output_schema_is_enforced_without_exposing_result(tmp_path, monkeyp
                     "command": [sys.executable, "-c", FAKE_SERVER, "output_mismatch"],
                     "allow_tools": ["echo"],
                     "trusted_local": True,
+                    "read_roots": ["."],
                 }
             }
         },
@@ -1043,14 +1136,17 @@ def test_client_checks_run_control_and_write_deadline(tmp_path, monkeypatch):
         mcp, "isolated_command", lambda command, *_args, **_kwargs: command
     )
     checks = []
-    monkeypatch.setattr(
-        mcp,
-        "current_run_control",
-        lambda: SimpleNamespace(check=lambda: checks.append(True)),
+    registered = set()
+    control = SimpleNamespace(
+        check=lambda: checks.append(True),
+        register=registered.add,
+        unregister=registered.remove,
     )
+    monkeypatch.setattr(mcp, "current_run_control", lambda: control)
     client = MCPClient([sys.executable, "-c", FAKE_SERVER, "ok"], root)
     assert client.discover()[0]["name"] == "echo"
     assert len(checks) >= 2
+    assert not registered
     original_select = mcp.select.select
     monkeypatch.setattr(
         mcp.select,

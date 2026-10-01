@@ -271,13 +271,22 @@ def test_agent_output_schemas_reject_extra_fields_and_coercion():
             parse_model_output(RequirementProposal, raw, agent="requirements")
     review = parse_model_output(
         IndependentReviewOutput,
-        '{"requirements":{"R":true},"criteria":{"C":true},"evidence":"checked"}',
+        '{"requirements":{"R":true},"criteria":{"C":true},"evidence":"checked",'
+        '"requirement_evidence":{"R":["file:a.py"]},'
+        '"criterion_evidence":{"C":["criterion:C"]}}',
         agent="independent_review",
     )
     assert review.requirements["R"] is True
     for raw in (
-        '{"requirements":{"R":1},"criteria":{"C":true},"evidence":"x"}',
-        '{"requirements":{},"criteria":{},"evidence":"x","extra":1}',
+        (
+            '{"requirements":{"R":1},"criteria":{"C":true},"evidence":"x",'
+            '"requirement_evidence":{"R":["file:a.py"]},'
+            '"criterion_evidence":{"C":["criterion:C"]}}'
+        ),
+        (
+            '{"requirements":{},"criteria":{},"evidence":"x",'
+            '"requirement_evidence":{},"criterion_evidence":{},"extra":1}'
+        ),
     ):
         with pytest.raises(StructuredOutputError):
             parse_model_output(IndependentReviewOutput, raw, agent="review")

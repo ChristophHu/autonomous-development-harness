@@ -138,6 +138,35 @@ def test_reconcile_skips_symlinks_and_is_idempotent(tmp_path):
     }
 
 
+def test_qdrant_index_excludes_generated_and_hidden_vault_documents(tmp_path):
+    notes, _vectors, service = lifecycle(tmp_path)
+    notes.write("rules/Harness-Prinzipien", "Keep memory local.")
+    notes.write("tasks/Task-Register", "Current tasks.")
+    notes.write("tasks/42/plan", "Generated historical snapshot.")
+    notes.write("_harness/decisions/42", "Generated projection.")
+    (notes.vault / ".obsidian").mkdir()
+    (notes.vault / ".obsidian/plugins.md").write_text("Private app metadata")
+
+    assert notes.list_documents() == ["rules/Harness-Prinzipien", "tasks/Task-Register"]
+    assert service.reconcile()["notes"] == 2
+
+
+def test_memory_search_returns_current_original_note_with_source(tmp_path):
+    notes, _vectors, service = lifecycle(tmp_path)
+    notes.write("architecture/Systemarchitektur", "SQLite stays authoritative.")
+    service.index("architecture/Systemarchitektur")
+
+    assert service.search("SQLite", limit=3) == [
+        {
+            "id": "obsidian:architecture/Systemarchitektur:0",
+            "payload": {
+                "source": "architecture/Systemarchitektur",
+                "text": "SQLite stays authoritative.",
+            },
+        }
+    ]
+
+
 def test_unindex_without_points_and_reconcile_ignores_foreign_payloads(tmp_path):
     _notes, vectors, service = lifecycle(tmp_path)
     assert service.unindex("missing") == 0

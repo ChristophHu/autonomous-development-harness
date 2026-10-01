@@ -5,11 +5,14 @@ from typing import Any, Literal
 
 from fastapi import APIRouter, FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, StrictStr
 
 from .core import Event, Task, build
+from .decisions import Decision, DecisionService
 from .domain import AcceptanceCriterion, Status, TaskComplexity
+from .evidence import EvidenceInput, EvidenceRepository, audit_evidence
+from .services import ConfigurationApplicationService
 
 
 class ErrorResponse(BaseModel):
@@ -111,6 +114,49 @@ class PlanResponse(BaseModel):
     created_at: str
 
 
+class ArtifactCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    key: StrictStr = Field(min_length=1, max_length=200, pattern=r"^[^/]+$")
+    content: StrictStr
+    expected_version: int | None = Field(default=None, ge=0)
+
+
+class ArtifactResponse(BaseModel):
+    id: int
+    task_id: int
+    artifact_key: str
+    version: int
+    content: str
+    sha256: str
+    created_at: str
+
+
+class CorrectionResponse(BaseModel):
+    id: str
+    task_id: int
+    plan_id: int | None
+    subtask_id: str | None
+    category: str
+    source: str
+    rule: str
+    message: str
+    affected_paths: list[str]
+    evidence: dict[str, Any]
+    expected: dict[str, Any]
+    status: Literal["open", "in_progress", "resolved"]
+    attempts: int
+    created_at: str
+    updated_at: str
+    resolved_at: str | None
+
+
+class CorrectionStatusRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    status: Literal["open", "in_progress", "resolved"]
+
+
 class ValidationResponse(BaseModel):
     model_config = ConfigDict(
         json_schema_extra={
@@ -190,9 +236,21 @@ class UsageReportResponse(BaseModel):
 
 def _service_error(error: ValueError):
     message = str(error)
-    if message == "task not found" or "question not found" in message:
+    if (
+        message == "task not found"
+        or "question not found" in message
+        or message == "correction not found"
+    ):
         status = 404
-    elif "currently running" in message or "invalid task transition" in message:
+    elif any(
+        marker in message
+        for marker in (
+            "currently running",
+            "invalid task transition",
+            "version conflict",
+            "invalid correction status transition",
+        )
+    ):
         status = 409
     else:
         status = 422
@@ -260,14 +318,80 @@ def health():
     return {"status": "ok", "service": "harness"}
 
 
+@router.get("/configuration/status")
+def configuration_status():
+    try:
+        return ConfigurationApplicationService(config).validate()
+    except ValueError as exc:
+        raise HTTPException(503, "configuration is invalid") from exc
+
+
 @router.get("/metrics")
 def metrics():
     return orchestrator.observability.metrics()
 
 
+@router.get("/metrics/prometheus", response_class=PlainTextResponse)
+def prometheus_metrics():
+    return PlainTextResponse(
+        orchestrator.observability.prometheus(),
+        media_type="text/plain; version=0.0.4; charset=utf-8",
+    )
+
+
 @router.get("/event-kinds")
 def event_kinds():
     return {"event_kinds": list(orchestrator.observability.event_kinds)}
+
+
+@router.get("/models/status")
+def model_inventory():
+    return {"providers": orchestrator.model_operations.model_inventory()}
+
+
+@router.get("/decisions", response_model=list[Decision])
+def list_decisions(
+    task_id: int | None = Query(default=None, gt=0),
+    category: str | None = None,
+    source: str | None = None,
+    tag: str | None = None,
+):
+    return DecisionService(store).query(task_id, category, source, tag)
+
+
+@router.get("/decisions/{decision_id}", response_model=Decision)
+def get_decision(decision_id: int):
+    decision = DecisionService(store).get(decision_id)
+    if decision is None:
+        raise HTTPException(404, "decision not found")
+    return decision
+
+
+@router.post("/verification/evidence")
+def import_verification_evidence(payload: EvidenceInput):
+    try:
+        return EvidenceRepository(store.database).record(payload)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@router.get("/verification/evidence")
+def list_verification_evidence(
+    kind: Literal["ci", "provider", "qdrant", "embedding", "http_tls"] | None = None,
+    limit: int = Query(default=100, ge=1, le=500),
+):
+    return EvidenceRepository(store.database).list(kind=kind, limit=limit)
+
+
+@router.get("/verification/evidence/audit")
+def audit_verification_evidence(
+    subject_sha256: str = Query(pattern=r"^[a-f0-9]{64}$"),
+    max_age_hours: int = Query(default=168, ge=1, le=8760),
+):
+    rows = EvidenceRepository(store.database).list(limit=500)
+    return audit_evidence(
+        rows, expected_subject_sha256=subject_sha256, max_age_hours=max_age_hours
+    )
 
 
 @router.post("/tasks", response_model=Task, responses={422: {"model": ErrorResponse}})
@@ -449,6 +573,85 @@ def plan(task_id: int):
 def validation(task_id: int):
     _require_task(task_id)
     return orchestrator.service.validation(task_id)
+
+
+@router.post(
+    "/tasks/{task_id}/artifacts",
+    response_model=ArtifactResponse,
+    responses={404: {"model": ErrorResponse}, 409: {"model": ErrorResponse}},
+)
+def create_artifact(task_id: int, payload: ArtifactCreateRequest):
+    try:
+        return orchestrator.service.save_artifact(
+            task_id, payload.key, payload.content, payload.expected_version
+        )
+    except ValueError as exc:
+        raise _service_error(exc) from exc
+
+
+@router.get(
+    "/tasks/{task_id}/artifacts",
+    response_model=list[ArtifactResponse],
+    responses={404: {"model": ErrorResponse}},
+)
+def list_artifacts(task_id: int):
+    try:
+        return orchestrator.service.artifacts(task_id)
+    except ValueError as exc:
+        raise _service_error(exc) from exc
+
+
+@router.get(
+    "/tasks/{task_id}/artifacts/{artifact_key}/history",
+    response_model=list[ArtifactResponse],
+    responses={404: {"model": ErrorResponse}},
+)
+def artifact_history(task_id: int, artifact_key: str):
+    try:
+        return orchestrator.service.artifact_history(task_id, artifact_key)
+    except ValueError as exc:
+        raise _service_error(exc) from exc
+
+
+@router.get(
+    "/tasks/{task_id}/artifacts/{artifact_key}",
+    response_model=ArtifactResponse | None,
+    responses={404: {"model": ErrorResponse}},
+)
+def get_artifact(task_id: int, artifact_key: str):
+    try:
+        return orchestrator.service.artifact(task_id, artifact_key)
+    except ValueError as exc:
+        raise _service_error(exc) from exc
+
+
+@router.get(
+    "/tasks/{task_id}/corrections",
+    response_model=list[CorrectionResponse],
+    responses={404: {"model": ErrorResponse}, 422: {"model": ErrorResponse}},
+)
+def list_corrections(
+    task_id: int,
+    status: Literal["open", "in_progress", "resolved"] | None = None,
+):
+    try:
+        rows = orchestrator.service.corrections(task_id, status)
+        return [store.audit.sanitize(item) for item in rows]
+    except ValueError as exc:
+        raise _service_error(exc) from exc
+
+
+@router.patch(
+    "/tasks/{task_id}/corrections/{item_id}",
+    response_model=CorrectionResponse,
+    responses={404: {"model": ErrorResponse}, 409: {"model": ErrorResponse}},
+)
+def update_correction(task_id: int, item_id: str, payload: CorrectionStatusRequest):
+    try:
+        row = orchestrator.service.update_correction(task_id, item_id, payload.status)
+        return store.audit.sanitize(row)
+    except ValueError as exc:
+        raise _service_error(exc) from exc
 
 
 @router.get(

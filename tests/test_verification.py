@@ -1,3 +1,4 @@
+import hashlib
 import json
 import xml.etree.ElementTree as ET
 
@@ -7,9 +8,10 @@ from test_completion import coverage_report
 from harness.verification import source_tree_sha256, write_verification_report
 
 
-def test_verification_report_hashes_matrix_and_coverage(tmp_path):
+@pytest.mark.parametrize("matrix_content", ["matrix", "matrix\nbody"])
+def test_verification_report_hashes_matrix_and_coverage(tmp_path, matrix_content):
     matrix = tmp_path / "GAP_MATRIX.md"
-    matrix.write_text("matrix")
+    matrix.write_text(matrix_content)
     coverage = tmp_path / "coverage.json"
     coverage.write_text(json.dumps(coverage_report()))
     junit = tmp_path / "junit.xml"
@@ -30,7 +32,55 @@ def test_verification_report_hashes_matrix_and_coverage(tmp_path):
     }
     assert json.loads(output.read_text()) == report
     assert report["source_sha256"] == source_tree_sha256(tmp_path)
+    assert report["matrix_sha256"] == hashlib.sha256(matrix.read_bytes()).hexdigest()
+    assert "2 Tests bestanden" in matrix.read_text()
     assert list(output.parent.iterdir()) == [output]
+
+
+def test_verification_report_replaces_managed_summary_and_counts_matrix_rows(tmp_path):
+    matrix = tmp_path / "GAP_MATRIX.md"
+    matrix.write_text(
+        "# Gap\n\n<!-- VERIFY-RESULT:START -->\nstale\n<!-- VERIFY-RESULT:END -->\n"
+        "| 1 | One | Erfüllt | evidence |\n| 2 | Two | Teilweise | evidence |\n"
+        "| 3 | Three | Offen | evidence |\n"
+    )
+    coverage = tmp_path / "coverage.json"
+    coverage.write_text(json.dumps(coverage_report()))
+    junit = tmp_path / "junit.xml"
+    junit.write_text('<testsuite tests="1"><testcase /></testsuite>')
+
+    report = write_verification_report(
+        matrix, coverage, junit, tmp_path / "report.json"
+    )
+    content = matrix.read_text()
+
+    assert content.count("VERIFY-RESULT:START") == 1
+    assert "stale" not in content
+    assert "1 erfüllt, 1 teilweise, 1 offen" in content
+    assert report["matrix_sha256"] == hashlib.sha256(matrix.read_bytes()).hexdigest()
+
+
+@pytest.mark.parametrize(
+    "markers",
+    [
+        "<!-- VERIFY-RESULT:START -->\n",
+        "<!-- VERIFY-RESULT:END -->\n<!-- VERIFY-RESULT:START -->",
+        (
+            "<!-- VERIFY-RESULT:START --><!-- VERIFY-RESULT:START -->\n"
+            "<!-- VERIFY-RESULT:END -->"
+        ),
+    ],
+)
+def test_verification_report_rejects_malformed_matrix_markers(tmp_path, markers):
+    matrix = tmp_path / "GAP_MATRIX.md"
+    matrix.write_text("# Gap\n" + markers)
+    coverage = tmp_path / "coverage.json"
+    coverage.write_text(json.dumps(coverage_report()))
+    junit = tmp_path / "junit.xml"
+    junit.write_text('<testsuite tests="1"><testcase /></testsuite>')
+
+    with pytest.raises(ValueError, match="markers are malformed"):
+        write_verification_report(matrix, coverage, junit, tmp_path / "report.json")
 
 
 def test_source_hash_is_stable_and_tracks_contract_files(tmp_path):

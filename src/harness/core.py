@@ -24,12 +24,15 @@ from .agents import (
     ModelRegistry,
     ModelRouter,
     Planner,
+    ProfileRegistry,
+    execute_plan_dag,
 )
 from .approvals import ApprovalDenied, ApprovalRequired, ApprovalService
 from .audit import AuditRecorder
 from .configuration import HarnessConfig
 from .database import (
     AgentRunRepository,
+    ArtifactRepository,
     CorrectionRepository,
     Database,
     DecisionRepository,
@@ -632,6 +635,7 @@ class Store:
         self.plans = PlanRepository(self.database)
         self.validations = ValidationRepository(self.database)
         self.corrections = CorrectionRepository(self.database)
+        self.artifacts = ArtifactRepository(self.database)
         self.subtasks = SubtaskRepository(self.database)
         self.questions = QuestionRepository(self.database)
         self.decisions = DecisionRepository(self.database)
@@ -740,6 +744,39 @@ class Store:
     def record_correction(self, task_id, finding, plan_id=None):
         return self.corrections.record(task_id, self.audit.sanitize(finding), plan_id)
 
+    def save_artifact(self, task_id, key, content, expected_version=None):
+        row = self.artifacts.save(
+            task_id,
+            self.audit.sanitize(key),
+            self.audit.sanitize(content),
+            expected_version,
+        )
+        return self._sanitize_artifact(row)
+
+    def artifact(self, task_id, key):
+        row = self.artifacts.latest(task_id, key)
+        return self._sanitize_artifact(row) if row else None
+
+    def artifact_history(self, task_id, key):
+        return [
+            self._sanitize_artifact(row) for row in self.artifacts.history(task_id, key)
+        ]
+
+    def artifacts_for_task(self, task_id):
+        return [
+            self._sanitize_artifact(row)
+            for row in self.artifacts.latest_for_task(task_id)
+        ]
+
+    def _sanitize_artifact(self, row):
+        row = dict(row)
+        safe = self.audit.sanitize(
+            {"key": row["artifact_key"], "content": row["content"]}
+        )
+        row["artifact_key"] = safe["key"]
+        row["content"] = safe["content"]
+        return row
+
     def list_events(self, *filters):
         rows = []
         for row in self.events.list(*filters):
@@ -826,11 +863,25 @@ class Orchestrator:
         from .observability import ObservabilityService
 
         self.observability = ObservabilityService(store.database, EventKind)
+        self.role_profiles = ProfileRegistry(self.config)
+        self.role_profiles.role_profiles()
+        self.planner_profile = self.role_profiles.for_role("planner").name
+        self.requirements_profile = self.role_profiles.for_role("requirements").name
+        self.executor_profile = self.role_profiles.for_role("executor").name
+        self.tester_profile = self.role_profiles.for_role("tester").name
+        self.validator_profile = self.role_profiles.for_role("independent-review").name
+        self.recovery_profile = self.role_profiles.for_role("recovery-inspector").name
         self.queue: asyncio.Queue[Event] = asyncio.Queue()
         registry = ModelRegistry(self.config)
         self.audit = store.audit
         router = ModelRouter(registry, self.config, audit=self.audit)
         self.models = registry
+        from .database import OperationalSnapshotRepository
+        from .services import ModelOperationsService
+
+        self.model_operations = ModelOperationsService(
+            registry, OperationalSnapshotRepository(store.database)
+        )
         self.router = router
         self.planner = Planner(router)
         workspace = self.config.path("workspace")
@@ -973,7 +1024,7 @@ class Orchestrator:
                     self._invoke,
                     task,
                     "recovery",
-                    "validator",
+                    self.recovery_profile,
                     ReconciliationService(
                         self.store, self.tools, self.validator
                     ).inspect,
@@ -1004,7 +1055,7 @@ class Orchestrator:
                 self._invoke,
                 task,
                 "requirements",
-                "planner",
+                self.requirements_profile,
                 RequirementCompleter(self.store, self.router).complete,
                 task,
                 lambda: self.context.build(task, str(self.config.path("workspace"))),
@@ -1060,7 +1111,7 @@ class Orchestrator:
                     self._invoke,
                     task,
                     "recovery-review",
-                    "validator",
+                    self.validator_profile,
                     RecoveryScope.assess,
                     task,
                     reconciliation,
@@ -1078,7 +1129,7 @@ class Orchestrator:
                 self._invoke,
                 task,
                 "planner",
-                "planner",
+                self.planner_profile,
                 self.planner.plan,
                 task,
                 context,
@@ -1139,37 +1190,26 @@ class Orchestrator:
                     self._invoke,
                     task,
                     "validator",
-                    "validator",
+                    self.validator_profile,
                     self.validator.workspace_snapshot,
                 )
-                outputs = []
-                for step in plan.ordered_steps():
-                    if any(
-                        not output.success
-                        for output in outputs
-                        if output.subtask_id in step.dependencies
-                    ):
-                        from .agents import ExecutorOutput
+                ordered_steps = plan.ordered_steps()
 
-                        output = ExecutorOutput(
-                            subtask_id=step.id,
-                            success=False,
-                            output="dependency failed",
-                        )
-                    else:
-                        self.store.subtasks.update(
-                            task_id, step.id, "running", plan_id=plan_id
-                        )
-                        output = await asyncio.to_thread(
-                            self._execute_step,
-                            task,
-                            step,
-                            context
-                            + "\\nCorrections: "
-                            + json.dumps(correction_context),
-                            recovery_scope,
-                        )
-                    outputs.append(output)
+                async def execute_step(step, corrections=correction_context):
+                    self.store.subtasks.update(
+                        task_id, step.id, "running", plan_id=plan_id
+                    )
+                    output = await asyncio.to_thread(
+                        self._execute_step,
+                        task,
+                        step,
+                        context + "\\nCorrections: " + json.dumps(corrections),
+                        recovery_scope,
+                    )
+
+                    return output
+
+                def persist_step(step, output):
                     self.store.update_subtask(
                         task_id,
                         step.id,
@@ -1177,11 +1217,30 @@ class Orchestrator:
                         output.model_dump(mode="json"),
                         plan_id,
                     )
+                    artifact_key = f"agent/{step.id}"
+                    prior_artifact = self.store.artifact(task_id, artifact_key)
+                    self.store.save_artifact(
+                        task_id,
+                        artifact_key,
+                        json.dumps(output.model_dump(mode="json"), ensure_ascii=False),
+                        expected_version=(
+                            prior_artifact["version"] if prior_artifact else 0
+                        ),
+                    )
+
+                outputs = await execute_plan_dag(
+                    ordered_steps,
+                    execute_step,
+                    max_parallel_steps=self.config.data.get("harness", {}).get(
+                        "max_parallel_steps", 4
+                    ),
+                    on_complete=persist_step,
+                )
                 workspace_after = await asyncio.to_thread(
                     self._invoke,
                     task,
                     "validator",
-                    "validator",
+                    self.validator_profile,
                     self.validator.workspace_snapshot,
                 )
                 transition(Status.TESTING)
@@ -1189,7 +1248,7 @@ class Orchestrator:
                     self._invoke,
                     task,
                     "tester",
-                    "validator",
+                    self.tester_profile,
                     self.validator.run_tests,
                     task,
                 )
@@ -1201,7 +1260,7 @@ class Orchestrator:
                     self._invoke,
                     task,
                     "validator",
-                    "validator",
+                    self.validator_profile,
                     self.validator.validate,
                     task,
                     outputs,
@@ -1257,14 +1316,14 @@ class Orchestrator:
                             target_tests = self._invoke(
                                 task,
                                 "target-tester",
-                                "validator",
+                                self.tester_profile,
                                 self.validator.run_tests,
                                 task,
                             )
                             target_workspace = self._invoke(
                                 task,
                                 "target-validator",
-                                "validator",
+                                self.validator_profile,
                                 self.validator.workspace_snapshot,
                             )
                             self.store.event(
@@ -1275,7 +1334,7 @@ class Orchestrator:
                             target_validation = self._invoke(
                                 task,
                                 "target-validator",
-                                "validator",
+                                self.validator_profile,
                                 self.validator.validate,
                                 task,
                                 step_outputs,

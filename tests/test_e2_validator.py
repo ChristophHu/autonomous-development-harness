@@ -68,16 +68,26 @@ def test_independent_review_must_cover_exactly_declared_contract_keys():
         "requirements": {"add two integers": True},
         "criteria": {"sum": True},
         "evidence": "checked output and tests",
+        "requirement_evidence": {"add two integers": ["criterion:sum"]},
+        "criterion_evidence": {"sum": ["criterion:sum"]},
     }
     extra = {
         **valid,
         "requirements": {**valid["requirements"], "invented": True},
     }
     missing = {**valid, "criteria": {}}
+    invented_evidence = {
+        **valid,
+        "requirement_evidence": {"add two integers": ["file:outside.py"]},
+    }
 
-    assert EvidenceValidator._review_confirms(valid, task)
-    assert not EvidenceValidator._review_confirms(extra, task)
-    assert not EvidenceValidator._review_confirms(missing, task)
+    assert EvidenceValidator._review_confirms(valid, task, {"criterion:sum"})
+    assert not EvidenceValidator._review_confirms(extra, task, {"criterion:sum"})
+    assert not EvidenceValidator._review_confirms(missing, task, {"criterion:sum"})
+    assert EvidenceValidator._review_confirms(valid, task, {"criterion:sum"})
+    assert not EvidenceValidator._review_confirms(
+        invented_evidence, task, {"criterion:sum"}
+    )
 
 
 def test_plan_must_match_executor_outputs(tmp_path):

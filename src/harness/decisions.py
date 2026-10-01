@@ -19,6 +19,20 @@ class DecisionEvidence(BaseModel):
         return self
 
 
+class DecisionAlternative(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    option: str = Field(min_length=1, max_length=500)
+    consequences: list[str] = Field(default_factory=list, max_length=16)
+    selected: bool = False
+
+    @model_validator(mode="after")
+    def validate_consequences(self):
+        if any(not item.strip() or len(item) > 1000 for item in self.consequences):
+            raise ValueError("alternative consequences must be nonempty and bounded")
+        return self
+
+
 class DecisionInput(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
@@ -32,8 +46,12 @@ class DecisionInput(BaseModel):
     ]
     source: Literal["human", "agent", "task", "parent", "memory", "repository"]
     question_id: int | None = None
+    supersedes_id: int | None = Field(default=None, gt=0)
     decision: str = Field(min_length=1, max_length=1000)
     rationale: str = Field(min_length=1, max_length=4000)
+    alternatives: list[DecisionAlternative] = Field(default_factory=list, max_length=16)
+    outcome: str | None = Field(default=None, max_length=2000)
+    tags: list[str] = Field(default_factory=list, max_length=32)
     field_names: list[str] = Field(default_factory=list, max_length=32)
     evidence: list[DecisionEvidence] = Field(min_length=1, max_length=32)
 
@@ -45,6 +63,16 @@ class DecisionInput(BaseModel):
             raise ValueError("decision field names must be valid identifiers")
         if len(self.field_names) != len(set(self.field_names)):
             raise ValueError("decision field names must be unique")
+        if len({item.option.casefold() for item in self.alternatives}) != len(
+            self.alternatives
+        ):
+            raise ValueError("decision alternatives must be unique")
+        if self.alternatives and sum(item.selected for item in self.alternatives) != 1:
+            raise ValueError("exactly one decision alternative must be selected")
+        if len(self.tags) != len(set(self.tags)) or any(
+            not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", tag) for tag in self.tags
+        ):
+            raise ValueError("decision tags must be unique lowercase kebab-case")
         if self.category == "requirement_resolution" and not self.field_names:
             raise ValueError("requirement decisions must name the resolved fields")
         if self.source == "human" and self.question_id is None:
@@ -79,6 +107,15 @@ class DecisionService:
                 raise ValueError("question does not belong to decision task")
             if question["status"] not in {"answered", "consumed", "executed"}:
                 raise ValueError("decision question is not answered")
+        if decision.supersedes_id is not None:
+            prior = self.repository.get(decision.supersedes_id)
+            if prior is None or prior["task_id"] != decision.task_id:
+                raise ValueError("superseded decision must belong to the same task")
+            if any(
+                row["supersedes_id"] == decision.supersedes_id
+                for row in self.repository.list_all()
+            ):
+                raise ValueError("decision is already superseded")
         answer_refs = set()
         for item in decision.evidence:
             identifier = item.ref.partition(":")[2]
@@ -117,6 +154,10 @@ class DecisionService:
         self._validate_evidence(decision)
         safe_decision = self.store.audit.sanitize(decision.decision)
         safe_rationale = self.store.audit.sanitize(decision.rationale)
+        safe_alternatives = self.store.audit.sanitize(
+            [item.model_dump() for item in decision.alternatives]
+        )
+        safe_outcome = self.store.audit.sanitize(decision.outcome)
         decision_id = self.repository.record(
             decision.task_id,
             decision.category,
@@ -126,6 +167,10 @@ class DecisionService:
             [item.model_dump() for item in decision.evidence],
             decision.field_names,
             decision.question_id,
+            safe_alternatives,
+            safe_outcome,
+            decision.tags,
+            decision.supersedes_id,
         )
         created = Decision.model_validate(self.repository.get(decision_id))
         if self.projection_enabled:
@@ -149,3 +194,23 @@ class DecisionService:
 
     def list(self, task_id):
         return [Decision.model_validate(row) for row in self.repository.list(task_id)]
+
+    def query(self, task_id=None, category=None, source=None, tag=None):
+        """Return validated decisions using exact, composable query filters."""
+        rows = (
+            self.repository.list(task_id)
+            if task_id is not None
+            else self.repository.list_all()
+        )
+        return [
+            Decision.model_validate(row)
+            for row in rows
+            if (category is None or row["category"] == category)
+            and (source is None or row["source"] == source)
+            and (tag is None or tag in row["tags"])
+        ]
+
+    def get(self, decision_id):
+        """Return one validated decision, or None when it does not exist."""
+        row = self.repository.get(decision_id)
+        return Decision.model_validate(row) if row is not None else None

@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
+import stat
 from datetime import UTC, date, datetime
 from pathlib import Path
 from posixpath import normpath
+
+import yaml
 
 DEFAULT_REQUIRED_NOTES = (
     "Willkommen.md",
@@ -13,10 +17,26 @@ DEFAULT_REQUIRED_NOTES = (
     "rules/Harness-Prinzipien.md",
     "architecture/Systemarchitektur.md",
     "architecture/Vault und Memory.md",
+    "architecture/Modelle und Routing.md",
+    "architecture/Git und Isolation.md",
+    "operations/Lokaler Betrieb.md",
     "decisions/Entscheidungsregister.md",
     "agents/Agentenprofile.md",
     "tasks/Task-Register.md",
 )
+CURATED_NOTE_TYPES = {
+    "Willkommen.md": "vault-home",
+    "Vault-Übersicht.md": "vault-index",
+    "rules/Harness-Prinzipien.md": "project-rules",
+    "architecture/Systemarchitektur.md": "architecture",
+    "architecture/Vault und Memory.md": "architecture",
+    "architecture/Modelle und Routing.md": "model-routing",
+    "architecture/Git und Isolation.md": "git-isolation-architecture",
+    "operations/Lokaler Betrieb.md": "operations-guide",
+    "decisions/Entscheidungsregister.md": "decision-index",
+    "agents/Agentenprofile.md": "agent-index",
+    "tasks/Task-Register.md": "task-index",
+}
 WIKILINK = re.compile(r"!?\[\[([^\]|#]+)")
 FRONTMATTER = re.compile(r"\A---\s*\n(.*?)\n---(?:\s*\n|\Z)", re.DOTALL)
 REVIEWED = re.compile(r"^last_reviewed\s*:\s*(.*?)\s*$", re.MULTILINE)
@@ -59,12 +79,141 @@ def _finding(code: str, path: str, message: str) -> dict[str, str]:
     return {"code": code, "path": path, "message": message}
 
 
+def _curated_type_state(text, expected):
+    frontmatter = FRONTMATTER.match(text)
+    if frontmatter is None:
+        return "missing"
+    try:
+        metadata = yaml.safe_load(frontmatter.group(1))
+    except yaml.YAMLError:
+        return "invalid"
+    if not isinstance(metadata, dict):
+        return "invalid"
+    actual = metadata.get("type")
+    if actual is None or actual == "":
+        return "missing"
+    return "valid" if actual == expected else "invalid"
+
+
+def _source_findings(text, note_path, source_root):
+    frontmatter = FRONTMATTER.match(text)
+    if frontmatter is None:
+        return [
+            _finding(
+                "content_sources_missing",
+                note_path,
+                "Curated note has no source references",
+            )
+        ]
+    try:
+        metadata = yaml.safe_load(frontmatter.group(1))
+    except yaml.YAMLError:
+        return [
+            _finding(
+                "content_sources_invalid",
+                note_path,
+                "Curated note source references are invalid",
+            )
+        ]
+    references = metadata.get("sources") if isinstance(metadata, dict) else None
+    if not isinstance(references, list) or not references:
+        return [
+            _finding(
+                "content_sources_missing",
+                note_path,
+                "Curated note has no source references",
+            )
+        ]
+    try:
+        root = Path(source_root).resolve(strict=True)
+    except (OSError, TypeError):
+        return [
+            _finding(
+                "content_source_unavailable", note_path, "Source root is unavailable"
+            )
+        ]
+    findings = []
+    for reference in references:
+        if not isinstance(reference, dict) or set(reference) != {"path", "sha256"}:
+            findings.append(
+                _finding(
+                    "content_sources_invalid",
+                    note_path,
+                    "Source reference must contain path and sha256",
+                )
+            )
+            continue
+        relative, digest = reference["path"], reference["sha256"]
+        if (
+            not isinstance(relative, str)
+            or not relative
+            or Path(relative).is_absolute()
+            or ".." in Path(relative).parts
+            or "\\" in relative
+            or not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        ):
+            findings.append(
+                _finding(
+                    "content_sources_invalid",
+                    note_path,
+                    "Source reference path or SHA-256 is invalid",
+                )
+            )
+            continue
+        candidate = root / relative
+        try:
+            current = root
+            unsafe = False
+            for component in Path(relative).parts:
+                current = current / component
+                if current.is_symlink():
+                    unsafe = True
+                    break
+            resolved = candidate.resolve(strict=True)
+            if (
+                unsafe
+                or not resolved.is_relative_to(root)
+                or not stat.S_ISREG(resolved.stat().st_mode)
+            ):
+                findings.append(
+                    _finding(
+                        "content_source_invalid",
+                        note_path,
+                        "Source path is unsafe or not a regular file",
+                    )
+                )
+                continue
+            actual = hashlib.sha256(resolved.read_bytes()).hexdigest()
+        except OSError:
+            findings.append(
+                _finding(
+                    "content_source_unavailable",
+                    note_path,
+                    "Referenced source is unavailable",
+                )
+            )
+            continue
+        if actual != digest:
+            findings.append(
+                _finding(
+                    "content_source_stale",
+                    note_path,
+                    "Referenced source SHA-256 has changed",
+                )
+            )
+    return findings
+
+
 def audit_vault(
     vault: str | Path,
     *,
     required_notes=DEFAULT_REQUIRED_NOTES,
     max_review_age_days: int = 180,
     today: date | None = None,
+    decision_rows=None,
+    content_governance: bool = False,
+    source_root: str | Path | None = None,
 ) -> dict:
     """Audit curated Markdown without modifying files or following symlinks."""
     if (
@@ -81,6 +230,7 @@ def audit_vault(
     ]
     excluded = len(candidates) - len(notes)
     findings: list[dict[str, str]] = []
+    note_hashes: dict[str, str] = {}
     if not exists:
         findings.append(
             _finding("vault_missing", ".", "Vault directory does not exist")
@@ -104,6 +254,7 @@ def audit_vault(
         by_stem.setdefault(Path(relative).stem, []).append(relative)
 
     reference_date = today or datetime.now(UTC).date()
+    inbound_links: set[str] = set()
     for path in notes:
         relative = path.relative_to(root).as_posix()
         try:
@@ -113,6 +264,21 @@ def audit_vault(
                 _finding("note_unreadable", relative, "Note cannot be read as UTF-8")
             )
             continue
+        note_hashes[relative] = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        if content_governance and relative in CURATED_NOTE_TYPES:
+            type_state = _curated_type_state(text, CURATED_NOTE_TYPES[relative])
+            if type_state != "valid":
+                code = (
+                    "content_type_missing"
+                    if type_state == "missing"
+                    else "content_type_invalid"
+                )
+                findings.append(
+                    _finding(code, relative, "Curated note has an invalid type field")
+                )
+            findings.extend(
+                _source_findings(text, relative, source_root or root.parent)
+            )
         review_state, reviewed = _review_date(text)
         if review_state == "missing":
             findings.append(
@@ -164,6 +330,69 @@ def audit_vault(
                         f"Wiki link target is ambiguous: {target}",
                     )
                 )
+            else:
+                inbound_links.update(matches)
+
+    if content_governance:
+        required_paths = set(CURATED_NOTE_TYPES)
+        root_entries = {"Index.md", "Welcome.md", "Willkommen.md", "Vault-Übersicht.md"}
+        for relative in sorted(
+            set(available) - required_paths - root_entries - inbound_links
+        ):
+            findings.append(
+                _finding(
+                    "orphan_note", relative, "Note has no incoming local wiki link"
+                )
+            )
+
+    if decision_rows is not None:
+        from .memory_projection import DecisionProjection
+
+        projection = DecisionProjection(root)
+        try:
+            projected = projection._read_manifest()
+            expected = {
+                f"decisions/{row['id']}.md": projection._render(row)
+                for row in decision_rows
+            }
+            actual = set(projected)
+            for name in sorted(set(expected) - actual):
+                findings.append(
+                    _finding(
+                        "decision_projection_missing",
+                        f"_harness/{name}",
+                        "SQLite decision is not projected",
+                    )
+                )
+            for name in sorted(actual - set(expected)):
+                findings.append(
+                    _finding(
+                        "decision_projection_stale",
+                        f"_harness/{name}",
+                        "Projection has no authoritative SQLite decision",
+                    )
+                )
+            for name in sorted(actual & set(expected)):
+                path = projection._inside_vault(projection.root / name)
+                if (
+                    not path.is_file()
+                    or path.read_text(encoding="utf-8") != expected[name]
+                ):
+                    findings.append(
+                        _finding(
+                            "decision_projection_conflict",
+                            f"_harness/{name}",
+                            "Projection differs from authoritative SQLite decision",
+                        )
+                    )
+        except (OSError, UnicodeError, ValueError, PermissionError):
+            findings.append(
+                _finding(
+                    "decision_projection_unreadable",
+                    "_harness",
+                    "Decision projection cannot be safely audited",
+                )
+            )
 
     findings.sort(key=lambda item: (item["path"], item["code"], item["message"]))
     return {
@@ -171,6 +400,7 @@ def audit_vault(
         "exists": exists,
         "markdown_notes": len(candidates),
         "audited_notes": len(notes),
+        "note_hashes": note_hashes,
         "excluded_notes": excluded,
         "max_review_age_days": max_review_age_days,
         "findings": findings,

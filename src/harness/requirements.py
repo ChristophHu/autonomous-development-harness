@@ -5,6 +5,7 @@ import json
 
 from pydantic import BaseModel, ConfigDict, StrictStr, model_validator
 
+from .agents import ProfileRegistry
 from .decisions import DecisionEvidence, DecisionService
 from .domain import EventKind, Task
 from .structured_output import parse_model_output
@@ -40,6 +41,7 @@ class RequirementCompleter:
     def __init__(self, store, router):
         self.store, self.router = store, router
         self.decisions = DecisionService(store)
+        self.profile = ProfileRegistry(router.config).for_role("requirements")
 
     @staticmethod
     def _ref(source, identifier):
@@ -137,6 +139,8 @@ class RequirementCompleter:
 
         missing = [name for name in FIELDS if not getattr(task, name)]
         if missing:
+            contract_input = {"task": task.model_dump(mode="json"), "sources": sources}
+            self.profile.validate_input(contract_input)
             prompt = (
                 "REQUIREMENTS: Derive only missing fields from these sources; do not invent requirements or commands. "
                 "Return JSON with fields, rationale, and evidence mapping each proposed field to one or more "
@@ -156,9 +160,12 @@ class RequirementCompleter:
             try:
                 response = parse_model_output(
                     RequirementProposal,
-                    self.router.complete("planner", prompt, complexity=task.complexity),
+                    self.router.complete(
+                        self.profile.name, prompt, complexity=task.complexity
+                    ),
                     agent="requirements",
                 )
+                self.profile.validate_output(response.model_dump(mode="json"))
                 fields = response.fields
                 citations = response.evidence
                 rationale = response.rationale

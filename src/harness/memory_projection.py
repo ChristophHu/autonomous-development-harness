@@ -3,6 +3,7 @@
 import json
 import os
 import tempfile
+from contextlib import suppress
 from pathlib import Path
 
 import yaml
@@ -79,8 +80,32 @@ class DecisionProjection:
             "source": row["source"],
             "field_names": row.get("field_names", []),
             "evidence": row.get("evidence", []),
+            "alternatives": row.get("alternatives", []),
+            "outcome": row.get("outcome"),
+            "tags": row.get("tags", []),
+            "supersedes_id": row.get("supersedes_id"),
             "created_at": row["created_at"],
         }
+        alternatives = row.get("alternatives", [])
+        alternatives_text = ""
+        if alternatives:
+            alternatives_text = (
+                "\n## Alternatives\n\n"
+                + "\n".join(
+                    "- **"
+                    + item["option"]
+                    + (" (selected)" if item.get("selected") else "")
+                    + (
+                        ": " + "; ".join(item.get("consequences", []))
+                        if item.get("consequences")
+                        else ""
+                    )
+                    for item in alternatives
+                )
+                + "\n"
+            )
+        outcome = row.get("outcome")
+        outcome_text = "\n## Outcome\n\n" + outcome + "\n" if outcome else ""
         return (
             "---\n"
             + cls.MARKER
@@ -91,6 +116,8 @@ class DecisionProjection:
             + "\n\n## Rationale\n\n"
             + str(row["rationale"])
             + "\n"
+            + alternatives_text
+            + outcome_text
         )
 
     @classmethod
@@ -101,12 +128,17 @@ class DecisionProjection:
     def _atomic_write(path, content):
         path.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", dir=path.parent
+            mode="w", encoding="utf-8", dir=path.parent, delete=False
         ) as stream:
             stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
-            os.replace(stream.name, path)
+            temporary_path = stream.name
+        try:
+            os.replace(temporary_path, path)
+        finally:
+            with suppress(FileNotFoundError):
+                os.unlink(temporary_path)
 
     def sync(self, rows):
         old_files = self._read_manifest()

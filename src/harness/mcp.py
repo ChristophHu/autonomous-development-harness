@@ -6,7 +6,6 @@ import json
 import os
 import re
 import select
-import signal
 import subprocess
 import sys
 import threading
@@ -20,7 +19,7 @@ from jsonschema.exceptions import SchemaError, ValidationError
 
 from .http_control import request as http_request
 from .isolation import isolated_command
-from .process_control import current_run_control
+from .process_control import _terminate, current_run_control
 
 PROTOCOL_VERSION = "2025-11-25"
 MAX_MESSAGE = 2_000_000
@@ -55,6 +54,9 @@ class MCPClient:
         self.read_roots = read_roots
 
     def _exchange(self, method, params):
+        control = current_run_control()
+        if control is not None:
+            control.check()
         command = isolated_command(
             self.command, self.workspace, read_roots=self.read_roots
         )
@@ -73,6 +75,8 @@ class MCPClient:
             )
         except OSError as exc:
             raise MCPError("MCP server could not start") from exc
+        if control is not None:
+            control.register(process)
         os.set_blocking(process.stdin.fileno(), False)
         deadline = time.monotonic() + self.timeout
         pending = bytearray()
@@ -220,15 +224,14 @@ class MCPClient:
         except (OSError, BrokenPipeError) as exc:
             raise MCPError("MCP transport failed") from exc
         finally:
-            if process.poll() is None:
-                os.killpg(process.pid, signal.SIGTERM)
-                try:
-                    process.wait(timeout=1)
-                except subprocess.TimeoutExpired:
-                    os.killpg(process.pid, signal.SIGKILL)
-                    process.wait(timeout=1)
-            process.stdin.close()
-            process.stdout.close()
+            try:
+                if process.poll() is None:
+                    _terminate(process, 0.2)
+            finally:
+                if control is not None:
+                    control.unregister(process)
+                process.stdin.close()
+                process.stdout.close()
 
     def discover(self):
         return self._exchange("tools/list", {})

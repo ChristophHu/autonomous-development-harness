@@ -105,15 +105,29 @@ class OpenAICompatibleProvider:
         timeout=120,
         retry=None,
         kind="openai_compatible",
+        headers=None,
     ):
         if kind not in {"openai_compatible", "lmstudio"}:
             raise ValueError("unsupported provider kind")
         if kind == "lmstudio" and not base_url.rstrip("/").endswith("/v1"):
             raise ValueError("LM Studio base URL must end in /v1")
+        headers = headers or {}
+        if kind == "lmstudio" and headers:
+            raise ValueError("custom provider headers are not supported for LM Studio")
+        if any(
+            not isinstance(key, str)
+            or key.lower() not in {"http-referer", "x-title"}
+            or not isinstance(value, str)
+            or not value.strip()
+            or any(char in value for char in "\r\n")
+            for key, value in headers.items()
+        ):
+            raise ValueError("provider headers must use the safe single-line allowlist")
         self.name = name
         self.base_url = base_url.rstrip("/")
         self.kind = kind
         self.api_key = api_key
+        self.custom_headers = dict(headers)
         self.model = model
         self.client = httpx.Client(transport=transport)
         self.transport = transport
@@ -126,7 +140,9 @@ class OpenAICompatibleProvider:
         self.retry.update(retry or {})
 
     def headers(self):
-        return {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+        result = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+        result.update(self.custom_headers)
+        return result
 
     def _wait_retry(self, attempt, retry_after=None):
         budget = current_retry_budget()

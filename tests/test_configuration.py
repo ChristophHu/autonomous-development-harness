@@ -54,6 +54,50 @@ def test_provider_kind_is_explicit_and_validated():
         )
 
 
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"Authorization": "secret"},
+        {"Cookie": "session"},
+        {"X-Title": "bad\r\ninjected: yes"},
+        {"X-Other": "value"},
+    ],
+)
+def test_provider_custom_headers_are_restricted_to_safe_metadata(headers):
+    with pytest.raises(ValidationError):
+        HarnessConfig.model_validate(
+            {"models": {"providers": {"p": {"headers": headers}}}}
+        )
+
+
+def test_provider_accepts_safe_metadata_headers_and_rejects_them_for_lmstudio():
+    settings = HarnessConfig.model_validate(
+        {
+            "models": {
+                "providers": {
+                    "p": {
+                        "headers": {
+                            "HTTP-Referer": "https://harness.test",
+                            "X-Title": "Harness",
+                        }
+                    }
+                }
+            }
+        }
+    )
+    assert settings.models.providers["p"].headers["X-Title"] == "Harness"
+    with pytest.raises(ValidationError):
+        HarnessConfig.model_validate(
+            {
+                "models": {
+                    "providers": {
+                        "p": {"kind": "lmstudio", "headers": {"X-Title": "Harness"}}
+                    }
+                }
+            }
+        )
+
+
 def test_mcp_streamable_http_requires_https_exact_host_binding_and_allowlist():
     server = {
         "transport": "streamable_http",
@@ -122,6 +166,30 @@ def test_model_tier_rejects_values_outside_supported_tiers(tier):
                 }
             }
         )
+
+
+@pytest.mark.parametrize(
+    "server",
+    [
+        {
+            "command": ["mcp"],
+            "allow_tools": ["read"],
+            "trusted_local": True,
+            "read_roots": [""],
+        },
+        {
+            "transport": "streamable_http",
+            "url": "https://mcp.example.test/rpc",
+            "allowed_hosts": ["mcp.example.test"],
+            "allow_tools": ["read"],
+            "read_roots": ["/tmp"],
+        },
+        {"builtin": "filesystem", "read_roots": ["/tmp"]},
+    ],
+)
+def test_mcp_read_roots_are_transport_and_builtin_scoped(server):
+    with pytest.raises(ValidationError):
+        HarnessConfig.model_validate({"tools": {"mcp": {"servers": {"s": server}}}})
 
 
 def test_model_tier_remains_optional_for_legacy_models():
@@ -331,6 +399,19 @@ def test_operational_config_objects_reject_invalid_shapes(payload, path):
 
 
 @pytest.mark.parametrize(
+    "payload",
+    [
+        {"agents": {"contract_mode": "sometimes"}},
+        {"agents": {"contract_mode": True}},
+        {"profiles": {"p": {"model": {"primary": "local"}, "contract_mode": "loose"}}},
+    ],
+)
+def test_agent_contract_modes_are_strictly_typed(payload):
+    with pytest.raises(ValidationError):
+        HarnessConfig.model_validate(payload)
+
+
+@pytest.mark.parametrize(
     "credential",
     [
         {"username": "oauth2", "secret_name": "GIT_TOKEN"},
@@ -454,11 +535,17 @@ def test_typed_config_accepts_current_runtime_configuration():
             },
         }
     )
-
+    assert settings.harness.max_parallel_steps == 4
     assert settings.models.providers["openai"].retry.max_attempts == 3
     assert settings.models.registry["openai_sol"].model == "vendor-model-id"
     assert settings.profiles["coding"].model.primary == "openai_sol"
     assert settings.testing.coverage.branches == 100
+
+
+@pytest.mark.parametrize("value", [0, 33, True, "4"])
+def test_parallel_step_limit_is_strict_and_bounded(value):
+    with pytest.raises(ValidationError):
+        HarnessConfig.model_validate({"harness": {"max_parallel_steps": value}})
 
 
 def test_typed_config_preserves_extensions_at_root_and_known_sections():
@@ -558,6 +645,10 @@ def test_configuration_service_reload_is_atomic_and_refreshes_sources(
         ({"api": {"swagger": "true"}}, "api.swagger"),
         ({"git": {"enabled": 1}}, "git.enabled"),
         ({"profiles": {"coding": {"max_steps": 0}}}, "profiles.coding.max_steps"),
+        (
+            {"profiles": {"coding": {"capabilities": ["superuser"]}}},
+            "profiles.coding.capabilities.0",
+        ),
         (
             {"models": {"registry": {"x": {"provider": 1, "model": "m"}}}},
             "models.registry.x.provider",

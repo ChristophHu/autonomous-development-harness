@@ -11,6 +11,7 @@ import socket
 import sqlite3
 import subprocess
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Annotated
@@ -24,9 +25,9 @@ from pydantic import ValidationError as PydanticValidationError
 from .completion import audit_gap_matrix, audit_harness_completion
 from .core import ROOT, Config, Task, build
 from .docker_broker import DockerComposeBroker
-from .providers import ProviderHealth
 from .security import SecretResolver
 from .service_lifecycle import ServiceLifecycle
+from .services import ModelOperationsService
 from .verification import source_tree_sha256
 
 app = typer.Typer(no_args_is_help=True)
@@ -34,12 +35,59 @@ tasks = typer.Typer(no_args_is_help=True)
 models = typer.Typer(no_args_is_help=True)
 config = typer.Typer(no_args_is_help=True)
 secrets = typer.Typer(no_args_is_help=True)
+artifacts = typer.Typer(no_args_is_help=True)
 memory = typer.Typer(no_args_is_help=True)
+evidence = typer.Typer(no_args_is_help=True)
 app.add_typer(tasks, name="tasks")
 app.add_typer(models, name="models")
 app.add_typer(config, name="config")
 app.add_typer(secrets, name="secrets")
+app.add_typer(artifacts, name="artifacts")
 app.add_typer(memory, name="memory")
+app.add_typer(evidence, name="evidence")
+
+
+@app.command("decisions")
+def decision_query(
+    task_id: int | None = typer.Option(None, "--task-id", min=1),
+    category: str | None = typer.Option(None, "--category"),
+    source: str | None = typer.Option(None, "--source"),
+    tag: str | None = typer.Option(None, "--tag"),
+    decision_id: int | None = typer.Option(None, "--id", min=1),
+):
+    """Read decisions by ID or with exact task/category/source/tag filters."""
+    from .decisions import DecisionService
+
+    _config, store, _orchestrator = build()
+    service = DecisionService(store)
+    if decision_id is not None:
+        decision = service.get(decision_id)
+        if decision is None:
+            typer.echo("decision not found")
+            raise typer.Exit(1)
+        rows = [decision]
+    else:
+        rows = service.query(task_id, category, source, tag)
+    typer.echo(
+        json.dumps([row.model_dump(mode="json") for row in rows], ensure_ascii=False)
+    )
+
+
+@artifacts.command("list")
+def artifact_list(task_id: int = typer.Option(..., "--task-id", min=1)):
+    """List the latest version of each task artifact."""
+    _config, store, _orchestrator = build()
+    typer.echo(json.dumps(store.artifacts_for_task(task_id), ensure_ascii=False))
+
+
+@artifacts.command("history")
+def artifact_history(
+    task_id: int = typer.Option(..., "--task-id", min=1),
+    key: str = typer.Option(..., "--key"),
+):
+    """Show append-only versions of one task artifact."""
+    _config, store, _orchestrator = build()
+    typer.echo(json.dumps(store.artifact_history(task_id, key), ensure_ascii=False))
 
 
 @app.command("completion")
@@ -66,6 +114,36 @@ def completion_status():
             evidence,
             source_sha256=source_tree_sha256(ROOT),
         )
+        settings = Config().settings.verification
+        required = settings.required_evidence
+        if required:
+            from .database import Database
+            from .evidence import EvidenceRepository, audit_evidence
+
+            database_path = Config().path("database")
+            rows = (
+                EvidenceRepository(Database(database_path)).list(limit=500)
+                if database_path.is_file()
+                else []
+            )
+            valid_by_kind = {}
+            for kind in required:
+                audit = audit_evidence(
+                    [row for row in rows if row["kind"] == kind],
+                    expected_subject_sha256=source_tree_sha256(ROOT),
+                    max_age_hours=settings.max_age_hours,
+                )
+                valid_by_kind[kind] = audit["healthy"]
+            report["required_evidence"] = valid_by_kind
+            report["evidence_policy_valid"] = all(valid_by_kind.values())
+            if not report["evidence_policy_valid"]:
+                report["complete"] = False
+                report["reasons"].append(
+                    "required external verification evidence is missing or invalid"
+                )
+        else:
+            report["required_evidence"] = {}
+            report["evidence_policy_valid"] = True
     except (OSError, ValueError) as error:
         typer.echo(f"Harness completion: unverifiable ({type(error).__name__})")
         raise typer.Exit(2) from None
@@ -74,6 +152,63 @@ def completion_status():
     report["open"] = matrix_report["open"]
     typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
     if not report["complete"]:
+        raise typer.Exit(1)
+
+
+def _evidence_repository():
+    from .database import Database
+    from .evidence import EvidenceRepository
+
+    return EvidenceRepository(Database(Config().path("database")))
+
+
+@evidence.command("import")
+def evidence_import(source: Path):
+    """Import one strict JSON verification record into append-only SQLite."""
+    from .evidence import EvidenceInput
+
+    try:
+        payload = EvidenceInput.model_validate_json(source.read_text(encoding="utf-8"))
+        result = _evidence_repository().record(payload)
+    except (OSError, ValueError) as error:
+        typer.echo(f"Evidence import rejected: {type(error).__name__}")
+        raise typer.Exit(2) from None
+    typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+@evidence.command("list")
+def evidence_list(
+    kind: str | None = typer.Option(None, "--kind"),
+    limit: int = typer.Option(100, "--limit", min=1, max=500),
+):
+    """List metadata-only imported evidence records."""
+    try:
+        records = _evidence_repository().list(kind=kind, limit=limit)
+    except ValueError as error:
+        typer.echo(f"Evidence query rejected: {type(error).__name__}")
+        raise typer.Exit(2) from None
+    typer.echo(json.dumps(records, ensure_ascii=False, indent=2))
+
+
+@evidence.command("audit")
+def evidence_audit(
+    subject_sha256: str = typer.Option(..., "--subject-sha256"),
+    max_age_hours: int = typer.Option(168, "--max-age-hours", min=1, max=8760),
+):
+    """Check evidence freshness and exact source-tree hash binding."""
+    from .evidence import audit_evidence
+
+    try:
+        report = audit_evidence(
+            _evidence_repository().list(limit=500),
+            expected_subject_sha256=subject_sha256,
+            max_age_hours=max_age_hours,
+        )
+    except ValueError as error:
+        typer.echo(f"Evidence audit rejected: {type(error).__name__}")
+        raise typer.Exit(2) from None
+    typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+    if not report["healthy"]:
         raise typer.Exit(1)
 
 
@@ -164,37 +299,30 @@ def _sqlite_health(store):
         connection = sqlite3.connect(uri, uri=True, timeout=1)
         try:
             result = connection.execute("PRAGMA quick_check").fetchone()
+            foreign_key_issues = connection.execute(
+                "PRAGMA foreign_key_check"
+            ).fetchall()
         finally:
             connection.close()
-        return "available" if result and result[0] == "ok" else "unhealthy"
+        return (
+            "available"
+            if result and result[0] == "ok" and not foreign_key_issues
+            else "unhealthy"
+        )
     except (OSError, sqlite3.Error, ValueError, TypeError):
         return "unavailable"
 
 
 def _provider_health(providers):
-    return {
-        name: _provider_status(_provider_probe(provider))
-        for name, provider in sorted(providers.items())
-    }
+    return ModelOperationsService.providers_health(providers)
 
 
 def _provider_probe(provider):
-    if hasattr(provider, "health_report"):
-        try:
-            return provider.health_report()
-        except (OSError, RuntimeError, ValueError, TypeError, httpx.HTTPError):
-            return "unavailable"
-    return _component_health(provider.health)
+    return ModelOperationsService.probe_provider(provider)
 
 
 def _provider_status(report):
-    return report.status if isinstance(report, ProviderHealth) else report
-
-
-def _model_available(report, model_id, discovered):
-    if isinstance(report, ProviderHealth):
-        return report.model_available(model_id)
-    return report == "available" and model_id in discovered
+    return ModelOperationsService.provider_status(report)
 
 
 def _config_health(conf):
@@ -378,9 +506,17 @@ def status():
 
 
 @app.command("metrics")
-def runtime_metrics():
+def runtime_metrics(
+    format: str = typer.Option("json", "--format", case_sensitive=False),
+):
     """Print durable task, event-catalogue, and model-usage counters."""
     _conf, _store, orchestrator = build()
+    if format.casefold() == "prometheus":
+        typer.echo(orchestrator.observability.prometheus(), nl=False)
+        return
+    if format.casefold() != "json":
+        typer.echo("Metrics format must be json or 'prometheus'.")
+        raise typer.Exit(2)
     typer.echo(json.dumps(orchestrator.observability.metrics(), indent=2))
 
 
@@ -526,7 +662,28 @@ def memory_audit():
 
     try:
         conf = Config()
-        report = audit_vault(conf.path("obsidian_vault"))
+        decision_rows = None
+        database_path = conf.path("database")
+        if database_path.is_file():
+            with sqlite3.connect(
+                f"file:{database_path}?mode=ro", uri=True
+            ) as connection:
+                connection.row_factory = sqlite3.Row
+                rows = connection.execute(
+                    "SELECT * FROM decisions ORDER BY id"
+                ).fetchall()
+            decision_rows = []
+            for row in rows:
+                item = dict(row)
+                for field in ("evidence", "field_names", "alternatives", "tags"):
+                    item[field] = json.loads(item[field])
+                decision_rows.append(item)
+        report = audit_vault(
+            conf.path("obsidian_vault"),
+            decision_rows=decision_rows,
+            content_governance=True,
+            source_root=ROOT,
+        )
     except (OSError, ValueError) as error:
         typer.echo(f"Vault audit unavailable: {type(error).__name__}")
         raise typer.Exit(2) from None
@@ -540,13 +697,82 @@ def qdrant_status():
     """Show Qdrant health, collection contract, and persisted point counts."""
     conf, _store, orchestrator = build()
     enabled = conf.data.get("memory", {}).get("qdrant", {}).get("enabled", False)
+    started = time.monotonic()
     report = _qdrant_report(orchestrator, enabled=enabled)
+    elapsed_ms = (time.monotonic() - started) * 1000
+    if enabled:
+        from .database import OperationalSnapshotRepository
+
+        OperationalSnapshotRepository(_store.database).record_qdrant_probe(
+            report, elapsed_ms
+        )
     report["enabled"] = enabled
     if not enabled:
         report["healthy"] = True
     typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
     if enabled and not report["healthy"]:
         raise typer.Exit(1)
+
+
+@memory.command("qdrant-acceptance")
+def qdrant_acceptance(confirm: bool = typer.Option(False, "--confirm")):
+    """Read-only live check of the configured embedding→Qdrant search path."""
+    if not confirm:
+        typer.echo(
+            "No provider request sent. Repeat with --confirm to run the live acceptance probe."
+        )
+        raise typer.Exit(2)
+    conf, _store, orchestrator = build()
+    qdrant_config = conf.data.get("memory", {}).get("qdrant", {})
+    if not qdrant_config.get("enabled", False):
+        typer.echo("Qdrant is disabled in configuration")
+        raise typer.Exit(1)
+    health = orchestrator.qdrant.health_report()
+    if not health.get("healthy"):
+        typer.echo(
+            json.dumps(
+                {
+                    "healthy": False,
+                    "stage": "qdrant_health",
+                    "errors": health.get("errors", []),
+                },
+                ensure_ascii=False,
+            )
+        )
+        raise typer.Exit(1)
+    try:
+        results = orchestrator.qdrant.search(
+            "Harness live embedding acceptance probe", limit=1
+        )
+        if not isinstance(results, list):
+            raise TypeError("Qdrant search result is invalid")
+    except (OSError, RuntimeError, TypeError, ValueError, httpx.HTTPError) as error:
+        typer.echo(
+            json.dumps(
+                {
+                    "healthy": False,
+                    "stage": "embedding_search",
+                    "error_type": type(error).__name__,
+                },
+                ensure_ascii=False,
+            )
+        )
+        raise typer.Exit(1) from None
+    embedding = conf.data.get("memory", {}).get("embeddings", {})
+    typer.echo(
+        json.dumps(
+            {
+                "healthy": True,
+                "read_only": True,
+                "stage": "embedding_search",
+                "collection": qdrant_config.get("collection", "harness-memory"),
+                "model": embedding.get("model"),
+                "dimension": embedding.get("dimensions", 1024),
+                "matches": len(results),
+            },
+            ensure_ascii=False,
+        )
+    )
 
 
 @memory.command("qdrant-init")
@@ -799,49 +1025,17 @@ def _watch_task_events(conf, task_id: int):
 @models.command("list")
 def model_list():
     _, _, orchestrator = build()
-    registry = orchestrator.models
-    providers = registry.providers
-    definitions = registry.models
-    names = set(providers) | {item.get("provider") for item in definitions.values()}
-    for name in sorted(item for item in names if isinstance(item, str)):
-        provider = providers.get(name)
-        report = _provider_probe(provider) if provider is not None else "unavailable"
-        state = _provider_status(report)
-        typer.echo(f"{name}\t{state}")
-        discovered = []
-        if isinstance(report, ProviderHealth):
-            discovered = report.models
-            registry.discovered[name] = tuple(sorted(set(discovered)))
-            if not report.api_available:
-                typer.echo(f"{name}\t<discovery failed>")
-        elif provider is not None:
-            try:
-                discovered = registry.discover(name)
-            except (OSError, RuntimeError, ValueError, httpx.HTTPError):
-                typer.echo(f"{name}\t<discovery failed>")
-        configured = {
-            alias: item
-            for alias, item in definitions.items()
-            if item.get("provider") == name
-        }
-        for alias, item in sorted(configured.items()):
-            model_id = item.get("model") or "-"
-            tier = item.get("tier") or "unknown"
-            model_state = (
-                "available"
-                if _model_available(report, model_id, discovered)
-                else "unavailable"
+    inventory = orchestrator.model_operations.model_inventory()
+    for provider in inventory:
+        name = provider["provider"]
+        typer.echo(f"{name}\t{provider['status']}")
+        if provider["discovery_failed"]:
+            typer.echo(f"{name}\t<discovery failed>")
+        for model in provider["models"]:
+            typer.echo(
+                f"{model['id']}\t{name}\t{model['alias']}\t"
+                f"{model['tier']}\t{model['status']}"
             )
-            typer.echo(f"{model_id}\t{name}\t{alias}\t{tier}\t{model_state}")
-        for model_id in sorted(
-            set(discovered) - {item.get("model") for item in configured.values()}
-        ):
-            model_state = (
-                "available"
-                if _model_available(report, model_id, discovered)
-                else "unavailable"
-            )
-            typer.echo(f"{model_id}\t{name}\t-\tunknown\t{model_state}")
 
 
 @models.command("status")
@@ -902,24 +1096,39 @@ def model_test(model_name: str):
 
 
 def _safe_config():
-    return Config().redacted(resolved=True)
+    from .services import ConfigurationApplicationService
+
+    return ConfigurationApplicationService(Config()).view(resolved=True)
 
 
 @config.command("show")
 def config_show():
-    typer.echo(yaml.safe_dump(Config().redacted(), sort_keys=False).rstrip())
+    from .services import ConfigurationApplicationService
+
+    typer.echo(
+        yaml.safe_dump(
+            ConfigurationApplicationService(Config()).view(), sort_keys=False
+        ).rstrip()
+    )
 
 
 @config.command("resolved")
 def config_resolved():
+    from .services import ConfigurationApplicationService
+
     typer.echo(
-        yaml.safe_dump(Config().redacted(resolved=True), sort_keys=False).rstrip()
+        yaml.safe_dump(
+            ConfigurationApplicationService(Config()).view(resolved=True),
+            sort_keys=False,
+        ).rstrip()
     )
 
 
 @config.command("validate")
 def config_validate():
-    Config().validate()
+    from .services import ConfigurationApplicationService
+
+    ConfigurationApplicationService(Config()).validate()
     typer.echo("configuration valid")
 
 

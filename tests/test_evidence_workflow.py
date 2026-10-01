@@ -92,11 +92,33 @@ def runtime(tmp_path):
                         ],
                     }
                 )
+            if prompt.startswith("REQUIREMENTS:"):
+                return json.dumps(
+                    {
+                        "fields": {},
+                        "rationale": "No additional requirement facts are supported.",
+                        "evidence": {},
+                    }
+                )
+            payload = json.loads(prompt.split("\n", 1)[1])
+            available = payload["available_evidence_ids"]
+            reference = available[0] if available else None
+            requirements = payload["task"]["requirements"]
+            criteria = [item["id"] for item in payload["task"]["acceptance_criteria"]]
             return json.dumps(
                 {
-                    "requirements": {"add two integers": True},
-                    "criteria": {"sum": True},
-                    "evidence": "Observed real subprocess tests and sum implementation.",
+                    "requirements": dict.fromkeys(requirements, True),
+                    "criteria": dict.fromkeys(criteria, True),
+                    "evidence": "Observed real subprocess tests and source artifacts.",
+                    "requirement_evidence": {
+                        name: [reference] if reference else [] for name in requirements
+                    },
+                    "criterion_evidence": {
+                        name: [f"criterion:{name}"]
+                        if f"criterion:{name}" in available
+                        else ([reference] if reference else [])
+                        for name in criteria
+                    },
                 }
             )
 
@@ -491,11 +513,25 @@ def test_real_executor_tool_loop_corrects_a_real_test_failure(tmp_path):
                     }
                 )
             assert '"artifacts"' in prompt
+            payload = json.loads(prompt.split("\n", 1)[1])
+            available = payload["available_evidence_ids"]
+            reference = available[0] if available else None
+            requirements = payload["task"]["requirements"]
+            criteria = [item["id"] for item in payload["task"]["acceptance_criteria"]]
             return json.dumps(
                 {
-                    "requirements": {"add two integers": True},
-                    "criteria": {"sum": True},
-                    "evidence": "Reviewed observed addition.py and actual test/coverage reports",
+                    "requirements": dict.fromkeys(requirements, True),
+                    "criteria": dict.fromkeys(criteria, True),
+                    "evidence": "Reviewed observed source artifacts and test reports",
+                    "requirement_evidence": {
+                        name: [reference] if reference else [] for name in requirements
+                    },
+                    "criterion_evidence": {
+                        name: [f"criterion:{name}"]
+                        if f"criterion:{name}" in available
+                        else ([reference] if reference else [])
+                        for name in criteria
+                    },
                 }
             )
 

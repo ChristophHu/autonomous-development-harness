@@ -1,10 +1,11 @@
+import ipaddress
 import subprocess
 
 import pytest
 from jsonschema import ValidationError
 
 from harness.core import Config, Permissions
-from harness.tools import ToolExecutor, ToolRegistry, ToolSpec
+from harness.tools import ToolExecutor, ToolRegistry, ToolSpec, resolve_http_addresses
 
 
 def executor(*rules):
@@ -61,7 +62,11 @@ def test_process_git_docker_http(monkeypatch, tmp_path):
         },
         "http": {"allowed_hosts": ["localhost"]},
     }
-    tool = ToolExecutor(Permissions(cfg), http_allow_hosts=["localhost"])
+    tool = ToolExecutor(
+        Permissions(cfg),
+        http_allow_hosts=["localhost"],
+        http_private_hosts=["localhost"],
+    )
 
     def run(args, **kwargs):
         calls.append(args)
@@ -77,12 +82,102 @@ def test_process_git_docker_http(monkeypatch, tmp_path):
     assert tool.shell(["echo", "hi"], tmp_path).stdout == "out"
     assert tool.git(["status"], tmp_path).returncode == 0
     assert tool.docker("status").returncode == 0
-    monkeypatch.setattr("httpx.request", lambda *a, **k: "response")
+    monkeypatch.setattr("harness.http_control.request", lambda *a, **k: "response")
     assert tool.http("GET", "http://localhost") == "response"
     with pytest.raises(PermissionError):
         tool.http("GET", "https://outside.test")
     assert len(calls) == 2
     assert "core.hooksPath=/dev/null" in calls[1]
+
+
+def test_http_destination_policy_rejects_private_dns_and_allows_explicit_local_host(
+    monkeypatch,
+):
+    config = Config()
+    config.data["tools"] = {"permissions": {"http": "write"}}
+    blocked = ToolExecutor(
+        Permissions(config),
+        http_allow_hosts=["service.test"],
+        http_resolver=lambda _host, _port: [ipaddress.ip_address("127.0.0.1")],
+    )
+    with pytest.raises(PermissionError, match="non-public"):
+        blocked.http("GET", "http://service.test/data")
+
+    seen = []
+    monkeypatch.setattr(
+        "harness.http_control.request",
+        lambda *args, **kwargs: seen.append((args, kwargs)) or "ok",
+    )
+    explicitly_local = ToolExecutor(
+        Permissions(config),
+        http_allow_hosts=["service.test"],
+        http_private_hosts=["service.test"],
+        http_resolver=lambda *_args: [ipaddress.ip_address("127.0.0.1")],
+    )
+    assert explicitly_local.http("GET", "http://service.test/data") == "ok"
+    assert len(seen) == 1
+    assert seen[0][1]["pinned_addresses"][0][0:2] == ("service.test", 80)
+
+
+def test_http_destination_policy_rejects_mixed_dns_addresses_and_bad_ports():
+    config = Config()
+    config.data["tools"] = {"permissions": {"http": "write"}}
+    tool = ToolExecutor(
+        Permissions(config),
+        http_allow_hosts=["service.test"],
+        http_resolver=lambda _host, _port: [
+            ipaddress.ip_address("93.184.216.34"),
+            ipaddress.ip_address("10.0.0.2"),
+        ],
+    )
+    with pytest.raises(PermissionError, match="non-public"):
+        tool.http("GET", "https://service.test/data")
+    with pytest.raises(PermissionError, match="invalid port"):
+        tool.http("GET", "https://service.test:bad/data")
+
+
+@pytest.mark.parametrize(
+    "resolver",
+    [
+        lambda _host, _port: [],
+        lambda _host, _port: (_ for _ in ()).throw(OSError("DNS unavailable")),
+    ],
+)
+def test_http_destination_policy_rejects_empty_or_failed_resolution(resolver):
+    config = Config()
+    config.data["tools"] = {"permissions": {"http": "write"}}
+    tool = ToolExecutor(
+        Permissions(config),
+        http_allow_hosts=["service.test"],
+        http_resolver=resolver,
+    )
+    with pytest.raises(
+        PermissionError,
+        match="could not be resolved|non-public|resolved to no addresses",
+    ):
+        tool.http("GET", "http://service.test/data")
+
+
+def test_http_resolver_handles_literals_dns_and_resolution_errors(monkeypatch):
+    assert resolve_http_addresses("127.0.0.1", 80) == [
+        ipaddress.ip_address("127.0.0.1")
+    ]
+    monkeypatch.setattr(
+        "harness.tools.socket.getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (None, None, None, None, ("93.184.216.34", 80)),
+            (None, None, None, None, ("93.184.216.34", 80)),
+        ],
+    )
+    assert resolve_http_addresses("service.test", 80) == [
+        ipaddress.ip_address("93.184.216.34")
+    ]
+    monkeypatch.setattr(
+        "harness.tools.socket.getaddrinfo",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("dns failure")),
+    )
+    with pytest.raises(PermissionError, match="could not be resolved"):
+        resolve_http_addresses("service.test", 80)
 
 
 def test_docker_actions_require_correct_permissions_and_use_broker(monkeypatch):
@@ -279,14 +374,19 @@ def test_http_secret_and_git_approval(monkeypatch):
 
     cfg = Config()
     cfg.data["tools"] = {"permissions": {"http": "write", "git": "write"}}
-    tool = ToolExecutor(Permissions(cfg), http_allow_hosts=["localhost"])
+    tool = ToolExecutor(
+        Permissions(cfg),
+        http_allow_hosts=["localhost"],
+        http_private_hosts=["localhost"],
+    )
     monkeypatch.setattr(
         "harness.security.SecretResolver",
         lambda: type("S", (), {"get": lambda self, name: "token"})(),
     )
     seen = {}
     monkeypatch.setattr(
-        "httpx.request", lambda method, url, **kwargs: seen.update(kwargs) or "ok"
+        "harness.http_control.request",
+        lambda method, url, **kwargs: seen.update(kwargs) or "ok",
     )
     assert tool.http("GET", "http://localhost/path", secret_name="API_KEY") == "ok"
     assert seen["headers"]["Authorization"] == "Bearer token"
@@ -314,7 +414,11 @@ def test_http_secret_and_git_approval(monkeypatch):
 def test_http_denies_missing_secret_and_bad_scheme(monkeypatch):
     cfg = Config()
     cfg.data["tools"] = {"permissions": {"http": "write"}}
-    tool = ToolExecutor(Permissions(cfg), http_allow_hosts=["localhost"])
+    tool = ToolExecutor(
+        Permissions(cfg),
+        http_allow_hosts=["localhost"],
+        http_private_hosts=["localhost"],
+    )
     monkeypatch.setattr(
         "harness.security.SecretResolver",
         lambda: type("S", (), {"get": lambda self, name: None})(),

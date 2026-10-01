@@ -1,15 +1,19 @@
+import asyncio
 import json
 from contextlib import contextmanager
 from types import SimpleNamespace
 
 import httpx
 import pytest
+from jsonschema import ValidationError
 
 from harness.agents import (
     AgentProfile,
     Complexity,
     Executor,
+    ExecutorOutput,
     ModelRegistry,
+    ModelResponse,
     ModelRouter,
     Planner,
     PlannerOutput,
@@ -17,10 +21,218 @@ from harness.agents import (
     RecoveryAgent,
     Subtask,
     Validator,
+    execute_plan_dag,
+    normalize_provider_response,
 )
 from harness.domain import Task, TaskComplexity
 from harness.process_control import RunControl, TaskCancelled, use_run_control
-from harness.providers import ModelUsage, OpenAICompatibleProvider, ProviderHealth
+from harness.providers import (
+    ModelUsage,
+    OpenAICompatibleProvider,
+    ProviderHealth,
+    ToolCall,
+)
+
+
+def test_plan_dag_runs_disjoint_ready_steps_concurrently_and_dependencies_after():
+    steps = [
+        Subtask(id="a", title="A", description="", write_paths=["src/a.py"]),
+        Subtask(id="b", title="B", description="", write_paths=["src/b.py"]),
+        Subtask(
+            id="c",
+            title="C",
+            description="",
+            dependencies=["a", "b"],
+            write_paths=["src/c.py"],
+        ),
+    ]
+    active = maximum = 0
+    completed = []
+
+    async def worker(step):
+        nonlocal active, maximum
+        active += 1
+        maximum = max(maximum, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        completed.append(step.id)
+        return ExecutorOutput(subtask_id=step.id, success=True, output=step.id)
+
+    outputs = asyncio.run(execute_plan_dag(steps, worker, max_parallel_steps=2))
+    assert maximum == 2
+    assert completed.index("c") > completed.index("a")
+    assert completed.index("c") > completed.index("b")
+    assert [item.subtask_id for item in outputs] == ["a", "b", "c"]
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        "answer",
+        ("answer", ModelUsage("fixture", "m")),
+        ("answer", ModelUsage("fixture", "m"), [ToolCall("id", "tool", {})]),
+        ModelResponse(text="answer", usage=ModelUsage("fixture", "m")),
+    ],
+)
+def test_provider_response_normalizer_returns_common_typed_fields(result):
+    text, usage, calls = normalize_provider_response(result)
+    assert text == "answer"
+    assert usage is None or isinstance(usage, ModelUsage)
+    assert isinstance(calls, list)
+    if isinstance(result, tuple) and len(result) == 3:
+        assert calls == result[2]
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        None,
+        (),
+        ("answer",),
+        ("answer", "invalid usage"),
+        ("answer", ModelUsage("fixture", "m"), "invalid calls"),
+        ("answer", ModelUsage("fixture", "m"), ["invalid call"]),
+    ],
+)
+def test_provider_response_normalizer_rejects_malformed_shapes(result):
+    with pytest.raises(TypeError):
+        normalize_provider_response(result)
+
+
+def test_model_router_returns_typed_usage_with_tool_response():
+    usage = ModelUsage("fixture", "fixture-model", prompt_tokens=2, completion_tokens=3)
+    response = ModelResponse(text="ok", usage=usage)
+    cfg = config({"profiles": {"p": {"model": {"primary": "fixture"}}}})
+    registry = ModelRegistry(cfg)
+    registry.register("fixture", FakeProvider(response))
+
+    result = ModelRouter(registry, cfg).complete("p", "prompt", tools=[])
+
+    assert isinstance(result, ModelResponse)
+    assert result.usage is usage
+    assert result.text == "ok"
+
+
+@pytest.mark.parametrize(
+    "paths",
+    [
+        (["src/shared"], ["src/shared/file.py"]),
+        ([], ["src/b.py"]),
+        (["src/a.py"], []),
+        ([""], ["src/b.py"]),
+    ],
+)
+def test_plan_dag_serializes_conflicting_or_undeclared_writes(paths):
+    steps = [
+        Subtask(id="a", title="A", description="", write_paths=paths[0]),
+        Subtask(id="b", title="B", description="", write_paths=paths[1]),
+    ]
+    active = maximum = 0
+
+    async def worker(step):
+        nonlocal active, maximum
+        active += 1
+        maximum = max(maximum, active)
+        await asyncio.sleep(0.005)
+        active -= 1
+        return ExecutorOutput(subtask_id=step.id, success=True, output="ok")
+
+    asyncio.run(execute_plan_dag(steps, worker, max_parallel_steps=4))
+    assert maximum == 1
+
+
+def test_plan_dag_bounds_concurrency_and_skips_failed_dependencies():
+    steps = [
+        Subtask(id="a", title="A", description="", write_paths=["a.py"]),
+        Subtask(
+            id="b", title="B", description="", dependencies=["a"], write_paths=["b.py"]
+        ),
+        Subtask(id="c", title="C", description="", write_paths=["c.py"]),
+    ]
+    calls = []
+
+    async def worker(step):
+        calls.append(step.id)
+        return ExecutorOutput(
+            subtask_id=step.id, success=step.id != "a", output="result"
+        )
+
+    persisted = []
+    outputs = asyncio.run(
+        execute_plan_dag(
+            steps,
+            worker,
+            max_parallel_steps=1,
+            on_complete=lambda step, output: persisted.append(
+                (step.id, output.success)
+            ),
+        )
+    )
+    assert calls == ["a", "c"]
+    assert outputs[1].output == "dependency failed"
+    assert [item.subtask_id for item in outputs] == ["a", "b", "c"]
+    assert persisted == [("a", False), ("b", False), ("c", True)]
+
+
+@pytest.mark.parametrize("limit", [0, 33, True, "2"])
+def test_plan_dag_rejects_invalid_parallelism(limit):
+    async def worker(_step):
+        raise AssertionError("invalid limit must fail before scheduling")
+
+    with pytest.raises(ValueError, match="max_parallel_steps"):
+        asyncio.run(
+            execute_plan_dag(
+                [Subtask(id="a", title="A", description="")],
+                worker,
+                max_parallel_steps=limit,
+            )
+        )
+
+
+def test_plan_dag_surfaces_worker_error_after_joining_siblings():
+    steps = [
+        Subtask(id="a", title="A", description="", write_paths=["a.py"]),
+        Subtask(id="b", title="B", description="", write_paths=["b.py"]),
+    ]
+    finished = []
+
+    async def worker(step):
+        await asyncio.sleep(0)
+        finished.append(step.id)
+        if step.id == "a":
+            raise RuntimeError("worker failed")
+        return ExecutorOutput(subtask_id=step.id, success=True, output="ok")
+
+    with pytest.raises(RuntimeError, match="worker failed"):
+        asyncio.run(execute_plan_dag(steps, worker, max_parallel_steps=2))
+    assert sorted(finished) == ["a", "b"]
+
+
+def test_plan_dag_rejects_graph_that_cannot_progress():
+    invalid_step = SimpleNamespace(
+        id="blocked", dependencies=["missing"], write_paths=["blocked.py"]
+    )
+
+    async def worker(_step):
+        raise AssertionError("unreachable step cannot run")
+
+    with pytest.raises(ValueError, match="cannot make progress"):
+        asyncio.run(execute_plan_dag([invalid_step], worker))
+
+
+def test_plan_dag_awaits_async_completion_persistence():
+    step = Subtask(id="a", title="A", description="", write_paths=["a.py"])
+    persisted = []
+
+    async def worker(current):
+        return ExecutorOutput(subtask_id=current.id, success=True, output="ok")
+
+    async def persist(current, output):
+        await asyncio.sleep(0)
+        persisted.append((current.id, output.output))
+
+    asyncio.run(execute_plan_dag([step], worker, on_complete=persist))
+    assert persisted == [("a", "ok")]
 
 
 class FakeProvider:
@@ -66,6 +278,430 @@ def test_registry_profiles_and_selection():
     assert ModelRouter(registry, c).select("coding", Complexity.SIMPLE) is registry.get(
         "fake"
     )
+
+
+def test_profile_catalog_lists_only_valid_configured_profiles():
+    registry = ProfileRegistry(
+        config(
+            {
+                "profiles": {
+                    "coding": {"model": {"primary": "local"}},
+                    "planner": {"model": {"primary": "local"}},
+                }
+            }
+        )
+    )
+    assert tuple(registry.catalog()) == ("coding", "planner")
+
+
+def test_profile_catalog_rejects_non_mapping_profiles():
+    with pytest.raises(TypeError, match="profiles must be a mapping"):
+        ProfileRegistry(config({"profiles": []})).catalog()
+
+
+def test_agent_role_profile_defaults_and_configured_override():
+    registry = ProfileRegistry(
+        config(
+            {
+                "profiles": {
+                    "planner": {"model": {"primary": "local"}},
+                    "coding": {"model": {"primary": "local"}},
+                    "validator": {"model": {"primary": "local"}},
+                    "test-engineer": {"model": {"primary": "local"}},
+                    "review": {"model": {"primary": "local"}},
+                },
+                "agent_roles": {"independent-review": "review"},
+            }
+        )
+    )
+    assert registry.for_role("executor").name == "coding"
+    assert registry.for_role("executor").capabilities == ["execute"]
+    assert registry.for_role("requirements").capabilities == ["requirements"]
+    assert registry.for_role("independent-review").name == "review"
+    with pytest.raises(ValueError, match="unknown agent role"):
+        registry.for_role("unknown")
+
+
+def test_agent_dispatch_rejects_explicit_profile_capability_mismatch():
+    registry = ProfileRegistry(
+        config(
+            {
+                "profiles": {
+                    "coding": {
+                        "model": {"primary": "local"},
+                        "capabilities": ["test"],
+                    }
+                }
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="lacks required capabilities for executor"):
+        registry.for_role("executor")
+
+
+def test_agent_dispatch_accepts_explicit_minimum_role_capability():
+    registry = ProfileRegistry(
+        config(
+            {
+                "profiles": {
+                    "coding": {
+                        "model": {"primary": "local"},
+                        "capabilities": ["execute"],
+                    }
+                }
+            }
+        )
+    )
+    assert registry.for_role("executor").capabilities == ["execute"]
+
+
+def test_agent_profile_validates_typed_input_and_output_contracts():
+    profile = AgentProfile(
+        name="typed",
+        instructions="follow contract",
+        model="local",
+        input_schema={
+            "type": "object",
+            "properties": {"task_id": {"type": "integer"}},
+            "required": ["task_id"],
+            "additionalProperties": False,
+        },
+        output_schema={"type": "string", "minLength": 1},
+    )
+    payload = {"task_id": 7}
+    assert profile.validate_input(payload) is payload
+    assert profile.validate_output("done") == "done"
+    with pytest.raises(ValidationError):
+        profile.validate_input({"task_id": "7"})
+    with pytest.raises(ValidationError):
+        profile.validate_output("")
+
+
+def test_agent_profile_without_contract_is_backward_compatible():
+    profile = AgentProfile(name="legacy", instructions="", model="local")
+    payload = {"anything": True}
+    assert profile.validate_input(payload) is payload
+    assert profile.validate_output(payload) is payload
+
+
+def test_required_contract_mode_rejects_profile_missing_either_contract():
+    registry = ProfileRegistry(
+        config(
+            {
+                "agents": {"contract_mode": "required"},
+                "profiles": {"p": {"model": {"primary": "local"}}},
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="requires input_schema and output_schema"):
+        registry.for_agent("custom", "p")
+
+
+def test_required_contract_mode_rejects_unknown_role_without_derived_contract():
+    assert ProfileRegistry._role_contracts("custom") is None
+    registry = ProfileRegistry(
+        config(
+            {
+                "agents": {"contract_mode": "required"},
+                "profiles": {"p": {"model": {"primary": "local"}}},
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="requires input_schema and output_schema"):
+        registry.for_agent("custom", "p")
+
+
+def test_required_contract_mode_allows_explicit_legacy_profile():
+    registry = ProfileRegistry(
+        config(
+            {
+                "agents": {"contract_mode": "required"},
+                "profiles": {
+                    "p": {"model": {"primary": "local"}, "contract_mode": "legacy"}
+                },
+            }
+        )
+    )
+    assert registry.for_agent("custom", "p").name == "p"
+
+
+def test_required_contract_mode_accepts_and_enforces_both_schemas():
+    schema = {
+        "type": "object",
+        "required": ["ok"],
+        "properties": {"ok": {"type": "boolean"}},
+        "additionalProperties": False,
+    }
+    registry = ProfileRegistry(
+        config(
+            {
+                "agents": {"contract_mode": "required"},
+                "profiles": {
+                    "p": {
+                        "model": {"primary": "local"},
+                        "contract_mode": "strict",
+                        "input_schema": schema,
+                        "output_schema": schema,
+                    }
+                },
+            }
+        )
+    )
+    profile = registry.for_agent("custom", "p")
+    assert profile.validate_input({"ok": True}) == {"ok": True}
+    with pytest.raises(ValidationError):
+        profile.validate_output({"ok": "yes"})
+
+
+@pytest.mark.parametrize(
+    "role",
+    [
+        "planner",
+        "requirements",
+        "executor",
+        "tester",
+        "validator",
+        "recovery-inspector",
+        "independent-review",
+    ],
+)
+def test_required_contract_mode_derives_contracts_for_builtin_roles(role):
+    names = {"planner", "coding", "test-engineer", "validator"}
+    registry = ProfileRegistry(
+        config(
+            {
+                "agents": {"contract_mode": "required"},
+                "profiles": {name: {"model": {"primary": "local"}} for name in names},
+            }
+        )
+    )
+    profile = registry.for_role(role)
+    assert profile.input_schema["type"] == "object"
+    assert profile.output_schema["type"] == "object"
+    with pytest.raises(ValidationError):
+        profile.validate_input(None)
+    with pytest.raises(ValidationError):
+        profile.validate_output(None)
+
+
+def test_contract_mode_treats_non_mapping_runtime_settings_as_legacy():
+    registry = ProfileRegistry(
+        config(
+            {
+                "agents": [],
+                "profiles": {"p": {"model": {"primary": "local"}}},
+            }
+        )
+    )
+    assert registry.for_agent("custom", "p").name == "p"
+
+
+def test_required_mode_rejects_profile_with_only_one_schema():
+    registry = ProfileRegistry(
+        config(
+            {
+                "agents": {"contract_mode": "required"},
+                "profiles": {
+                    "p": {
+                        "model": {"primary": "local"},
+                        "input_schema": {"type": "object"},
+                    }
+                },
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="requires input_schema and output_schema"):
+        registry.for_agent("custom", "p")
+
+
+def test_profile_strict_mode_requires_contracts_under_optional_global_mode():
+    registry = ProfileRegistry(
+        config(
+            {
+                "agents": {"contract_mode": "optional"},
+                "profiles": {
+                    "p": {
+                        "model": {"primary": "local"},
+                        "contract_mode": "strict",
+                    }
+                },
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="requires input_schema and output_schema"):
+        registry.for_agent("custom", "p")
+
+
+def test_agent_profile_rejects_malformed_contract_schema():
+    registry = ProfileRegistry(
+        config(
+            {
+                "profiles": {
+                    "broken": {
+                        "model": {"primary": "local"},
+                        "input_schema": "not-json-schema",
+                    }
+                }
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="input_schema must be an object"):
+        registry.get("broken")
+
+
+@pytest.mark.parametrize(
+    "data,message",
+    [
+        (
+            {"profiles": {"p": {"model": {"primary": "local"}}}, "agent_roles": []},
+            "agent_roles must be a mapping",
+        ),
+        (
+            {
+                "profiles": {"p": {"model": {"primary": "local"}}},
+                "agent_roles": {"review": "missing"},
+            },
+            "unknown or invalid agent profile: missing",
+        ),
+        (
+            {
+                "profiles": {"p": {"model": {"primary": "local"}}},
+                "agent_roles": {"review": " "},
+            },
+            "invalid profile",
+        ),
+    ],
+)
+def test_agent_role_catalog_rejects_invalid_configuration(data, message):
+    with pytest.raises((ValueError, TypeError), match=message):
+        ProfileRegistry(config(data)).role_profiles()
+
+
+def test_agent_role_catalog_rejects_non_string_role_name():
+    with pytest.raises(ValueError, match="role names"):
+        ProfileRegistry(
+            config({"profiles": {}, "agent_roles": {1: "p"}})
+        ).role_profiles()
+
+
+def test_planner_dispatches_by_role_and_canonicalizes_step_profile():
+    plan = {
+        "summary": "role-selected plan",
+        "complexity": "LOW",
+        "subtasks": [
+            {
+                "id": "s1",
+                "title": "implement",
+                "description": "do work",
+                "assigned_agent": "executor",
+                "profile": "coding-specialist",
+                "expected_result": "file updated",
+                "acceptance_criteria": ["c1"],
+            }
+        ],
+    }
+
+    config_for_test = config(
+        {
+            "profiles": {
+                name: {"model": {"primary": "local"}, "tools": []}
+                for name in ("planner-specialist", "coding-specialist")
+            },
+            "agent_roles": {
+                "planner": "planner-specialist",
+                "executor": "coding-specialist",
+            },
+        }
+    )
+    config_for_test.data["profiles"]["planner-specialist"].update(
+        {
+            "input_schema": {
+                "type": "object",
+                "required": ["title"],
+                "properties": {"title": {"type": "string"}},
+            },
+            "output_schema": {
+                "type": "object",
+                "required": ["summary"],
+                "properties": {"summary": {"type": "string"}},
+            },
+        }
+    )
+
+    class Router:
+        config = config_for_test
+
+        def complete(self, profile, *_args, **_kwargs):
+            self.selected_profile = profile
+            return json.dumps(plan)
+
+    router = Router()
+    task = Task(
+        title="role routing",
+        acceptance_criteria=[{"id": "c1", "description": "file updated"}],
+    )
+    result = Planner(router).plan(task)
+    assert router.selected_profile == "planner-specialist"
+    assert result.subtasks[0].profile == "coding-specialist"
+
+
+def test_planner_rejects_profile_that_bypasses_role_assignment():
+    class Router:
+        config = config(
+            {
+                "profiles": {
+                    name: {"model": {"primary": "local"}, "tools": []}
+                    for name in ("planner-specialist", "coding-specialist", "unsafe")
+                },
+                "agent_roles": {
+                    "planner": "planner-specialist",
+                    "executor": "coding-specialist",
+                },
+            }
+        )
+
+        def complete(self, *_args, **_kwargs):
+            return json.dumps(
+                {
+                    "summary": "bad plan",
+                    "complexity": "LOW",
+                    "subtasks": [
+                        {
+                            "id": "s1",
+                            "title": "unsafe",
+                            "description": "try escalation",
+                            "assigned_agent": "executor",
+                            "profile": "unsafe",
+                            "expected_result": "none",
+                            "acceptance_criteria": ["c1"],
+                        }
+                    ],
+                }
+            )
+
+    with pytest.raises(ValueError, match="does not match configured dispatch"):
+        Planner(Router()).plan(
+            Task(
+                title="role boundary",
+                acceptance_criteria=[{"id": "c1", "description": "done"}],
+            )
+        )
+
+
+def test_agent_assignment_rejects_builtin_role_profile_escalation_and_allows_unknown_role():
+    registry = ProfileRegistry(
+        config(
+            {
+                "profiles": {
+                    name: {"model": {"primary": "local"}}
+                    for name in ("coding", "unsafe", "custom")
+                }
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="does not match dispatch policy"):
+        registry.for_agent("executor", "unsafe")
+    assert registry.for_agent("custom-agent", "custom").name == "custom"
 
 
 @pytest.mark.parametrize(
@@ -836,7 +1472,9 @@ def test_executor_dispatches_only_profile_granted_tools(tmp_path):
     c.data["profiles"]["coding"]["model"] = {"primary": "fake"}
     c.data["tools"] = {"permissions": {"filesystem": "read"}}
     router = ModelRouter(registry, c)
-    tool_registry = ToolRegistry(Permissions(Config()), workspace=tmp_path)
+    isolated_config = Config()
+    isolated_config.data["tools"]["mcp"] = {"servers": {}}
+    tool_registry = ToolRegistry(Permissions(isolated_config), workspace=tmp_path)
     (tmp_path / "x").write_text("contents")
     result = Executor(router, tool_registry).execute(
         Subtask(id="1", title="read", description="read it")

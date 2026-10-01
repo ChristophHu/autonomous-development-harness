@@ -40,6 +40,7 @@ def test_restart_reconciles_actual_state_before_replanning(tmp_path):
         if prompt.startswith("REVIEW:"):
             review = json.loads(result)
             review["criteria"]["missing"] = True
+            review["criterion_evidence"]["missing"] = ["criterion:missing"]
             return json.dumps(review)
         return result
 
