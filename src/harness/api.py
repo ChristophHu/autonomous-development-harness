@@ -11,8 +11,8 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, StrictStr
 from .core import Event, Task, build
 from .decisions import Decision, DecisionService
 from .domain import AcceptanceCriterion, Status, TaskComplexity
-from .evidence import EvidenceInput, EvidenceRepository, audit_evidence
-from .services import ConfigurationApplicationService
+from .evidence import EvidenceInput
+from .services import ConfigurationApplicationService, VerificationEvidenceService
 
 
 class ErrorResponse(BaseModel):
@@ -61,6 +61,7 @@ class QuestionRequest(BaseModel):
     )
     options: list[str] = Field(default_factory=list)
     required: bool = True
+    purpose: Literal["input", "decision"] = "input"
 
 
 class QuestionResponse(BaseModel):
@@ -74,6 +75,7 @@ class QuestionResponse(BaseModel):
                     "reason": "Compatibility is unclear.",
                     "options": ["yes", "no"],
                     "required": True,
+                    "purpose": "decision",
                     "answer": None,
                     "status": "open",
                     "created_at": "2026-09-28T12:00:00+00:00",
@@ -89,6 +91,7 @@ class QuestionResponse(BaseModel):
     reason: str
     options: list[str]
     required: bool
+    purpose: Literal["input", "decision", "approval"] = "input"
     answer: str | None
     status: str
     created_at: str
@@ -198,6 +201,7 @@ class ModelUsageRow(BaseModel):
     reasoning_tokens: int | None
     cost: float | None
     error_type: str | None
+    error_category: str | None = None
 
 
 class ModelUsageTotals(BaseModel):
@@ -290,6 +294,7 @@ def _question(row):
         reason=safe["reason"],
         options=safe["options"],
         required=bool(row["required"]),
+        purpose=row["purpose"],
         answer=safe["answer"],
         status=row["status"],
         created_at=row["created_at"],
@@ -370,7 +375,7 @@ def get_decision(decision_id: int):
 @router.post("/verification/evidence")
 def import_verification_evidence(payload: EvidenceInput):
     try:
-        return EvidenceRepository(store.database).record(payload)
+        return VerificationEvidenceService(store.database).record(payload)
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
 
@@ -380,7 +385,7 @@ def list_verification_evidence(
     kind: Literal["ci", "provider", "qdrant", "embedding", "http_tls"] | None = None,
     limit: int = Query(default=100, ge=1, le=500),
 ):
-    return EvidenceRepository(store.database).list(kind=kind, limit=limit)
+    return VerificationEvidenceService(store.database).list(kind=kind, limit=limit)
 
 
 @router.get("/verification/evidence/audit")
@@ -388,9 +393,8 @@ def audit_verification_evidence(
     subject_sha256: str = Query(pattern=r"^[a-f0-9]{64}$"),
     max_age_hours: int = Query(default=168, ge=1, le=8760),
 ):
-    rows = EvidenceRepository(store.database).list(limit=500)
-    return audit_evidence(
-        rows, expected_subject_sha256=subject_sha256, max_age_hours=max_age_hours
+    return VerificationEvidenceService(store.database).audit(
+        subject_sha256=subject_sha256, max_age_hours=max_age_hours
     )
 
 
@@ -549,6 +553,7 @@ def ask_question(task_id: int, payload: QuestionRequest):
             payload.reason,
             payload.options,
             payload.required,
+            payload.purpose,
         )
     except ValueError as exc:
         raise _service_error(exc) from exc

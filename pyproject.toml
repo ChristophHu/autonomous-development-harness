@@ -16,10 +16,11 @@ dev = ["pytest>=8", "pytest-cov>=5", "ruff>=0.6", "httpx2>=2"]
 harness = "harness.cli:app"
 harness-filesystem-mcp = "harness.mcp_servers.filesystem:main"
 harness-obsidian-mcp = "harness.mcp_servers.obsidian:main"
+harness-apple-shell-mcp = "harness.mcp_servers.apple_shell.server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "src/harness/mcp_servers"]
 addopts = "--cov=harness --cov-branch --cov-report=term-missing --cov-report=json --cov-fail-under=100"

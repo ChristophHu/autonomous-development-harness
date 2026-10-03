@@ -40,7 +40,43 @@ def test_complete_example_config_is_valid_and_has_specified_sections(tmp_path):
     assert settings.git.workflow["feature"] == "feature/"
     assert settings.testing.coverage.branches == 100
     assert settings.tools.permissions["filesystem.delete"] == "denied"
+    assert settings.harness.max_correction_attempts == 2
     assert ConfigurationService(sample).validate()
+
+
+def test_configuration_extensions_are_explicit_and_unknown_fields_are_rejected():
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        HarnessConfig.model_validate({"harness": {"untyped_option": True}})
+
+    settings = HarnessConfig.model_validate(
+        {
+            "extensions": {"vendor": {"mode": "custom"}},
+            "harness": {"extensions": {"label": "local"}},
+        }
+    )
+
+    assert settings.extensions == {"vendor": {"mode": "custom"}}
+    assert settings.harness.extensions == {"label": "local"}
+
+
+def test_default_configuration_path_can_be_overridden_for_isolated_tests(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "isolated-config.yaml"
+    path.write_text("harness:\n  name: isolated-test-config\n")
+    monkeypatch.setenv("HARNESS_CONFIG_PATH", str(path))
+
+    config = ConfigurationService()
+
+    assert config._path == path
+    assert config.resolved()["harness"]["name"] == "isolated-test-config"
+
+
+def test_known_path_settings_may_be_omitted_after_defaults_are_loaded():
+    config = ConfigurationService()
+    config.data["paths"].pop("logs")
+
+    assert config.validate()
 
 
 def test_provider_kind_is_explicit_and_validated():
@@ -548,22 +584,32 @@ def test_parallel_step_limit_is_strict_and_bounded(value):
         HarnessConfig.model_validate({"harness": {"max_parallel_steps": value}})
 
 
+@pytest.mark.parametrize("value", [-1, 11, True, "2"])
+def test_correction_attempt_limit_is_strict_and_bounded(value):
+    with pytest.raises(ValidationError):
+        HarnessConfig.model_validate({"harness": {"max_correction_attempts": value}})
+
+
 def test_typed_config_preserves_extensions_at_root_and_known_sections():
     settings = HarnessConfig.model_validate(
         {
-            "x_org_extension": {"mode": "custom"},
+            "extensions": {"x_org_extension": {"mode": "custom"}},
             "models": {
-                "x_registry_source": "catalog",
-                "providers": {"local": {"enabled": False, "x_transport": "unix"}},
+                "extensions": {"x_registry_source": "catalog"},
+                "providers": {
+                    "local": {"enabled": False, "extensions": {"x_transport": "unix"}}
+                },
             },
-            "profiles": {"coding": {"model": {}, "x_prompt_revision": 4}},
+            "profiles": {
+                "coding": {"model": {}, "extensions": {"x_prompt_revision": 4}}
+            },
         }
     )
 
-    assert settings.model_extra["x_org_extension"] == {"mode": "custom"}
-    assert settings.models.model_extra["x_registry_source"] == "catalog"
-    assert settings.models.providers["local"].model_extra["x_transport"] == "unix"
-    assert settings.profiles["coding"].model_extra["x_prompt_revision"] == 4
+    assert settings.extensions["x_org_extension"] == {"mode": "custom"}
+    assert settings.models.extensions["x_registry_source"] == "catalog"
+    assert settings.models.providers["local"].extensions["x_transport"] == "unix"
+    assert settings.profiles["coding"].extensions["x_prompt_revision"] == 4
 
 
 def test_configuration_service_exposes_fresh_typed_settings_and_path(
@@ -581,7 +627,10 @@ def test_configuration_service_exposes_fresh_typed_settings_and_path(
     path.write_text(
         yaml.safe_dump(
             {
-                "paths": {"workspace": "./initial", "extension_data": "./extra"},
+                "paths": {
+                    "workspace": "./initial",
+                    "extensions": {"extension_data": "./extra"},
+                },
                 "api": {"port": 8090},
             }
         )
@@ -590,7 +639,7 @@ def test_configuration_service_exposes_fresh_typed_settings_and_path(
 
     assert config.settings.api.port == 8090
     assert config.path("workspace") == tmp_path / "initial"
-    assert config.path("extension_data") == tmp_path / "extra"
+    assert config.settings.paths.extensions["extension_data"] == "./extra"
     assert config.path("unconfigured") == tmp_path / "unconfigured"
 
     config.data["api"]["port"] = "private-invalid-value"

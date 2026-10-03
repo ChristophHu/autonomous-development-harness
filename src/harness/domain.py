@@ -17,6 +17,8 @@ class Status(StrEnum):
     CORRECTING = "correcting"
     RECOVERING = "recovering"
     WAITING_HUMAN = "waiting_human"
+    WAITING_DECISION = "waiting_decision"
+    WAITING_APPROVAL = "waiting_approval"
     COMPLETED = "completed"
     FAILED = "failed"
     BLOCKED = "blocked"
@@ -93,8 +95,25 @@ TRANSITIONS = {
     Status.CORRECTING: {Status.EXECUTING, Status.PLANNING},
     Status.RECOVERING: {Status.ANALYZING},
     Status.WAITING_HUMAN: {Status.ANALYZING, Status.RECOVERING},
+    Status.WAITING_DECISION: {Status.ANALYZING, Status.RECOVERING},
+    Status.WAITING_APPROVAL: {Status.ANALYZING, Status.RECOVERING},
     Status.FAILED: {Status.ANALYZING, Status.RECOVERING},
     Status.BLOCKED: {Status.ANALYZING, Status.RECOVERING},
+}
+
+RECOVERABLE = {
+    Status.ANALYZING,
+    Status.PLANNING,
+    Status.READY,
+    Status.EXECUTING,
+    Status.TESTING,
+    Status.VALIDATING,
+    Status.CORRECTING,
+    Status.WAITING_HUMAN,
+    Status.WAITING_DECISION,
+    Status.WAITING_APPROVAL,
+    Status.FAILED,
+    Status.BLOCKED,
 }
 
 
@@ -102,11 +121,17 @@ def may_transition(source, target):
     source, target = Status(source), Status(target)
     if source in TERMINAL:
         return False
+    if target is Status.RECOVERING:
+        return source in RECOVERABLE
     if target in {
         Status.CANCELLED,
         Status.FAILED,
         Status.BLOCKED,
         Status.WAITING_HUMAN,
+        Status.WAITING_DECISION,
+        Status.WAITING_APPROVAL,
+        Status.WAITING_DECISION,
+        Status.WAITING_APPROVAL,
     }:
         return True
     return target in TRANSITIONS.get(source, set())

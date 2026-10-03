@@ -5,6 +5,7 @@ mounts, images, contexts and TCP daemon endpoints are never forwarded.
 """
 
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -16,6 +17,7 @@ from pathlib import Path
 import httpx
 import yaml
 
+from .isolation import ProcessAccessProfile, isolated_command
 from .process_control import run_cancellable
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -26,6 +28,10 @@ IMAGE = "qdrant/qdrant:v1.19.0"
 MAX_OUTPUT = 1_000_000
 _ACTIONS = {"status", "start", "stop", "logs"}
 _ISOLATED_ACTIONS = {"status", "start", "stop", "restart", "cleanup"}
+_PINNED_QDRANT_IMAGE = re.compile(
+    r"qdrant/qdrant:v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?"
+    r"|qdrant/qdrant@sha256:[0-9a-f]{64}"
+)
 
 
 class DockerComposeBroker:
@@ -180,10 +186,11 @@ class DockerComposeBroker:
             host_port = probe.getsockname()[1]
         return host_port
 
-    def _isolated_manifest(self, project_name):
+    def _isolated_manifest(self, project_name, image=IMAGE):
         host_port = self._isolated_projects[project_name]
         _path, manifest_text = self._manifest()
         manifest = yaml.safe_load(manifest_text)
+        manifest["services"][SERVICE]["image"] = image
         manifest["services"][SERVICE]["restart"] = "no"
         manifest["services"][SERVICE]["ports"] = [f"127.0.0.1:{host_port}:6333"]
         return yaml.safe_dump(manifest, sort_keys=True)
@@ -196,29 +203,58 @@ class DockerComposeBroker:
         return self._command(
             action,
             compose_file=compose_file,
-            project_directory=PROJECT_ROOT,
+            project_directory=Path(compose_file).parent,
             project_name=project_name,
         )
 
-    def run_isolated(self, action, *, project_name):
+    def _sandboxed_command(self, command, *, compose_file, temporary_root):
+        profile = ProcessAccessProfile.broker(
+            "docker_compose",
+            read_roots=(compose_file,),
+            write_roots=(temporary_root,),
+            executable_paths=(command[0],),
+            unix_sockets=(self._socket(),),
+        )
+        return isolated_command(
+            command,
+            temporary_root,
+            access_profile=profile,
+        )
+
+    @staticmethod
+    def _validate_pinned_image(image):
+        if not isinstance(image, str) or not _PINNED_QDRANT_IMAGE.fullmatch(image):
+            raise ValueError("image must be a pinned official Qdrant release")
+        return image
+
+    def run_isolated(self, action, *, project_name, image=None):
         if action not in _ISOLATED_ACTIONS:
             raise PermissionError("isolated Docker action is not allowlisted")
         if project_name not in self._isolated_projects:
             raise PermissionError("isolated Docker project is not owned by this broker")
-        env = {
-            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
-            "HOME": str(Path.home()),
-            "LANG": os.environ.get("LANG", "C.UTF-8"),
-        }
+        if image is not None:
+            image = self._validate_pinned_image(image)
         try:
             with tempfile.TemporaryDirectory(
                 prefix="adh-test-compose-", dir="/private/tmp"
             ) as directory:
+                env = {
+                    "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+                    "HOME": directory,
+                    "LANG": os.environ.get("LANG", "C.UTF-8"),
+                }
                 snapshot = Path(directory) / "docker-compose.yml"
-                snapshot.write_text(self._isolated_manifest(project_name))
+                snapshot.write_text(
+                    self._isolated_manifest(project_name, image or IMAGE)
+                )
                 snapshot.chmod(0o600)
-                command = self._isolated_command(
+                docker_command = self._isolated_command(
                     action, project_name=project_name, compose_file=snapshot
+                )
+                command = self._sandboxed_command(
+                    docker_command,
+                    compose_file=snapshot,
+                    temporary_root=Path(directory),
                 )
                 result = run_cancellable(
                     subprocess.run,
@@ -282,6 +318,95 @@ class DockerComposeBroker:
             raise smoke_error
         return {"healthy": True, "persisted_after_restart": True, "cleaned": True}
 
+    def upgrade_smoke_test(self, baseline_image, candidate_image):
+        """Exercise a pinned candidate against only a disposable test volume."""
+        baseline_image = self._validate_pinned_image(baseline_image)
+        candidate_image = self._validate_pinned_image(candidate_image)
+        if baseline_image == candidate_image:
+            raise ValueError("baseline and candidate images must differ")
+        project_name, _host_port = self.create_isolated_project()
+        try:
+            self._exercise_upgrade(project_name, baseline_image, candidate_image)
+            smoke_error = None
+        except Exception as error:  # noqa: BLE001
+            smoke_error = error
+        cleanup = self.run_isolated(
+            "cleanup", project_name=project_name, image=candidate_image
+        )
+        if cleanup.returncode:
+            details = f"; rehearsal failed: {smoke_error}" if smoke_error else ""
+            raise RuntimeError(
+                f"isolated Qdrant upgrade cleanup failed for {project_name}{details}"
+            ) from smoke_error
+        if smoke_error:
+            raise smoke_error
+        return {
+            "healthy": True,
+            "baseline_image": baseline_image,
+            "candidate_image": candidate_image,
+            "collection_readable": True,
+            "persisted_after_restart": True,
+            "cleaned": True,
+        }
+
+    def _exercise_upgrade(self, project_name, baseline_image, candidate_image):
+        project_started = self.run_isolated(
+            "start", project_name=project_name, image=baseline_image
+        )
+        if project_started.returncode:
+            raise RuntimeError("isolated Qdrant baseline start failed")
+        _project, host_port = project_name, self._isolated_projects[project_name]
+        base_url = f"http://127.0.0.1:{host_port}"
+        collection = f"adh_upgrade_{uuid.uuid4().hex[:12]}"
+        point_id = str(uuid.uuid4())
+        marker = uuid.uuid4().hex
+        with httpx.Client(timeout=2) as client:
+            self._wait_for_qdrant(client, base_url)
+            response = client.put(
+                f"{base_url}/collections/{collection}",
+                json={"vectors": {"size": 1, "distance": "Cosine"}},
+            )
+            response.raise_for_status()
+            response = client.put(
+                f"{base_url}/collections/{collection}/points?wait=true",
+                json={
+                    "points": [
+                        {
+                            "id": point_id,
+                            "vector": [1.0],
+                            "payload": {"upgrade_marker": marker},
+                        }
+                    ]
+                },
+            )
+            response.raise_for_status()
+            upgraded = self.run_isolated(
+                "start", project_name=project_name, image=candidate_image
+            )
+            if upgraded.returncode:
+                raise RuntimeError("isolated Qdrant candidate start failed")
+            self._wait_for_qdrant(client, base_url)
+            self._assert_upgrade_marker(client, base_url, collection, point_id, marker)
+            restarted = self.run_isolated(
+                "restart", project_name=project_name, image=candidate_image
+            )
+            if restarted.returncode:
+                raise RuntimeError("isolated Qdrant candidate restart failed")
+            self._wait_for_qdrant(client, base_url)
+            self._assert_upgrade_marker(client, base_url, collection, point_id, marker)
+
+    @staticmethod
+    def _assert_upgrade_marker(client, base_url, collection, point_id, marker):
+        collection_response = client.get(f"{base_url}/collections/{collection}")
+        collection_response.raise_for_status()
+        point_response = client.get(
+            f"{base_url}/collections/{collection}/points/{point_id}"
+        )
+        point_response.raise_for_status()
+        point = point_response.json().get("result") or {}
+        if point.get("payload", {}).get("upgrade_marker") != marker:
+            raise RuntimeError("Qdrant candidate did not preserve the test point")
+
     def _exercise_isolated_qdrant(
         self, project_name, base_url, collection, point_id, marker
     ):
@@ -321,24 +446,29 @@ class DockerComposeBroker:
                 raise RuntimeError("isolated Qdrant data did not persist after restart")
 
     def run(self, action, *, tail=100):
-        env = {
-            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
-            "HOME": str(Path.home()),
-            "LANG": os.environ.get("LANG", "C.UTF-8"),
-        }
         try:
             compose_file, manifest_text = self._manifest()
             with tempfile.TemporaryDirectory(
                 prefix="adh-compose-", dir="/private/tmp"
             ) as directory:
+                env = {
+                    "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+                    "HOME": directory,
+                    "LANG": os.environ.get("LANG", "C.UTF-8"),
+                }
                 snapshot = Path(directory) / "docker-compose.yml"
                 snapshot.write_text(manifest_text)
                 snapshot.chmod(0o600)
-                command = self.command(
+                docker_command = self.command(
                     action,
                     tail=tail,
                     compose_file=snapshot,
-                    project_directory=compose_file.parent,
+                    project_directory=Path(directory),
+                )
+                command = self._sandboxed_command(
+                    docker_command,
+                    compose_file=snapshot,
+                    temporary_root=Path(directory),
                 )
                 result = run_cancellable(
                     subprocess.run,

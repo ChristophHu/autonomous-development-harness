@@ -9,6 +9,7 @@ from contextvars import ContextVar
 from dataclasses import replace
 
 from .database import AgentRunRepository, AuditRepository
+from .errors import failure_record
 
 CURRENT_RUN = ContextVar("harness_run", default=None)
 LOGGER = logging.getLogger("harness")
@@ -87,7 +88,10 @@ class AuditRecorder:
         try:
             yield span
         except BaseException as exc:
-            span.update(status="failed", output={"error_type": type(exc).__name__})
+            span.update(
+                status="failed",
+                output=failure_record(exc, self.sanitize),
+            )
             raise
         finally:
             self.agents.finish(
@@ -115,12 +119,12 @@ class AuditRecorder:
         try:
             yield span
         except BaseException as exc:
-            self._finish_model(run_id, "failed", started, span, type(exc).__name__)
+            self._finish_model(run_id, "failed", started, span, exc)
             raise
         else:
             self._finish_model(run_id, "completed", started, span)
 
-    def _finish_model(self, run_id, status, started, span, error_type=None):
+    def _finish_model(self, run_id, status, started, span, error=None):
         usage = span["usage"]
         if usage is not None:
             usage = replace(
@@ -133,7 +137,10 @@ class AuditRecorder:
             status,
             (time.monotonic() - started) * 1000,
             usage,
-            error_type,
+            type(error).__name__ if error is not None else None,
+            failure_record(error, self.sanitize)["category"]
+            if error is not None
+            else None,
             self.sanitize(span["provider"]),
             self.sanitize(span["model"]),
         )

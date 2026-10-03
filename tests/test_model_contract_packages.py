@@ -375,7 +375,7 @@ def test_approval_resume_issues_only_the_exact_answered_action():
     questions = Questions()
     target = ToolApprovalTarget.create(9, "http.request", {"method": "POST"})
 
-    def ask(task_id, question, reason, options, required):
+    def ask(task_id, question, reason, options, required, **_kwargs):
         questions.row = {
             "id": 7,
             "task_id": task_id,

@@ -389,7 +389,7 @@ def test_high_impact_tool_approval_pauses_task_and_records_exact_target(tmp_path
 
     orchestrator._invoke = request_approval
     result = asyncio.run(orchestrator.run(task.id))
-    assert result.status == "waiting_human"
+    assert result.status == "waiting_approval"
     question = store.questions.list(task.id)[0]
     assert question["reason"] == target.reason()
     assert "https://example.test" not in question["question"]
@@ -404,7 +404,7 @@ def test_persisted_approval_resumes_for_exact_action_once(tmp_path):
     question_id = orchestrator.approvals.request_tool(target)
     question = store.questions.get(question_id)
     assert secret not in question["question"]
-    assert store.get(task.id).status == "waiting_human"
+    assert store.get(task.id).status == "waiting_approval"
     assert store.answer(question_id, "approve", task.id)
 
     grant = orchestrator.approvals.grant_tool_for_target(target)

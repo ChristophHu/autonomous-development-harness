@@ -23,15 +23,17 @@ TimeoutNumber: TypeAlias = Annotated[Number, Field(gt=0, le=300)]
 
 
 class ExtensibleSettings(BaseModel):
-    """Validate known fields while preserving explicitly permitted extensions."""
+    """Reject undeclared settings; keep custom values in the named extension map."""
 
-    model_config = ConfigDict(extra="allow", strict=True)
+    model_config = ConfigDict(extra="forbid", strict=True)
+    extensions: dict[StrictStr, Any] = Field(default_factory=dict)
 
 
 class HarnessSettings(ExtensibleSettings):
     name: StrictStr = "autonomous-development-harness"
     environment: StrictStr = "development"
     max_parallel_steps: StrictInt = Field(default=4, ge=1, le=32)
+    max_correction_attempts: StrictInt = Field(default=2, ge=0, le=10)
 
 
 class PathSettings(ExtensibleSettings):
@@ -76,6 +78,12 @@ class ObsidianSettings(ExtensibleSettings):
     enabled: StrictBool = True
 
 
+class MemoryMonitoringSettings(ExtensibleSettings):
+    enabled: StrictBool = False
+    interval_seconds: StrictInt = Field(default=60, ge=5, le=3600)
+    evidence_max_age_hours: StrictInt = Field(default=168, ge=1, le=8760)
+
+
 class QdrantSettings(ExtensibleSettings):
     enabled: StrictBool = False
     url: StrictStr = "http://127.0.0.1:6333"
@@ -96,6 +104,9 @@ class MemorySettings(ExtensibleSettings):
     obsidian: ObsidianSettings = Field(default_factory=ObsidianSettings)
     qdrant: QdrantSettings = Field(default_factory=QdrantSettings)
     embeddings: EmbeddingSettings = Field(default_factory=EmbeddingSettings)
+    monitoring: MemoryMonitoringSettings = Field(
+        default_factory=MemoryMonitoringSettings
+    )
 
 
 class ProviderSettings(ExtensibleSettings):
@@ -329,7 +340,7 @@ class MCPServerSettings(BaseModel):
 
     enabled: StrictBool = True
     transport: Literal["stdio", "streamable_http"] = "stdio"
-    builtin: Literal["filesystem", "obsidian"] | None = None
+    builtin: Literal["filesystem", "obsidian", "apple_shell"] | None = None
     command: list[StrictStr] = Field(default_factory=list)
     url: StrictStr | None = None
     allowed_hosts: list[StrictStr] = Field(default_factory=list)
@@ -436,6 +447,7 @@ class HarnessConfig(ExtensibleSettings):
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)
     verification: VerificationSettings = Field(default_factory=VerificationSettings)
     agents: AgentRuntimeSettings = Field(default_factory=AgentRuntimeSettings)
+    agent_roles: dict[StrictStr, StrictStr] = Field(default_factory=dict)
     memory: MemorySettings = Field(default_factory=MemorySettings)
     git: GitSettings = Field(default_factory=GitSettings)
     docker: DockerSettings = Field(default_factory=DockerSettings)

@@ -177,6 +177,90 @@ def test_audit_reports_missing_and_stale_decision_projection(tmp_path):
     )
 
 
+def test_audit_distinguishes_unowned_stale_projection_without_modifying_it(tmp_path):
+    vault = tmp_path / "vault"
+    projection_root = vault / "_harness"
+    note_path = projection_root / "decisions" / "1.md"
+    note_path.parent.mkdir(parents=True)
+    note_path.write_text("User-authored content", encoding="utf-8")
+    manifest = projection_root / "manifest.json"
+    manifest.write_text('{"version":1,"files":["decisions/1.md"]}', encoding="utf-8")
+
+    report = audit_vault(vault, required_notes=(), decision_rows=[])
+
+    assert report["findings"] == [
+        {
+            "code": "decision_projection_unowned",
+            "path": "_harness/decisions/1.md",
+            "message": "Stale manifest entry points to a note without the Harness marker",
+        }
+    ]
+    assert note_path.read_text(encoding="utf-8") == "User-authored content"
+    assert manifest.read_text(encoding="utf-8") == (
+        '{"version":1,"files":["decisions/1.md"]}'
+    )
+
+
+def test_audit_reports_registered_but_missing_authoritative_projection(tmp_path):
+    from harness.memory_projection import DecisionProjection
+
+    vault = tmp_path / "vault"
+    projection = DecisionProjection(vault)
+    projection.root.mkdir(parents=True)
+    projection.manifest_path.write_text(
+        '{"version":1,"files":["decisions/4.md"]}', encoding="utf-8"
+    )
+    row = {
+        "id": 4,
+        "task_id": None,
+        "question_id": None,
+        "category": "architecture",
+        "source": "human",
+        "field_names": [],
+        "evidence": [],
+        "alternatives": [],
+        "outcome": None,
+        "tags": [],
+        "supersedes_id": None,
+        "created_at": "2026-10-02T00:00:00+00:00",
+        "decision": "Use SQLite",
+        "rationale": "Local authority",
+    }
+
+    report = audit_vault(vault, required_notes=(), decision_rows=[row])
+
+    assert report["findings"] == [
+        {
+            "code": "decision_projection_missing",
+            "path": "_harness/decisions/4.md",
+            "message": "SQLite decision projection file is missing",
+        }
+    ]
+
+
+def test_audit_reports_manifest_entry_without_file_or_authoritative_decision(
+    tmp_path,
+):
+    from harness.memory_projection import DecisionProjection
+
+    vault = tmp_path / "vault"
+    projection = DecisionProjection(vault)
+    projection.root.mkdir(parents=True)
+    projection.manifest_path.write_text(
+        '{"version":1,"files":["decisions/9.md"]}', encoding="utf-8"
+    )
+
+    report = audit_vault(vault, required_notes=(), decision_rows=[])
+
+    assert report["findings"] == [
+        {
+            "code": "decision_projection_stale",
+            "path": "_harness/decisions/9.md",
+            "message": "Manifest entry has no authoritative SQLite decision",
+        }
+    ]
+
+
 def test_audit_fails_closed_when_projection_manifest_is_unreadable(
     tmp_path, monkeypatch
 ):

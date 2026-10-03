@@ -45,6 +45,7 @@ from .database import (
     ValidationRepository,
 )
 from .domain import EventKind, Status, Task
+from .errors import failure_record
 from .memory import (
     EMBEDDING_BATCH_SIZE_DEFAULT,
     EMBEDDING_DIMENSION_DEFAULT,
@@ -127,16 +128,27 @@ class Event(BaseModel):
 
 
 class TaskLifecycle:
-    STARTABLE: ClassVar[set[Status]] = {Status.PENDING, Status.FAILED, Status.BLOCKED}
+    STARTABLE: ClassVar[set[Status]] = {
+        Status.PENDING,
+        Status.FAILED,
+        Status.BLOCKED,
+        Status.RECOVERING,
+    }
 
     @classmethod
     def can_start(cls, status, has_open_question=False):
         state = Status(status)
-        return not has_open_question and state in cls.STARTABLE | {Status.WAITING_HUMAN}
+        return not has_open_question and state in cls.STARTABLE | {
+            Status.WAITING_HUMAN,
+            Status.WAITING_DECISION,
+            Status.WAITING_APPROVAL,
+        }
 
 
 class ConfigurationService:
-    def __init__(self, path: Path = ROOT / "config.yaml"):
+    def __init__(self, path: Path | None = None):
+        if path is None:
+            path = os.environ.get("HARNESS_CONFIG_PATH", ROOT / "config.yaml")
         self._path = Path(path)
         self.reload()
 
@@ -351,6 +363,16 @@ class ConfigurationService:
             if not isinstance(value, bool):
                 raise ValueError(f"{name} must be a boolean")  # noqa: TRY004
 
+        def integer(value, name, *, minimum, maximum):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or not minimum <= value <= maximum
+            ):
+                raise ValueError(
+                    f"{name} must be an integer between {minimum} and {maximum}"
+                )
+
         def secret_value(value, name):
             if isinstance(value, dict):
                 for child, item in value.items():
@@ -422,8 +444,9 @@ class ConfigurationService:
         boolean(api.get("swagger", True), "api.swagger")
 
         paths = mapping(root.get("paths", {}), "paths")
-        for name, value in paths.items():
-            text(value, f"paths.{name}")
+        for name in ("workspace", "obsidian_vault", "logs", "database"):
+            if name in paths:
+                text(paths[name], f"paths.{name}")
         database = mapping(root.get("database", {}), "database")
         if database.get("type", "sqlite") != "sqlite":
             raise ValueError("database.type must be sqlite")
@@ -459,6 +482,20 @@ class ConfigurationService:
                 section_data.get("enabled", section == "obsidian"),
                 f"memory.{section}.enabled",
             )
+        monitoring = mapping(memory.get("monitoring", {}), "memory.monitoring")
+        boolean(monitoring.get("enabled", False), "memory.monitoring.enabled")
+        integer(
+            monitoring.get("interval_seconds", 60),
+            "memory.monitoring.interval_seconds",
+            minimum=5,
+            maximum=3600,
+        )
+        integer(
+            monitoring.get("evidence_max_age_hours", 168),
+            "memory.monitoring.evidence_max_age_hours",
+            minimum=1,
+            maximum=8760,
+        )
         qdrant = memory.get("qdrant", {})
         valid_url(qdrant.get("url", "http://127.0.0.1:6333"), "memory.qdrant.url")
         text(qdrant.get("collection", "harness-memory"), "memory.qdrant.collection")
@@ -824,7 +861,9 @@ class Store:
             task_id=task_id, kind=event_kind.value, payload=payload, created_at=now
         )
 
-    def ask(self, task_id, question, reason, options=None, required=True):
+    def ask(
+        self, task_id, question, reason, options=None, required=True, purpose="input"
+    ):
         if not question.strip():
             raise ValueError("question must not be blank")
         safe_fields = self.audit.sanitize(
@@ -837,7 +876,7 @@ class Store:
         )
         payload = self.audit.sanitize({"question": question, "required": required})
         question_id = self.questions.ask(
-            task_id, question, reason, options, required, payload
+            task_id, question, reason, options, required, payload, purpose
         )
         return question_id
 
@@ -1013,11 +1052,15 @@ class Orchestrator:
                 Status.FAILED,
                 Status.BLOCKED,
                 Status.WAITING_HUMAN,
+                Status.WAITING_DECISION,
+                Status.WAITING_APPROVAL,
             }
             if interrupted or (
                 task.status in {Status.FAILED, Status.BLOCKED}
                 and self.store.latest_plan(task_id) is not None
             ):
+                if task.status != Status.RECOVERING:
+                    transition(Status.RECOVERING)
                 from .reconciliation import ReconciliationService
 
                 reconciliation = await asyncio.to_thread(
@@ -1035,7 +1078,6 @@ class Orchestrator:
                     EventKind.RECOVERY_RECONCILED,
                     reconciliation.model_dump(mode="json"),
                 )
-                self.store.tasks.transition(task_id, Status.BLOCKED, owner)
                 self.store.event(
                     task_id,
                     EventKind.RECOVERY_INSPECTED,
@@ -1434,12 +1476,24 @@ class Orchestrator:
             raise
         except Exception as exc:
             task = self.store.get(task_id)
-            if task.status not in TERMINAL and task.status != Status.WAITING_HUMAN:
+            if task.status not in TERMINAL and task.status not in {
+                Status.WAITING_HUMAN,
+                Status.WAITING_DECISION,
+                Status.WAITING_APPROVAL,
+            }:
                 transition(Status.FAILED)
-                safe_error = self.store.audit.sanitize(str(exc))
-                self.store.update_task_fields(task_id, result=safe_error)
-                self.store.event(task_id, EventKind.TASK_FAILED, {"error": safe_error})
-                exc.args = (safe_error,)
+                failure = failure_record(exc, self.store.audit.sanitize)
+                self.store.update_task_fields(task_id, result=failure["message"])
+                self.store.event(
+                    task_id,
+                    EventKind.TASK_FAILED,
+                    {
+                        "error": failure["message"],
+                        "error_type": failure["error_type"],
+                        "category": failure["category"],
+                    },
+                )
+                exc.args = (failure["message"],)
             raise
 
 

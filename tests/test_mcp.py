@@ -140,7 +140,9 @@ def test_obsidian_server_reads_only_visible_markdown_in_vault(tmp_path):
 
     vault = tmp_path / "vault"
     (vault / "notes").mkdir(parents=True)
-    (vault / "notes" / "a.md").write_text("alpha decision")
+    (vault / "notes" / "a.md").write_text(
+        "---\ntype: decision\n---\n# Alpha\nalpha decision [[Beta]]"
+    )
     (vault / "notes" / "b.md").write_text("beta decision")
     (vault / "notes" / "raw.txt").write_text("private")
     (vault / ".obsidian").mkdir()
@@ -149,11 +151,20 @@ def test_obsidian_server_reads_only_visible_markdown_in_vault(tmp_path):
     server = ObsidianServer(vault)
     assert server.call("list_notes", {"limit": 1}) == {"notes": ["notes/a.md"]}
     assert server.call("read_note", {"path": "notes/a.md"}) == {
-        "content": "alpha decision"
+        "content": "---\ntype: decision\n---\n# Alpha\nalpha decision [[Beta]]"
     }
     assert server.call("search_notes", {"query": "decision"}) == {
         "matches": ["notes/a.md", "notes/b.md"]
     }
+    assert server.call("knowledge_note", {"path": "notes/a.md"})["metadata"] == {
+        "type": "decision"
+    }
+    assert server.call("knowledge_note", {"path": "notes/a.md"})["links"] == ["Beta"]
+    assert server.call("backlinks", {"path": "Beta.md"}) == {"matches": ["notes/a.md"]}
+    assert (
+        server.call("knowledge_search", {"query": "decision"})["matches"][0]["path"]
+        == "notes/a.md"
+    )
     for path in (
         "../outside.md",
         ".obsidian/hidden.md",
@@ -230,13 +241,13 @@ def test_obsidian_stdio_entrypoint(tmp_path, monkeypatch):
     monkeypatch.setattr(sys, "stdin", SimpleNamespace(buffer=BytesIO(message + b"\n")))
     monkeypatch.setattr(sys, "stdout", output)
     obsidian.main()
-    assert len(json.loads(output.getvalue())["result"]["tools"]) == 3
+    assert len(json.loads(output.getvalue())["result"]["tools"]) == 6
     monkeypatch.setattr(sys, "stdin", SimpleNamespace(buffer=BytesIO(message + b"\n")))
     second = StringIO()
     monkeypatch.setattr(sys, "stdout", second)
     monkeypatch.delitem(sys.modules, "harness.mcp_servers.obsidian")
     runpy.run_module("harness.mcp_servers.obsidian", run_name="__main__")
-    assert len(json.loads(second.getvalue())["result"]["tools"]) == 3
+    assert len(json.loads(second.getvalue())["result"]["tools"]) == 6
 
 
 def test_obsidian_registry_rejects_unexpected_builtin_tool(tmp_path, monkeypatch):
@@ -350,6 +361,58 @@ def test_obsidian_builtin_is_read_only_and_profile_gated(tmp_path, monkeypatch):
                     }
                 }
             )
+
+
+def test_apple_shell_builtin_registers_only_fixed_read_tool(tmp_path, monkeypatch):
+    from harness import mcp, tools
+    from harness.mcp_servers.apple_shell import EXECUTABLES, TOOLS
+    from harness.mcp_servers.apple_shell.server import OUTPUTS
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    captured = {}
+
+    class Client:
+        def __init__(self, command, _workspace, **kwargs):
+            captured["command"] = command
+            captured.update(kwargs)
+
+        def discover(self):
+            return [
+                {
+                    "name": name,
+                    "description": "fixed diagnostic",
+                    "inputSchema": schema,
+                    "outputSchema": OUTPUTS[name],
+                }
+                for name, schema in TOOLS.items()
+            ]
+
+    monkeypatch.setattr(mcp, "MCPClient", Client)
+    monkeypatch.setattr(tools.sys, "platform", "darwin")
+    config = Config()
+    config.data["tools"] = {
+        "permissions": {"apple_shell": "read"},
+        "mcp": {"servers": {"apple_diagnostics": {"builtin": "apple_shell"}}},
+    }
+    registry = ToolRegistry(Permissions(config), workspace=workspace)
+    assert captured["command"] == mcp.builtin_apple_shell_command(workspace)
+    assert captured["executable_paths"] == tuple(EXECUTABLES.values())
+    assert (
+        registry.specs["mcp.apple_diagnostics.diagnostic"].permission == "apple_shell"
+    )
+
+
+def test_apple_shell_builtin_rejects_non_macos(tmp_path, monkeypatch):
+    from harness import tools
+
+    monkeypatch.setattr(tools.sys, "platform", "linux")
+    config = Config()
+    config.data["tools"] = {
+        "mcp": {"servers": {"apple_diagnostics": {"builtin": "apple_shell"}}}
+    }
+    with pytest.raises(ValueError, match="requires macOS"):
+        ToolRegistry(Permissions(config), workspace=tmp_path)
 
 
 def test_filesystem_server_confines_paths_and_separates_permissions(tmp_path):

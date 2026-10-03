@@ -12,7 +12,10 @@ import sqlite3
 import subprocess
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, wait
+from contextlib import closing
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
 
@@ -37,6 +40,7 @@ config = typer.Typer(no_args_is_help=True)
 secrets = typer.Typer(no_args_is_help=True)
 artifacts = typer.Typer(no_args_is_help=True)
 memory = typer.Typer(no_args_is_help=True)
+memory_service = typer.Typer(no_args_is_help=True)
 evidence = typer.Typer(no_args_is_help=True)
 app.add_typer(tasks, name="tasks")
 app.add_typer(models, name="models")
@@ -44,6 +48,7 @@ app.add_typer(config, name="config")
 app.add_typer(secrets, name="secrets")
 app.add_typer(artifacts, name="artifacts")
 app.add_typer(memory, name="memory")
+memory.add_typer(memory_service, name="service")
 app.add_typer(evidence, name="evidence")
 
 
@@ -118,22 +123,21 @@ def completion_status():
         required = settings.required_evidence
         if required:
             from .database import Database
-            from .evidence import EvidenceRepository, audit_evidence
+            from .services import VerificationEvidenceService
 
             database_path = Config().path("database")
-            rows = (
-                EvidenceRepository(Database(database_path)).list(limit=500)
-                if database_path.is_file()
-                else []
-            )
-            valid_by_kind = {}
-            for kind in required:
-                audit = audit_evidence(
-                    [row for row in rows if row["kind"] == kind],
-                    expected_subject_sha256=source_tree_sha256(ROOT),
-                    max_age_hours=settings.max_age_hours,
-                )
-                valid_by_kind[kind] = audit["healthy"]
+            if database_path.is_file():
+                evidence_service = VerificationEvidenceService(Database(database_path))
+                valid_by_kind = {
+                    kind: evidence_service.audit_kind(
+                        kind,
+                        subject_sha256=source_tree_sha256(ROOT),
+                        max_age_hours=settings.max_age_hours,
+                    )["healthy"]
+                    for kind in required
+                }
+            else:
+                valid_by_kind = {kind: False for kind in required}
             report["required_evidence"] = valid_by_kind
             report["evidence_policy_valid"] = all(valid_by_kind.values())
             if not report["evidence_policy_valid"]:
@@ -144,7 +148,7 @@ def completion_status():
         else:
             report["required_evidence"] = {}
             report["evidence_policy_valid"] = True
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError, sqlite3.Error) as error:
         typer.echo(f"Harness completion: unverifiable ({type(error).__name__})")
         raise typer.Exit(2) from None
     report["fulfilled"] = matrix_report["fulfilled"]
@@ -157,9 +161,9 @@ def completion_status():
 
 def _evidence_repository():
     from .database import Database
-    from .evidence import EvidenceRepository
+    from .services import VerificationEvidenceService
 
-    return EvidenceRepository(Database(Config().path("database")))
+    return VerificationEvidenceService(Database(Config().path("database")))
 
 
 @evidence.command("import")
@@ -196,13 +200,9 @@ def evidence_audit(
     max_age_hours: int = typer.Option(168, "--max-age-hours", min=1, max=8760),
 ):
     """Check evidence freshness and exact source-tree hash binding."""
-    from .evidence import audit_evidence
-
     try:
-        report = audit_evidence(
-            _evidence_repository().list(limit=500),
-            expected_subject_sha256=subject_sha256,
-            max_age_hours=max_age_hours,
+        report = _evidence_repository().audit(
+            subject_sha256=subject_sha256, max_age_hours=max_age_hours
         )
     except ValueError as error:
         typer.echo(f"Evidence audit rejected: {type(error).__name__}")
@@ -625,25 +625,95 @@ def qdrant_smoke(confirm: bool = typer.Option(False, "--confirm")):
     )
 
 
+@app.command("qdrant-upgrade-smoke")
+def qdrant_upgrade_smoke(
+    baseline_image: Annotated[str, typer.Option("--baseline-image")],
+    candidate_image: Annotated[str, typer.Option("--candidate-image")],
+    confirm: bool = typer.Option(False, "--confirm"),
+):
+    """Test a pinned Qdrant candidate against an isolated throwaway volume."""
+    if not confirm:
+        typer.echo(
+            "No action taken. Repeat with --confirm to pull and test the pinned image transition."
+        )
+        raise typer.Exit(2)
+    try:
+        result = DockerComposeBroker().upgrade_smoke_test(
+            baseline_image, candidate_image
+        )
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        typer.echo(f"Isolated Qdrant upgrade test failed: {type(error).__name__}")
+        raise typer.Exit(1) from None
+    typer.echo(
+        "Isolated Qdrant upgrade test passed: "
+        f"baseline={result['baseline_image']} "
+        f"candidate={result['candidate_image']} "
+        f"collection_readable={result['collection_readable']} "
+        f"persisted_after_restart={result['persisted_after_restart']} "
+        f"cleaned={result['cleaned']}"
+    )
+
+
 @memory.command("sync")
 def memory_sync():
     """Rebuild the Obsidian decision-note projection from canonical SQLite."""
-    conf, store, _ = build()
+    try:
+        conf = Config()
+        database_path = conf.path("database")
+        if not database_path.is_file():
+            raise FileNotFoundError("canonical SQLite database does not exist")
+        with closing(
+            sqlite3.connect(f"file:{database_path}?mode=ro", uri=True)
+        ) as connection:
+            connection.row_factory = sqlite3.Row
+            rows = connection.execute("SELECT * FROM decisions ORDER BY id").fetchall()
+        decisions = []
+        for row in rows:
+            item = dict(row)
+            for field in ("evidence", "field_names", "alternatives", "tags"):
+                item[field] = json.loads(item[field])
+            decisions.append(item)
+    except (OSError, sqlite3.Error, ValueError) as error:
+        typer.echo(f"Obsidian decision projection unavailable: {type(error).__name__}")
+        raise typer.Exit(2) from None
     from .memory_projection import DecisionProjection
 
-    result = DecisionProjection(conf.path("obsidian_vault")).sync(
-        store.decisions.list_all()
-    )
+    result = DecisionProjection(conf.path("obsidian_vault")).sync(decisions)
     typer.echo(
         "Obsidian decision projection: "
         + ", ".join(f"{key}={value}" for key, value in result.items())
     )
 
 
+def _build_memory_store():
+    """Build only configuration and SQLite services for memory operations."""
+    from .core import Store
+
+    conf = Config()
+    return conf, Store(conf)
+
+
+def _memory_qdrant(conf):
+    """Construct the Qdrant health client without initializing MCP tools."""
+    from .memory import QdrantMemory
+
+    memory = conf.data.get("memory", {})
+    qdrant = memory.get("qdrant", {})
+    embeddings = memory.get("embeddings", {})
+    return QdrantMemory(
+        qdrant.get("url", "http://127.0.0.1:6333"),
+        qdrant.get("collection", "harness-memory"),
+        embeddings.get("dimensions", 1024),
+        timeout=qdrant.get("timeout", 5),
+        api_key=conf.data.get("secrets", {}).get("QDRANT__SERVICE__API_KEY"),
+    )
+
+
 @memory.command("status")
 def memory_status():
     """Report configured Obsidian and MCP vault state without writing files."""
-    conf, _, _ = build()
+    conf, store = _build_memory_store()
+    from .database import MemoryOpsEvidenceRepository, OperationalSnapshotRepository
     from .memory_projection import DecisionProjection
 
     settings = conf.data.get("memory", {}).get("obsidian", {})
@@ -652,7 +722,153 @@ def memory_status():
         obsidian_enabled=settings.get("enabled", False),
         mcp_enabled=servers.get("vault", {}).get("enabled", False),
     )
+    status["last_memory_monitor"] = OperationalSnapshotRepository(
+        store.database
+    ).latest_memory_health()
+    latest_acceptance = MemoryOpsEvidenceRepository(store.database).list(limit=1)
+    status["last_memory_ops_acceptance"] = (
+        latest_acceptance[0] if latest_acceptance else None
+    )
     typer.echo(json.dumps(status, ensure_ascii=False, indent=2))
+
+
+@memory.command("watch")
+def memory_watch(once: bool = typer.Option(False, "--once")):
+    """Run opt-in, read-only memory health probes and persist their summaries."""
+    conf, store = _build_memory_store()
+    settings = conf.data.get("memory", {}).get("monitoring", {})
+    if not settings.get("enabled", False):
+        typer.echo("Memory monitoring is disabled in configuration")
+        raise typer.Exit(2)
+
+    from .database import OperationalSnapshotRepository
+    from .memory_monitor import MemoryHealthMonitor, collect_memory_health
+
+    snapshots = OperationalSnapshotRepository(store.database)
+    source_hash = source_tree_sha256(ROOT)
+    monitor = MemoryHealthMonitor(
+        lambda: collect_memory_health(
+            conf,
+            store,
+            _memory_qdrant(conf),
+            source_sha256=source_hash,
+        ),
+        snapshots,
+        interval_seconds=settings.get("interval_seconds", 60),
+        emit=lambda report: typer.echo(json.dumps(report, ensure_ascii=False)),
+    )
+    try:
+        monitor.run(max_checks=1 if once else None)
+    except KeyboardInterrupt:
+        typer.echo("Memory monitoring stopped")
+        return
+    if once:
+        latest = snapshots.latest_memory_health()
+        if latest is not None and not latest["healthy"]:
+            raise typer.Exit(1)
+
+
+def _launchd_memory_watch_service():
+    from .memory_watch_service import LaunchdMemoryWatchService
+
+    return LaunchdMemoryWatchService(
+        home=Path.home(),
+        root=ROOT,
+        executable=Path(os.path.abspath(os.sys.argv[0])),
+    )
+
+
+@memory_service.command("install")
+def memory_service_install(confirm: bool = typer.Option(False, "--confirm")):
+    """Install and start the explicitly enabled memory watcher LaunchAgent."""
+    conf = Config()
+    enabled = conf.data.get("memory", {}).get("monitoring", {}).get("enabled", False)
+    try:
+        result = _launchd_memory_watch_service().install(
+            confirm=confirm, monitoring_enabled=enabled
+        )
+    except (OSError, RuntimeError, ValueError) as error:
+        typer.echo(f"Memory watcher service install failed: {type(error).__name__}")
+        raise typer.Exit(2) from None
+    typer.echo(json.dumps(result))
+
+
+@memory_service.command("status")
+def memory_service_status():
+    """Report whether the managed memory watcher LaunchAgent is installed."""
+    try:
+        result = _launchd_memory_watch_service().status()
+    except (OSError, RuntimeError, ValueError) as error:
+        typer.echo(f"Memory watcher service status failed: {type(error).__name__}")
+        raise typer.Exit(2) from None
+    typer.echo(json.dumps(result))
+
+
+@memory_service.command("uninstall")
+def memory_service_uninstall(confirm: bool = typer.Option(False, "--confirm")):
+    """Stop and remove only the managed memory watcher LaunchAgent."""
+    try:
+        result = _launchd_memory_watch_service().uninstall(confirm=confirm)
+    except (OSError, RuntimeError, ValueError) as error:
+        typer.echo(f"Memory watcher service uninstall failed: {type(error).__name__}")
+        raise typer.Exit(2) from None
+    typer.echo(json.dumps(result))
+
+
+@memory.command("acceptance")
+def memory_ops_acceptance(confirm: bool = typer.Option(False, "--confirm")):
+    """Record operational evidence after five healthy monitored minutes."""
+    if confirm is not True:
+        typer.echo("Memory operational acceptance requires --confirm")
+        raise typer.Exit(2)
+    conf, store = _build_memory_store()
+    settings = conf.data.get("memory", {}).get("monitoring", {})
+    if settings.get("enabled", False) is not True:
+        typer.echo("Memory monitoring is disabled in configuration")
+        raise typer.Exit(2)
+
+    from .database import MemoryOpsEvidenceRepository, OperationalSnapshotRepository
+    from .memory_ops_acceptance import (
+        evaluate_memory_ops_acceptance,
+        required_snapshot_count,
+    )
+
+    interval = settings.get("interval_seconds", 60)
+    try:
+        limit = required_snapshot_count(interval)
+        launchd_status = _launchd_memory_watch_service().status()
+        snapshots = OperationalSnapshotRepository(store.database).recent_memory_health(
+            limit=limit
+        )
+        report = evaluate_memory_ops_acceptance(
+            snapshots,
+            launchd_status=launchd_status,
+            source_sha256=source_tree_sha256(ROOT),
+            interval_seconds=interval,
+        )
+        if not report["passed"]:
+            typer.echo(json.dumps(report, ensure_ascii=False))
+            raise typer.Exit(1)
+        evidence = MemoryOpsEvidenceRepository(store.database).record(
+            subject_sha256=report["source_sha256"],
+            observed_at=datetime.now(UTC),
+            checks=report["checks"],
+        )
+    except typer.Exit:
+        raise
+    except (OSError, RuntimeError, ValueError, sqlite3.Error) as error:
+        typer.echo(f"Memory operational acceptance failed: {type(error).__name__}")
+        raise typer.Exit(2) from None
+    typer.echo(
+        json.dumps(
+            {
+                "acceptance": report,
+                "evidence_id": evidence["id"],
+                "digest": evidence["digest"],
+            },
+            ensure_ascii=False,
+        )
+    )
 
 
 @memory.command("audit")
@@ -665,8 +881,8 @@ def memory_audit():
         decision_rows = None
         database_path = conf.path("database")
         if database_path.is_file():
-            with sqlite3.connect(
-                f"file:{database_path}?mode=ro", uri=True
+            with closing(
+                sqlite3.connect(f"file:{database_path}?mode=ro", uri=True)
             ) as connection:
                 connection.row_factory = sqlite3.Row
                 rows = connection.execute(
@@ -686,6 +902,29 @@ def memory_audit():
         )
     except (OSError, ValueError) as error:
         typer.echo(f"Vault audit unavailable: {type(error).__name__}")
+        raise typer.Exit(2) from None
+    typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+    if not report["healthy"]:
+        raise typer.Exit(1)
+
+
+@memory.command("qdrant-config-audit")
+def qdrant_config_audit(
+    compose_path: Annotated[
+        Path, typer.Argument(..., readable=True, exists=True, dir_okay=False)
+    ],
+    config_path: Annotated[
+        Path | None,
+        typer.Option("--config", readable=True, exists=True, dir_okay=False),
+    ] = None,
+):
+    """Read-only audit of operator-managed Qdrant Compose/config files."""
+    from .qdrant_config_audit import audit_qdrant_compose
+
+    try:
+        report = audit_qdrant_compose(compose_path, config_path)
+    except (OSError, TypeError, ValueError) as error:
+        typer.echo(f"Qdrant configuration audit unavailable: {type(error).__name__}")
         raise typer.Exit(2) from None
     typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
     if not report["healthy"]:
@@ -722,7 +961,7 @@ def qdrant_acceptance(confirm: bool = typer.Option(False, "--confirm")):
             "No provider request sent. Repeat with --confirm to run the live acceptance probe."
         )
         raise typer.Exit(2)
-    conf, _store, orchestrator = build()
+    conf, store, orchestrator = build()
     qdrant_config = conf.data.get("memory", {}).get("qdrant", {})
     if not qdrant_config.get("enabled", False):
         typer.echo("Qdrant is disabled in configuration")
@@ -759,6 +998,36 @@ def qdrant_acceptance(confirm: bool = typer.Option(False, "--confirm")):
         )
         raise typer.Exit(1) from None
     embedding = conf.data.get("memory", {}).get("embeddings", {})
+    from .evidence import EvidenceRepository
+
+    try:
+        evidence = EvidenceRepository(store.database).record(
+            {
+                "kind": "embedding",
+                "source_id": f"memory-live-acceptance:{uuid.uuid4().hex}",
+                "observed_at": datetime.now(UTC),
+                "subject_sha256": source_tree_sha256(ROOT),
+                "passed": True,
+                "checks": {
+                    "embedding_provider_response": True,
+                    "embedding_dimension_match": True,
+                    "qdrant_collection_healthy": True,
+                    "read_only_search": True,
+                },
+            }
+        )
+    except (OSError, sqlite3.Error, ValueError) as error:
+        typer.echo(
+            json.dumps(
+                {
+                    "healthy": False,
+                    "stage": "evidence_persist",
+                    "error_type": type(error).__name__,
+                },
+                ensure_ascii=False,
+            )
+        )
+        raise typer.Exit(1) from None
     typer.echo(
         json.dumps(
             {
@@ -769,6 +1038,8 @@ def qdrant_acceptance(confirm: bool = typer.Option(False, "--confirm")):
                 "model": embedding.get("model"),
                 "dimension": embedding.get("dimensions", 1024),
                 "matches": len(results),
+                "evidence_id": evidence["id"],
+                "evidence_kind": evidence["kind"],
             },
             ensure_ascii=False,
         )

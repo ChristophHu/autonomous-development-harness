@@ -286,7 +286,7 @@ def test_failing_merged_target_is_revalidated_before_task_completion(
 
     harness.executor.execute = execute
     result = asyncio.run(harness.run(task.id))
-    assert result.status == "waiting_human"
+    assert result.status == "waiting_approval"
     expected_phase = "merged_primary" if workflow == "feature" else "merged_secondary"
     assert result.git_state["phase"] == expected_phase
     repair_question = store.questions.list(task.id)[0]
@@ -371,7 +371,7 @@ def test_approved_target_repair_is_scoped_and_revalidated(tmp_path, monkeypatch)
     harness.executor.execute = execute
     waiting = asyncio.run(harness.run(task.id))
     question = store.questions.list(task.id)[0]
-    assert waiting.status == "waiting_human"
+    assert waiting.status == "waiting_approval"
     assert (
         "check.py"
         in json.loads(question["question"].removeprefix("Git-Freigabe: "))["arguments"]
@@ -435,7 +435,7 @@ def test_denied_target_repair_stays_blocked_without_creating_branch(
     waiting = asyncio.run(harness.run(task.id))
     qid = store.questions.list(task.id)[0]["id"]
     denied = asyncio.run(harness.service.answer(task.id, qid, "deny"))
-    assert waiting.status == "waiting_human"
+    assert waiting.status == "waiting_approval"
     assert denied.status == "blocked"
     assert denied.git_state["phase"] == "repair_declined"
     assert not store.events.list(task.id, "task.completed")

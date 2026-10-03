@@ -119,6 +119,8 @@ def test_harness_crash_lease_expiry_restart_remaining_work_and_completion(tmp_pa
         connection.execute(
             "UPDATE task_leases SET expires_at=0 WHERE task_id=?", (task.id,)
         )
+    # Simulate a second crash after the next process had durably entered recovery.
+    store.tasks.transition(task.id, "recovering")
     restart = subprocess.run(
         [*command, "restart"],
         env=environment,

@@ -56,6 +56,8 @@ def test_success_failure_fallback_and_provider_usage_are_correlated(tmp_path):
         rows = connection.execute("SELECT * FROM model_runs ORDER BY id").fetchall()
         agent = connection.execute("SELECT * FROM agent_runs").fetchone()
     assert [row["status"] for row in rows] == ["failed", "completed"]
+    assert rows[0]["error_category"] == "execution"
+    assert rows[0]["error_type"] == "RuntimeError"
     assert [row["fallback_index"] for row in rows] == [0, 1]
     assert rows[1]["task_id"] == task.id and rows[1]["agent_run_id"] == agent["id"]
     assert rows[1]["agent"] == "executor" and rows[1]["profile"] == "coding"
@@ -64,6 +66,46 @@ def test_success_failure_fallback_and_provider_usage_are_correlated(tmp_path):
     assert rows[1]["started_at"] <= rows[1]["finished_at"]
     assert "PRIVATE-PROMPT" not in str([dict(row) for row in rows])
     assert "FULL-SECRET-PROMPT" not in agent["output"]
+
+
+def test_failed_agent_run_persists_typed_redacted_failure(tmp_path):
+    store, _orchestrator = runtime(tmp_path)
+    task = store.create(Task(title="failure audit"))
+    store.audit.secrets["FAILURE_CANARY"] = "hidden-detail"
+
+    with pytest.raises(RuntimeError), store.audit.agent(task, "executor", "coding"):
+        raise RuntimeError("provider failed: hidden-detail")
+
+    with store.database.connect() as connection:
+        row = connection.execute("SELECT output FROM agent_runs").fetchone()
+    failure = json.loads(row["output"])
+    assert failure == {
+        "category": "execution",
+        "error_type": "RuntimeError",
+        "message": "provider failed: [REDACTED]",
+    }
+
+
+def test_task_failure_event_persists_typed_redacted_error(tmp_path, monkeypatch):
+    store, orchestrator, task = ready_runtime(tmp_path)
+    task = store.create(task)
+    store.audit.secrets["FAILURE_CANARY"] = "DO-NOT-PERSIST"
+
+    def fail(*_args, **_kwargs):
+        raise ValueError("invalid input DO-NOT-PERSIST")
+
+    monkeypatch.setattr(orchestrator, "_invoke", fail)
+    with pytest.raises(ValueError, match="invalid input"):
+        asyncio.run(orchestrator.run(task.id))
+
+    event = store.events.list(task.id, "task.failed")[-1]
+    payload = json.loads(event["payload"])
+    assert payload == {
+        "category": "validation",
+        "error": "invalid input [REDACTED]",
+        "error_type": "ValueError",
+    }
+    assert store.get(task.id).result == "invalid input [REDACTED]"
 
 
 def test_actual_provider_details_and_missing_usage():

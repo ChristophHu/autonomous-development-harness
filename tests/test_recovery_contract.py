@@ -40,6 +40,27 @@ def test_recovery_rejects_replay_and_requires_complete_remaining_scope(tmp_path)
         scope.validate_plan(plan, runtime.tools)
 
 
+def test_restart_from_recovering_does_not_repeat_recovery_transition(
+    tmp_path, monkeypatch
+):
+    from harness.reconciliation import ReconciliationService
+
+    store, runtime, task = ready_runtime(tmp_path)
+    task_id = store.create(task).id
+    for status in ("analyzing", "planning", "ready", "executing", "recovering"):
+        store.tasks.transition(task_id, status)
+
+    def fail_inspection(*_args):
+        raise RuntimeError("recovery inspection unavailable")
+
+    monkeypatch.setattr(ReconciliationService, "inspect", fail_inspection)
+
+    with pytest.raises(RuntimeError, match="recovery inspection unavailable"):
+        asyncio.run(runtime.run(task_id))
+
+    assert store.get(task_id).status == "failed"
+
+
 def review_response(task, status="completed"):
     return json.dumps(
         {

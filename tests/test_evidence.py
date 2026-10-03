@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -58,7 +59,7 @@ def test_evidence_repository_persists_idempotence_and_append_only_guards(tmp_pat
     assert repository.list(kind="ci") == [stored]
     with pytest.raises(ValueError, match="already exists"):
         repository.record(payload())
-    with sqlite3.connect(database.path) as connection:
+    with closing(sqlite3.connect(database.path)) as connection, connection:
         with pytest.raises(sqlite3.IntegrityError, match="append-only"):
             connection.execute(
                 "DELETE FROM verification_evidence WHERE id=?", (stored["id"],)

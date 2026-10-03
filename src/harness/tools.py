@@ -8,6 +8,7 @@ import shlex
 import socket
 import subprocess
 import sys
+import tempfile
 import uuid
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -20,7 +21,7 @@ from urllib.parse import urlsplit
 from jsonschema import Draft202012Validator, ValidationError
 from pydantic import ValidationError as PydanticValidationError
 
-from .isolation import git_metadata, isolated_command
+from .isolation import ProcessAccessProfile, git_metadata, isolated_command
 from .process_control import current_run_control, run_cancellable
 
 
@@ -89,13 +90,17 @@ class ToolExecutor:
 
     def _environment(self):
         allowed = {"PATH", "TMPDIR", "LANG", "LC_ALL", *self.env_allowlist}
-        return {
+        environment = {
             key: value
             for key, value in os.environ.items()
             if key in allowed and not key.startswith(("DYLD_", "LD_", "GIT_"))
         }
+        # Never let host-wide or per-user Git settings weaken broker policy.
+        environment["GIT_CONFIG_NOSYSTEM"] = "1"
+        environment["GIT_CONFIG_GLOBAL"] = "/dev/null"
+        return environment
 
-    def shell(self, command, cwd=None):
+    def shell(self, command, cwd=None, *, read_roots=None, write_roots=None):
         self.permissions.require("shell", write=True)
         args = ["/bin/zsh", "-lc", command] if isinstance(command, str) else command
         if not args or not all(isinstance(arg, str) and arg for arg in args):
@@ -107,7 +112,13 @@ class ToolExecutor:
             )
         return run_cancellable(
             subprocess.run,
-            isolated_command(args, cwd),
+            isolated_command(
+                args,
+                cwd,
+                access_profile=ProcessAccessProfile.workspace(
+                    read_roots=read_roots or (), write_roots=write_roots or ()
+                ),
+            ),
             shell=False,
             cwd=cwd,
             text=True,
@@ -734,9 +745,12 @@ class ToolRegistry:
             MCPClient,
             MCPError,
             MCPHTTPClient,
+            builtin_apple_shell_command,
             builtin_filesystem_command,
             builtin_obsidian_command,
         )
+        from .mcp_servers.apple_shell import EXECUTABLES as APPLE_SHELL_EXECUTABLES
+        from .mcp_servers.apple_shell import TOOLS as APPLE_SHELL_TOOLS
         from .mcp_servers.filesystem import _DELETE, _READ, _WRITE
         from .mcp_servers.obsidian import READ_TOOLS as OBSIDIAN_READ
 
@@ -781,6 +795,10 @@ class ToolRegistry:
                 )
             elif settings.builtin == "obsidian":
                 command = builtin_obsidian_command(vault)
+            elif settings.builtin == "apple_shell":
+                if sys.platform != "darwin":
+                    raise ValueError("Apple Shell MCP requires macOS")
+                command = builtin_apple_shell_command(self.workspace)
             else:
                 command = settings.command
             read_roots = (
@@ -801,6 +819,11 @@ class ToolRegistry:
                     self.workspace,
                     timeout=settings.timeout,
                     read_roots=read_roots,
+                    executable_paths=(
+                        tuple(APPLE_SHELL_EXECUTABLES.values())
+                        if settings.builtin == "apple_shell"
+                        else ()
+                    ),
                 )
             try:
                 discovered = client.discover()
@@ -821,6 +844,10 @@ class ToolRegistry:
                     if name not in OBSIDIAN_READ:
                         raise ValueError("builtin MCP server advertised unknown tool")
                     permission, risk = "obsidian", "READ"
+                elif settings.builtin == "apple_shell":
+                    if name not in APPLE_SHELL_TOOLS:
+                        raise ValueError("Apple Shell MCP advertised unknown tool")
+                    permission, risk = "apple_shell", "READ"
                 elif name in settings.allow_tools:
                     permission, risk = f"mcp.{server_name}", "DESTRUCTIVE"
                 else:
@@ -1028,7 +1055,23 @@ class ToolRegistry:
         return candidate
 
     def shell(self, command, cwd=None):
-        return self.executor.shell(command, cwd=self._workspace_cwd(cwd))
+        temporary_root = Path(tempfile.gettempdir()).resolve(strict=True)
+        runtime_roots = tuple(
+            dict.fromkeys(
+                (
+                    self.workspace,
+                    Path(sys.prefix).resolve(strict=True),
+                    Path(sys.base_prefix).resolve(strict=True),
+                    temporary_root,
+                )
+            )
+        )
+        return self.executor.shell(
+            command,
+            cwd=self._workspace_cwd(cwd),
+            read_roots=runtime_roots,
+            write_roots=(temporary_root,),
+        )
 
     def run_test_file(self, command, path, cwd=None):
         selected = (self.workspace / path).resolve()

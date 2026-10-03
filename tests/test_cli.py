@@ -1158,11 +1158,17 @@ def test_task_events_cli_reports_missing_task(harness_context, capsys):
     assert capsys.readouterr().out == "task not found\n"
 
 
-def test_memory_sync_command_projects_sqlite_decisions(harness_context):
-    _cfg, store, _orchestrator, root = harness_context
+def test_memory_sync_command_projects_sqlite_decisions(harness_context, monkeypatch):
+    cfg, store, _orchestrator, root = harness_context
     from typer.testing import CliRunner
 
     store.decisions.save(None, "Use SQLite", "Canonical persistence")
+    monkeypatch.setattr(cli, "Config", lambda: cfg)
+    monkeypatch.setattr(
+        cli,
+        "build",
+        lambda: (_ for _ in ()).throw(AssertionError("Orchestrator must not start")),
+    )
 
     result = CliRunner().invoke(cli.app, ["memory", "sync"])
 
@@ -1171,6 +1177,29 @@ def test_memory_sync_command_projects_sqlite_decisions(harness_context):
     assert (root / "vault" / "_harness" / "decisions" / "1.md").read_text().find(
         "Use SQLite"
     ) >= 0
+
+
+@pytest.mark.parametrize("database_contents", [None, "not a SQLite database"])
+def test_memory_sync_fails_closed_when_canonical_database_is_unavailable(
+    harness_context, monkeypatch, capsys, database_contents
+):
+    cfg, _store, _orchestrator, root = harness_context
+    database_path = root / "missing.db"
+    cfg.data["paths"]["database"] = str(database_path)
+    if database_contents is not None:
+        database_path.write_text(database_contents, encoding="utf-8")
+    monkeypatch.setattr(cli, "Config", lambda: cfg)
+
+    with pytest.raises(cli.typer.Exit) as result:
+        cli.memory_sync()
+
+    assert result.value.exit_code == 2
+    assert capsys.readouterr().out == (
+        "Obsidian decision projection unavailable: "
+        + ("DatabaseError" if database_contents else "FileNotFoundError")
+        + "\n"
+    )
+    assert not (root / "vault" / "_harness").exists()
 
 
 def test_task_create_accepts_structured_yaml_spec(harness_context, tmp_path):
@@ -1427,8 +1456,11 @@ def test_task_watch_rejects_malformed_sse(harness_context, monkeypatch, lines):
     assert result.output.endswith("task event stream unavailable\n")
 
 
-def test_memory_status_reports_explicit_mcp_opt_in(harness_context, capsys):
-    cfg, _store, _orchestrator, _root = harness_context
+def test_memory_status_reports_explicit_mcp_opt_in(
+    harness_context, monkeypatch, capsys
+):
+    cfg, store, _orchestrator, _root = harness_context
+    monkeypatch.setattr(cli, "_build_memory_store", lambda: (cfg, store))
     cfg.data["memory"]["obsidian"]["enabled"] = True
     cfg.data["tools"]["mcp"]["servers"]["vault"]["enabled"] = False
 
@@ -1438,10 +1470,45 @@ def test_memory_status_reports_explicit_mcp_opt_in(harness_context, capsys):
     assert report["obsidian_enabled"] is True
     assert report["mcp_enabled"] is False
     assert report["markdown_notes"] == 0
+    assert report["last_memory_monitor"] is None
+    assert report["last_memory_ops_acceptance"] is None
 
 
-def test_memory_status_does_not_create_a_missing_vault(harness_context, capsys):
+def test_memory_service_factories_avoid_orchestrator_initialization(
+    harness_context, monkeypatch
+):
+    from harness import core
+    from harness.memory import QdrantMemory
+
     cfg, _store, _orchestrator, _root = harness_context
+    created = []
+    monkeypatch.setattr(cli, "Config", lambda: cfg)
+    monkeypatch.setattr(core, "Store", lambda config: created.append(config) or "store")
+
+    assert cli._build_memory_store() == (cfg, "store")
+    assert created == [cfg]
+
+    cfg.data["memory"]["qdrant"].update(
+        {"url": "http://127.0.0.1:6333", "collection": "memory-test", "timeout": 7}
+    )
+    cfg.data["memory"]["embeddings"]["dimensions"] = 1024
+    cfg.data["secrets"]["QDRANT__SERVICE__API_KEY"] = "test-key"
+    client = cli._memory_qdrant(cfg)
+
+    assert isinstance(client, QdrantMemory)
+    assert client.url == "http://127.0.0.1:6333"
+    assert client.collection == "memory-test"
+    assert client.dimension == 1024
+    assert client.timeout == 7
+    assert client.api_key == "test-key"
+    assert client.embedder is None
+
+
+def test_memory_status_does_not_create_a_missing_vault(
+    harness_context, monkeypatch, capsys
+):
+    cfg, store, _orchestrator, _root = harness_context
+    monkeypatch.setattr(cli, "_build_memory_store", lambda: (cfg, store))
     vault = cfg.path("obsidian_vault")
     vault.rmdir()
 
@@ -1450,6 +1517,325 @@ def test_memory_status_does_not_create_a_missing_vault(harness_context, capsys):
     report = json.loads(capsys.readouterr().out)
     assert report["exists"] is False
     assert not vault.exists()
+
+
+def test_memory_status_does_not_initialize_mcp_registry(
+    harness_context, monkeypatch, capsys
+):
+    cfg, store, _orchestrator, _root = harness_context
+    monkeypatch.setattr(cli, "_build_memory_store", lambda: (cfg, store))
+    monkeypatch.setattr(
+        cli,
+        "build",
+        lambda: (_ for _ in ()).throw(AssertionError("MCP registry initialized")),
+    )
+
+    cli.memory_status()
+
+    assert json.loads(capsys.readouterr().out)["mcp_enabled"] is False
+
+
+def test_memory_watch_requires_explicit_configuration(
+    harness_context, monkeypatch, capsys
+):
+    cfg, store, _orchestrator, _root = harness_context
+    cfg.data["memory"].setdefault("monitoring", {})["enabled"] = False
+    monkeypatch.setattr(cli, "_build_memory_store", lambda: (cfg, store))
+    with pytest.raises(cli.typer.Exit) as result:
+        cli.memory_watch(once=True)
+    assert result.value.exit_code == 2
+    assert capsys.readouterr().out == "Memory monitoring is disabled in configuration\n"
+
+
+@pytest.mark.parametrize("healthy", [True, False])
+def test_memory_watch_once_persists_and_reports_health(
+    harness_context, monkeypatch, capsys, healthy
+):
+    cfg, store, _orchestrator, _root = harness_context
+    cfg.data.setdefault("memory", {}).setdefault("monitoring", {})["enabled"] = True
+    report = {"healthy": healthy, "checks": {"sqlite": "healthy"}}
+    monkeypatch.setattr(cli, "_build_memory_store", lambda: (cfg, store))
+    monkeypatch.setattr(cli, "_memory_qdrant", lambda _config: _orchestrator.qdrant)
+    monkeypatch.setattr(cli, "source_tree_sha256", lambda _root: "b" * 64)
+    monkeypatch.setattr(
+        "harness.memory_monitor.collect_memory_health", lambda *_args, **_kwargs: report
+    )
+
+    if not healthy:
+        with pytest.raises(cli.typer.Exit) as result:
+            cli.memory_watch(once=True)
+        assert result.value.exit_code == 1
+    else:
+        cli.memory_watch(once=True)
+
+    assert json.loads(capsys.readouterr().out) == report
+    from harness.database import OperationalSnapshotRepository
+
+    assert (
+        OperationalSnapshotRepository(store.database).latest_memory_health()["healthy"]
+        is healthy
+    )
+
+
+def test_memory_watch_stops_cleanly_on_keyboard_interrupt(
+    harness_context, monkeypatch, capsys
+):
+    cfg, store, orchestrator, _root = harness_context
+    cfg.data.setdefault("memory", {}).setdefault("monitoring", {})["enabled"] = True
+    monkeypatch.setattr(cli, "_build_memory_store", lambda: (cfg, store))
+    monkeypatch.setattr(cli, "_memory_qdrant", lambda _config: orchestrator.qdrant)
+    monkeypatch.setattr(cli, "source_tree_sha256", lambda _root: "b" * 64)
+    monkeypatch.setattr(
+        "harness.memory_monitor.MemoryHealthMonitor.run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+
+    cli.memory_watch()
+
+    assert capsys.readouterr().out == "Memory monitoring stopped\n"
+
+
+def test_memory_watch_runs_until_monitor_returns(harness_context, monkeypatch, capsys):
+    cfg, store, orchestrator, _root = harness_context
+    cfg.data.setdefault("memory", {}).setdefault("monitoring", {})["enabled"] = True
+    monkeypatch.setattr(cli, "_build_memory_store", lambda: (cfg, store))
+    monkeypatch.setattr(cli, "_memory_qdrant", lambda _config: orchestrator.qdrant)
+    monkeypatch.setattr(cli, "source_tree_sha256", lambda _root: "b" * 64)
+    monkeypatch.setattr(
+        "harness.memory_monitor.MemoryHealthMonitor.run", lambda *_args, **_kwargs: 3
+    )
+
+    cli.memory_watch(once=False)
+
+    assert capsys.readouterr().out == ""
+
+
+def test_memory_service_commands_are_confirmation_gated_and_redacted(
+    harness_context, monkeypatch, capsys
+):
+    cfg, _store, _orchestrator, _root = harness_context
+    cfg.data.setdefault("memory", {}).setdefault("monitoring", {})["enabled"] = True
+    calls = []
+    fake = SimpleNamespace(
+        install=lambda **kwargs: (
+            calls.append(("install", kwargs)) or {"installed": True, "loaded": True}
+        ),
+        status=lambda: {"installed": True, "loaded": True},
+        uninstall=lambda **kwargs: (
+            calls.append(("uninstall", kwargs)) or {"installed": False, "removed": True}
+        ),
+    )
+    monkeypatch.setattr(cli, "Config", lambda: cfg)
+    monkeypatch.setattr(cli, "_launchd_memory_watch_service", lambda: fake)
+
+    cli.memory_service_install(confirm=True)
+    assert json.loads(capsys.readouterr().out) == {
+        "installed": True,
+        "loaded": True,
+    }
+    cli.memory_service_status()
+    assert json.loads(capsys.readouterr().out) == {
+        "installed": True,
+        "loaded": True,
+    }
+    cli.memory_service_uninstall(confirm=True)
+    assert json.loads(capsys.readouterr().out) == {
+        "installed": False,
+        "removed": True,
+    }
+    assert calls == [
+        ("install", {"confirm": True, "monitoring_enabled": True}),
+        ("uninstall", {"confirm": True}),
+    ]
+
+
+def test_memory_ops_acceptance_requires_confirmation_and_enabled_config(
+    harness_context, monkeypatch, capsys
+):
+    import typer
+
+    cfg, _store, _orchestrator, _root = harness_context
+    cfg.data["memory"].setdefault("monitoring", {})["enabled"] = False
+    monkeypatch.setattr(cli, "_build_memory_store", lambda: (cfg, _store))
+    with pytest.raises(typer.Exit) as result:
+        cli.memory_ops_acceptance(confirm=False)
+    assert result.value.exit_code == 2
+    assert "--confirm" in capsys.readouterr().out
+    with pytest.raises(typer.Exit) as result:
+        cli.memory_ops_acceptance(confirm=True)
+    assert result.value.exit_code == 2
+    assert "disabled" in capsys.readouterr().out
+
+
+def test_memory_ops_acceptance_persists_successful_evidence(
+    harness_context, monkeypatch, capsys
+):
+    from datetime import UTC, datetime, timedelta
+
+    from harness.database import OperationalSnapshotRepository
+
+    cfg, store, _orchestrator, _root = harness_context
+    cfg.data.setdefault("memory", {}).setdefault("monitoring", {}).update(
+        {"enabled": True, "interval_seconds": 60}
+    )
+    now = datetime.now(UTC)
+    snapshots = [
+        {
+            "observed_at": (now - timedelta(seconds=60 * (index + 1))).isoformat(),
+            "healthy": True,
+            "checks": {
+                "sqlite": "healthy",
+                "vault": "healthy",
+                "qdrant": "healthy",
+                "embedding_evidence": "healthy",
+            },
+            "source_sha256": "a" * 64,
+        }
+        for index in range(6)
+    ]
+    monkeypatch.setattr(cli, "_build_memory_store", lambda: (cfg, store))
+    monkeypatch.setattr(
+        cli,
+        "_launchd_memory_watch_service",
+        lambda: SimpleNamespace(status=lambda: {"installed": True, "loaded": True}),
+    )
+    monkeypatch.setattr(
+        OperationalSnapshotRepository,
+        "recent_memory_health",
+        lambda _self, *, limit: snapshots[:limit],
+    )
+    monkeypatch.setattr(cli, "source_tree_sha256", lambda _root: "a" * 64)
+
+    cli.memory_ops_acceptance(confirm=True)
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["acceptance"]["passed"] is True
+    assert output["evidence_id"] == 1
+    from harness.database import MemoryOpsEvidenceRepository
+
+    evidence = MemoryOpsEvidenceRepository(store.database).list()
+    assert len(evidence) == 1
+    assert evidence[0]["passed"] is True
+    cli.memory_status()
+    status = json.loads(capsys.readouterr().out)
+    assert status["last_memory_ops_acceptance"]["id"] == evidence[0]["id"]
+
+
+def test_memory_ops_acceptance_failure_and_launchd_error_do_not_write_evidence(
+    harness_context, monkeypatch, capsys
+):
+    import typer
+
+    cfg, store, _orchestrator, _root = harness_context
+    cfg.data.setdefault("memory", {}).setdefault("monitoring", {}).update(
+        {"enabled": True, "interval_seconds": 60}
+    )
+    monkeypatch.setattr(cli, "_build_memory_store", lambda: (cfg, store))
+    monkeypatch.setattr(
+        cli,
+        "_launchd_memory_watch_service",
+        lambda: SimpleNamespace(status=lambda: {"installed": False, "loaded": False}),
+    )
+    monkeypatch.setattr(cli, "source_tree_sha256", lambda _root: "a" * 64)
+    with pytest.raises(typer.Exit) as result:
+        cli.memory_ops_acceptance(confirm=True)
+    assert result.value.exit_code == 1
+    assert json.loads(capsys.readouterr().out)["checks"]["launchd_loaded"] is False
+
+    monkeypatch.setattr(
+        cli,
+        "_launchd_memory_watch_service",
+        lambda: SimpleNamespace(
+            status=lambda: (_ for _ in ()).throw(RuntimeError("private details"))
+        ),
+    )
+    with pytest.raises(typer.Exit) as result:
+        cli.memory_ops_acceptance(confirm=True)
+    assert result.value.exit_code == 2
+    assert (
+        capsys.readouterr().out
+        == "Memory operational acceptance failed: RuntimeError\n"
+    )
+
+
+def test_memory_service_command_redacts_install_errors(
+    harness_context, monkeypatch, capsys
+):
+    import typer
+
+    cfg, _store, _orchestrator, _root = harness_context
+    cfg.data.setdefault("memory", {}).setdefault("monitoring", {})["enabled"] = True
+    monkeypatch.setattr(cli, "Config", lambda: cfg)
+    monkeypatch.setattr(
+        cli,
+        "_launchd_memory_watch_service",
+        lambda: SimpleNamespace(
+            install=lambda **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("secret user path")
+            )
+        ),
+    )
+    with pytest.raises(typer.Exit) as result:
+        cli.memory_service_install(confirm=True)
+    assert result.value.exit_code == 2
+    assert (
+        capsys.readouterr().out
+        == "Memory watcher service install failed: RuntimeError\n"
+    )
+
+
+def test_memory_service_typer_options_and_error_paths(harness_context, monkeypatch):
+    from typer.testing import CliRunner
+
+    cfg, _store, _orchestrator, _root = harness_context
+    cfg.data.setdefault("memory", {}).setdefault("monitoring", {})["enabled"] = True
+    calls = []
+
+    def fake_install(**kwargs):
+        calls.append(kwargs)
+        if not kwargs["confirm"]:
+            raise ValueError("confirmation required")
+        return {"installed": True, "loaded": True}
+
+    fake = SimpleNamespace(
+        install=fake_install,
+        status=lambda: (_ for _ in ()).throw(OSError("private path")),
+        uninstall=lambda **_kwargs: (_ for _ in ()).throw(ValueError("private path")),
+    )
+    monkeypatch.setattr(cli, "Config", lambda: cfg)
+    monkeypatch.setattr(cli, "_launchd_memory_watch_service", lambda: fake)
+    runner = CliRunner()
+
+    missing_confirmation = runner.invoke(cli.app, ["memory", "service", "install"])
+    assert missing_confirmation.exit_code == 2
+    assert "ValueError" in missing_confirmation.output
+    installed = runner.invoke(cli.app, ["memory", "service", "install", "--confirm"])
+    assert installed.exit_code == 0
+    assert json.loads(installed.output) == {"installed": True, "loaded": True}
+    status = runner.invoke(cli.app, ["memory", "service", "status"])
+    assert status.exit_code == 2
+    assert "OSError" in status.output
+    uninstalled = runner.invoke(
+        cli.app, ["memory", "service", "uninstall", "--confirm"]
+    )
+    assert uninstalled.exit_code == 2
+    assert "ValueError" in uninstalled.output
+    assert calls == [
+        {"confirm": False, "monitoring_enabled": True},
+        {"confirm": True, "monitoring_enabled": True},
+    ]
+
+
+def test_memory_service_factory_uses_project_and_executable_paths(
+    harness_context, monkeypatch
+):
+    _cfg, _store, _orchestrator, root = harness_context
+    monkeypatch.setattr(cli.Path, "home", lambda: root / "home")
+    monkeypatch.setattr(cli.os.sys, "argv", [str(root / ".venv" / "bin" / "harness")])
+    service = cli._launchd_memory_watch_service()
+    assert service.home == root / "home"
+    assert service.root == root
+    assert service.executable == root / ".venv" / "bin" / "harness"
 
 
 def test_memory_audit_reports_read_only_health(tmp_path, monkeypatch, capsys):
@@ -1524,6 +1910,49 @@ def test_memory_audit_compares_read_only_sqlite_decisions(
     assert not (vault / "_harness").exists()
 
 
+@pytest.mark.parametrize("command", ["sync", "audit"])
+def test_memory_cli_closes_read_only_sqlite_connections(
+    tmp_path, monkeypatch, capsys, command
+):
+    import sqlite3
+    from types import SimpleNamespace
+
+    from harness.database import Database
+
+    database = Database(tmp_path / "harness.sqlite")
+    vault = tmp_path / "vault"
+    config = SimpleNamespace(
+        path=lambda name: database.path if name == "database" else vault
+    )
+    monkeypatch.setattr(cli, "Config", lambda: config)
+    if command == "sync":
+        monkeypatch.setattr(
+            "harness.memory_projection.DecisionProjection.sync",
+            lambda _self, _rows: {"created": 0, "updated": 0, "removed": 0},
+        )
+    else:
+        monkeypatch.setattr(
+            "harness.vault_audit.audit_vault",
+            lambda *_args, **_kwargs: {"healthy": True},
+        )
+
+    original_connect = sqlite3.connect
+    opened = []
+
+    def tracked_connect(*args, **kwargs):
+        connection = original_connect(*args, **kwargs)
+        opened.append(connection)
+        return connection
+
+    monkeypatch.setattr(cli.sqlite3, "connect", tracked_connect)
+    getattr(cli, f"memory_{command}")()
+    capsys.readouterr()
+
+    assert len(opened) == 1
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        opened[0].execute("SELECT 1")
+
+
 def test_memory_audit_fails_closed_for_missing_vault(tmp_path, monkeypatch, capsys):
     vault = tmp_path / "missing-vault"
     monkeypatch.setattr(
@@ -1548,6 +1977,113 @@ def test_memory_audit_reports_configuration_error(monkeypatch, capsys):
         cli.memory_audit()
     assert exc.value.exit_code == 2
     assert capsys.readouterr().out == "Vault audit unavailable: OSError\n"
+
+
+def test_qdrant_config_audit_reports_redacted_findings(tmp_path, capsys):
+    compose = tmp_path / "docker-compose.yml"
+    compose.write_text(
+        "services:\n  qdrant:\n    image: qdrant/qdrant:latest\n"
+        '    ports: ["6333:6333"]\n'
+        "    environment:\n      QDRANT__SERVICE__API_KEY: never-print-this\n"
+    )
+    config = tmp_path / "production.yml"
+    config.write_text("service:\n  enable_cors: true\n")
+    with pytest.raises(cli.typer.Exit) as exc:
+        cli.qdrant_config_audit(compose, config)
+    output = capsys.readouterr().out
+    assert exc.value.exit_code == 1
+    assert "literal_api_key" in output
+    assert "never-print-this" not in output
+
+
+def test_qdrant_config_audit_reports_unavailable_without_details(tmp_path, capsys):
+    with pytest.raises(cli.typer.Exit) as exc:
+        cli.qdrant_config_audit(tmp_path / "missing.yml")
+    assert exc.value.exit_code == 2
+    assert (
+        capsys.readouterr().out
+        == "Qdrant configuration audit unavailable: ValueError\n"
+    )
+
+
+def test_qdrant_config_audit_cli_accepts_compose_and_optional_config(tmp_path):
+    from typer.testing import CliRunner
+
+    compose = tmp_path / "compose.yml"
+    compose.write_text(
+        "services:\n  qdrant:\n    image: qdrant/qdrant:v1.19.0\n"
+        '    ports: ["127.0.0.1:6333:6333"]\n'
+    )
+    config = tmp_path / "production.yml"
+    config.write_text("service:\n  enable_cors: false\n")
+    result = CliRunner().invoke(
+        cli.app,
+        ["memory", "qdrant-config-audit", str(compose), "--config", str(config)],
+    )
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output) == {"healthy": True, "findings": []}
+
+
+def test_qdrant_upgrade_smoke_requires_confirmation(capsys):
+    with pytest.raises(cli.typer.Exit) as exc:
+        cli.qdrant_upgrade_smoke(
+            "qdrant/qdrant:v1.19.0", "qdrant/qdrant:v1.20.0", confirm=False
+        )
+    assert exc.value.exit_code == 2
+    assert "No action taken" in capsys.readouterr().out
+
+
+def test_qdrant_upgrade_smoke_cli_requires_explicit_confirmation():
+    from typer.testing import CliRunner
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "qdrant-upgrade-smoke",
+            "--baseline-image",
+            "qdrant/qdrant:v1.19.0",
+            "--candidate-image",
+            "qdrant/qdrant:v1.20.0",
+        ],
+    )
+    assert result.exit_code == 2
+    assert "No action taken" in result.output
+
+
+def test_qdrant_upgrade_smoke_reports_result_and_redacted_errors(monkeypatch, capsys):
+    result = {
+        "baseline_image": "qdrant/qdrant:v1.19.0",
+        "candidate_image": "qdrant/qdrant:v1.20.0",
+        "collection_readable": True,
+        "persisted_after_restart": True,
+        "cleaned": True,
+    }
+    monkeypatch.setattr(
+        cli.DockerComposeBroker,
+        "upgrade_smoke_test",
+        lambda _self, _baseline, _candidate: result,
+    )
+    cli.qdrant_upgrade_smoke(
+        "qdrant/qdrant:v1.19.0", "qdrant/qdrant:v1.20.0", confirm=True
+    )
+    output = capsys.readouterr().out
+    assert "baseline=qdrant/qdrant:v1.19.0" in output
+    assert "candidate=qdrant/qdrant:v1.20.0" in output
+    assert "persisted_after_restart=True" in output
+
+    monkeypatch.setattr(
+        cli.DockerComposeBroker,
+        "upgrade_smoke_test",
+        lambda *_args: (_ for _ in ()).throw(ValueError("sensitive detail")),
+    )
+    with pytest.raises(cli.typer.Exit) as exc:
+        cli.qdrant_upgrade_smoke(
+            "qdrant/qdrant:v1.19.0", "qdrant/qdrant:v1.20.0", confirm=True
+        )
+    assert exc.value.exit_code == 1
+    assert (
+        capsys.readouterr().out == "Isolated Qdrant upgrade test failed: ValueError\n"
+    )
 
 
 def test_qdrant_status_reports_disabled_service_and_exits_on_bad_health(
@@ -1733,6 +2269,7 @@ def test_qdrant_acceptance_checks_enabled_health_and_read_only_search(
         {"model": "local-embed", "dimensions": 1024}
     )
     monkeypatch.setattr(cli, "build", lambda: (cfg, store, orchestrator))
+    monkeypatch.setattr(cli, "source_tree_sha256", lambda _root: "a" * 64)
     calls = []
     monkeypatch.setattr(orchestrator.qdrant, "health_report", lambda: {"healthy": True})
     monkeypatch.setattr(
@@ -1752,9 +2289,55 @@ def test_qdrant_acceptance_checks_enabled_health_and_read_only_search(
         "model": "local-embed",
         "dimension": 1024,
         "matches": 1,
+        "evidence_id": 1,
+        "evidence_kind": "embedding",
     }
     assert calls == [("Harness live embedding acceptance probe", 1)]
     assert "not-output" not in json.dumps(report)
+    evidence = store.database
+    from harness.evidence import EvidenceRepository
+
+    item = EvidenceRepository(evidence).list(kind="embedding")[0]
+    assert item["subject_sha256"] == "a" * 64
+    assert item["passed"] is True
+    assert item["checks"] == {
+        "embedding_provider_response": True,
+        "embedding_dimension_match": True,
+        "qdrant_collection_healthy": True,
+        "read_only_search": True,
+    }
+    assert "not-output" not in json.dumps(item)
+
+
+def test_qdrant_acceptance_fails_if_live_evidence_cannot_be_persisted(
+    harness_context, monkeypatch, capsys
+):
+    import sqlite3
+
+    cfg, store, orchestrator, _root = harness_context
+    cfg.data["memory"]["qdrant"]["enabled"] = True
+    monkeypatch.setattr(cli, "build", lambda: (cfg, store, orchestrator))
+    monkeypatch.setattr(orchestrator.qdrant, "health_report", lambda: {"healthy": True})
+    monkeypatch.setattr(orchestrator.qdrant, "search", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cli, "source_tree_sha256", lambda _root: "a" * 64)
+
+    from harness.evidence import EvidenceRepository
+
+    monkeypatch.setattr(
+        EvidenceRepository,
+        "record",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(sqlite3.OperationalError()),
+    )
+    with pytest.raises(cli.typer.Exit) as result:
+        cli.qdrant_acceptance(confirm=True)
+
+    assert result.value.exit_code == 1
+    report = json.loads(capsys.readouterr().out)
+    assert report == {
+        "healthy": False,
+        "stage": "evidence_persist",
+        "error_type": "OperationalError",
+    }
 
 
 def test_qdrant_acceptance_fails_closed_when_service_is_disabled_or_unhealthy(
@@ -1934,6 +2517,7 @@ def test_completion_enforces_configured_evidence_policy(
     write_verification_report(
         matrix_path, coverage_path, junit_path, root / "data" / "verification.json"
     )
+    cfg.path("database").unlink()
     with pytest.raises(typer.Exit) as error:
         cli.completion_status()
     report = json.loads(capsys.readouterr().out)

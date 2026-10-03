@@ -11,6 +11,7 @@ import hashlib
 import os
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -34,6 +35,14 @@ from .git_ssh import (
 from .isolation import isolated_command
 from .process_control import run_cancellable, supervised_popen
 from .workflows import GitWorkflow
+
+_LOCAL_GIT_HELPER_NAMES = (
+    "git-index-pack",
+    "git-maintenance",
+    "git-pack-objects",
+    "git-remote-fd",
+    "git-unpack-objects",
+)
 
 
 def local_path(url, cwd):
@@ -453,6 +462,10 @@ def stop_group(process):
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass  # The process may exit between poll and killpg.
+        except PermissionError:
+            # Some macOS sandbox profiles deny signaling the process group while
+            # still allowing the parent to terminate its direct child.
+            process.kill()
         process.wait()
 
 
@@ -507,6 +520,15 @@ class _LocalTransportCore:
         remote = local_path(remote_url or args[index], cwd)
         if not remote.is_dir():
             raise PermissionError("local Git remote is unavailable")
+        git_executable = Path(
+            shutil.which("git", path="/opt/homebrew/bin:/usr/bin:/bin") or ""
+        ).resolve(strict=True)
+        helper_dir = git_executable.parent.parent / "libexec/git-core"
+        helpers = tuple(helper_dir / name for name in _LOCAL_GIT_HELPER_NAMES)
+        for helper in helpers:
+            if not helper.is_file() or helper.resolve(strict=True) != git_executable:
+                label = "remote-fd" if helper.name == "git-remote-fd" else "Git"
+                raise PermissionError(f"trusted {label} helper is unavailable")
         writing = args[0] == "push"
         server = isolated_command(
             [
@@ -518,6 +540,7 @@ class _LocalTransportCore:
             ],
             remote,
             git=True,
+            git_helpers=helpers,
             read_only=not writing,
         )
         check = isolated_command(
@@ -1414,6 +1437,12 @@ class LocalTransport(_LocalTransportCore):
                     ],
                     self.cwd,
                     git=True,
+                    git_helpers=tuple(
+                        Path(self.server_command[3]).parent.parent
+                        / "libexec/git-core"
+                        / name
+                        for name in _LOCAL_GIT_HELPER_NAMES
+                    ),
                 )
                 with supervised_popen(
                     subprocess.Popen,

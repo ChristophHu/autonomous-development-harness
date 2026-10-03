@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -13,6 +14,8 @@ from typing import ClassVar
 
 
 class Database:
+    CURRENT_SCHEMA_VERSION: ClassVar[int] = 15
+
     def __init__(self, path: Path, *, timeout: float = 5.0):
         if (
             isinstance(timeout, bool)
@@ -62,6 +65,7 @@ class Database:
                     c.execute(
                         f"ALTER TABLE tasks ADD COLUMN {name} TEXT NOT NULL DEFAULT ''"
                     )
+            self._validate_migration_history(c)
             if not c.execute(
                 "SELECT 1 FROM schema_versions WHERE version=1"
             ).fetchone():
@@ -235,6 +239,77 @@ class Database:
                     collection_exists INTEGER NOT NULL CHECK(collection_exists IN (0,1)),
                     vector_size INTEGER, points INTEGER, error_category TEXT)""")
                 c.execute("INSERT INTO schema_versions VALUES(10,?)", (self.now(),))
+            if not c.execute(
+                "SELECT 1 FROM schema_versions WHERE version=11"
+            ).fetchone():
+                c.execute("""CREATE TABLE memory_health_snapshots(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, observed_at TEXT NOT NULL,
+                    healthy INTEGER NOT NULL CHECK(healthy IN (0,1)),
+                    checks_json TEXT NOT NULL)""")
+                c.execute(
+                    "CREATE INDEX memory_health_latest ON memory_health_snapshots(id DESC)"
+                )
+                c.execute("INSERT INTO schema_versions VALUES(11,?)", (self.now(),))
+            if not c.execute(
+                "SELECT 1 FROM schema_versions WHERE version=12"
+            ).fetchone():
+                c.execute("""CREATE TABLE memory_ops_evidence(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    observed_at TEXT NOT NULL,
+                    subject_sha256 TEXT NOT NULL CHECK(length(subject_sha256)=64),
+                    passed INTEGER NOT NULL CHECK(passed=1),
+                    checks_json TEXT NOT NULL,
+                    digest TEXT NOT NULL UNIQUE CHECK(length(digest)=64))""")
+                c.execute(
+                    "CREATE INDEX memory_ops_evidence_latest ON memory_ops_evidence(id DESC)"
+                )
+                c.execute(
+                    "CREATE TRIGGER memory_ops_evidence_no_update BEFORE UPDATE ON memory_ops_evidence BEGIN SELECT RAISE(ABORT,'memory ops evidence is append-only'); END"
+                )
+                c.execute(
+                    "CREATE TRIGGER memory_ops_evidence_no_delete BEFORE DELETE ON memory_ops_evidence BEGIN SELECT RAISE(ABORT,'memory ops evidence is append-only'); END"
+                )
+                c.execute("INSERT INTO schema_versions VALUES(12,?)", (self.now(),))
+            if not c.execute(
+                "SELECT 1 FROM schema_versions WHERE version=13"
+            ).fetchone():
+                c.execute(
+                    "ALTER TABLE memory_health_snapshots ADD COLUMN source_sha256 TEXT"
+                )
+                c.execute("INSERT INTO schema_versions VALUES(13,?)", (self.now(),))
+            if not c.execute(
+                "SELECT 1 FROM schema_versions WHERE version=14"
+            ).fetchone():
+                c.execute(
+                    "ALTER TABLE questions ADD COLUMN purpose TEXT NOT NULL DEFAULT 'input' CHECK(purpose IN ('input','decision','approval'))"
+                )
+                c.execute("INSERT INTO schema_versions VALUES(14,?)", (self.now(),))
+            if not c.execute(
+                "SELECT 1 FROM schema_versions WHERE version=15"
+            ).fetchone():
+                c.execute(
+                    "ALTER TABLE model_runs ADD COLUMN error_category TEXT "
+                    "CHECK(error_category IS NULL OR error_category IN "
+                    "('cancellation','execution','permission','persistence',"
+                    "'provider','timeout','transport','validation'))"
+                )
+                c.execute("INSERT INTO schema_versions VALUES(15,?)", (self.now(),))
+
+    @classmethod
+    def _validate_migration_history(cls, connection):
+        versions = [
+            row[0]
+            for row in connection.execute(
+                "SELECT version FROM schema_versions ORDER BY version"
+            )
+        ]
+        if versions and versions[-1] > cls.CURRENT_SCHEMA_VERSION:
+            raise RuntimeError(
+                f"Database schema version {versions[-1]} is newer than this Harness "
+                f"(maximum supported: {cls.CURRENT_SCHEMA_VERSION})"
+            )
+        if versions and versions != list(range(1, versions[-1] + 1)):
+            raise RuntimeError("Database migration history is incomplete")
 
     @staticmethod
     def now():
@@ -242,7 +317,7 @@ class Database:
 
 
 class OperationalSnapshotRepository:
-    """Persist bounded model discovery and Qdrant probe summaries."""
+    """Persist bounded model discovery, Qdrant probes, and memory health."""
 
     def __init__(self, database):
         self.database = database
@@ -294,6 +369,164 @@ class OperationalSnapshotRepository:
                     category,
                 ),
             )
+
+    def record_memory_health(self, report):
+        if (
+            not isinstance(report, dict)
+            or not isinstance(report.get("healthy"), bool)
+            or not isinstance(report.get("checks"), dict)
+            or not report["checks"]
+            or any(
+                not isinstance(name, str) or not isinstance(state, str)
+                for name, state in report["checks"].items()
+            )
+        ):
+            raise ValueError("memory health report is invalid")
+        source_sha256 = report.get("source_sha256")
+        if source_sha256 is not None and (
+            not isinstance(source_sha256, str)
+            or not re.fullmatch(r"[a-f0-9]{64}", source_sha256)
+        ):
+            raise ValueError("memory health source SHA-256 is invalid")
+        with self.database.connect() as connection:
+            cursor = connection.execute(
+                "INSERT INTO memory_health_snapshots(observed_at,healthy,checks_json,source_sha256) VALUES(?,?,?,?)",
+                (
+                    Database.now(),
+                    int(report["healthy"]),
+                    json.dumps(report["checks"], sort_keys=True),
+                    source_sha256,
+                ),
+            )
+        return cursor.lastrowid
+
+    def latest_memory_health(self):
+        with self.database.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM memory_health_snapshots ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "id": row["id"],
+            "observed_at": row["observed_at"],
+            "healthy": bool(row["healthy"]),
+            "checks": json.loads(row["checks_json"]),
+            "source_sha256": row["source_sha256"],
+        }
+
+    def recent_memory_health(self, *, limit):
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= 500
+        ):
+            raise ValueError("memory snapshot limit must be between 1 and 500")
+        with self.database.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM memory_health_snapshots ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [
+            {
+                "id": row["id"],
+                "observed_at": row["observed_at"],
+                "healthy": bool(row["healthy"]),
+                "checks": json.loads(row["checks_json"]),
+                "source_sha256": row["source_sha256"],
+            }
+            for row in rows
+        ]
+
+
+class MemoryOpsEvidenceRepository:
+    """Store successful, append-only evidence for an operational memory run."""
+
+    REQUIRED_CHECKS: ClassVar[set[str]] = {
+        "launchd_loaded",
+        "snapshot_count_sufficient",
+        "observation_window_met",
+        "snapshots_healthy",
+        "required_checks_present",
+        "latest_snapshot_fresh",
+        "monitor_source_current",
+    }
+
+    def __init__(self, database):
+        self.database = database
+
+    def record(self, *, subject_sha256, observed_at, checks):
+        import hashlib
+        import re
+
+        if not isinstance(subject_sha256, str) or not re.fullmatch(
+            r"[a-f0-9]{64}", subject_sha256
+        ):
+            raise ValueError("memory ops evidence subject SHA-256 is invalid")
+        if not isinstance(observed_at, datetime) or observed_at.tzinfo is None:
+            raise ValueError("memory ops evidence timestamp must be timezone-aware")
+        if (
+            not isinstance(checks, dict)
+            or set(checks) != self.REQUIRED_CHECKS
+            or any(type(value) is not bool for value in checks.values())
+        ):
+            raise ValueError("memory ops evidence checks are invalid")
+        if not all(checks.values()):
+            raise ValueError("memory ops evidence requires all checks to pass")
+        normalized_at = observed_at.astimezone(UTC).isoformat()
+        canonical = json.dumps(
+            {
+                "observed_at": normalized_at,
+                "subject_sha256": subject_sha256,
+                "passed": True,
+                "checks": checks,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        with self.database.connect() as connection:
+            cursor = connection.execute(
+                "INSERT INTO memory_ops_evidence(observed_at,subject_sha256,passed,checks_json,digest) VALUES(?,?,?,?,?)",
+                (
+                    normalized_at,
+                    subject_sha256,
+                    1,
+                    json.dumps(checks, sort_keys=True),
+                    digest,
+                ),
+            )
+        return {
+            "id": cursor.lastrowid,
+            "observed_at": normalized_at,
+            "subject_sha256": subject_sha256,
+            "passed": True,
+            "checks": checks,
+            "digest": digest,
+        }
+
+    def list(self, *, limit=100):
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= 500
+        ):
+            raise ValueError("memory ops evidence limit must be between 1 and 500")
+        with self.database.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM memory_ops_evidence ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [
+            {
+                "id": row["id"],
+                "observed_at": row["observed_at"],
+                "subject_sha256": row["subject_sha256"],
+                "passed": bool(row["passed"]),
+                "checks": json.loads(row["checks_json"]),
+                "digest": row["digest"],
+            }
+            for row in rows
+        ]
 
 
 class TaskRepository:
@@ -1105,9 +1338,24 @@ class QuestionRepository:
             return cur.lastrowid
 
     def ask(
-        self, task_id, question, reason, options=None, required=True, event_payload=None
+        self,
+        task_id,
+        question,
+        reason,
+        options=None,
+        required=True,
+        event_payload=None,
+        purpose="input",
     ):
         from .domain import EventKind
+
+        status_by_purpose = {
+            "input": "waiting_human",
+            "decision": "waiting_decision",
+            "approval": "waiting_approval",
+        }
+        if purpose not in status_by_purpose:
+            raise ValueError("unsupported question purpose")
 
         with self.db.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -1125,7 +1373,7 @@ class QuestionRepository:
             if existing is not None:
                 return existing["id"]
             question_id = connection.execute(
-                "INSERT INTO questions(task_id,question,reason,options,required,created_at) VALUES(?,?,?,?,?,?)",
+                "INSERT INTO questions(task_id,question,reason,options,required,created_at,purpose) VALUES(?,?,?,?,?,?,?)",
                 (
                     task_id,
                     question,
@@ -1133,13 +1381,26 @@ class QuestionRepository:
                     json.dumps(options or []),
                     int(required),
                     self.db.now(),
+                    purpose,
                 ),
             ).lastrowid
             if required:
+                status = status_by_purpose[purpose]
+                previous = task["status"]
                 connection.execute(
-                    "UPDATE tasks SET status='waiting_human',updated_at=? WHERE id=?",
-                    (self.db.now(), task_id),
+                    "UPDATE tasks SET status=?,updated_at=? WHERE id=?",
+                    (status, self.db.now(), task_id),
                 )
+                if previous != status:
+                    connection.execute(
+                        "INSERT INTO events(task_id,kind,payload,created_at) VALUES(?,?,?,?)",
+                        (
+                            task_id,
+                            EventKind.TASK_STATUS.value,
+                            json.dumps({"from": previous, "status": status}),
+                            self.db.now(),
+                        ),
+                    )
             connection.execute(
                 "INSERT INTO events(task_id,kind,payload,created_at) VALUES(?,?,?,?)",
                 (
@@ -1176,7 +1437,7 @@ class QuestionRepository:
     def answer(self, question_id, answer, task_id=None):
         with self.db.connect() as c:
             row = c.execute(
-                "SELECT options,task_id FROM questions WHERE id=? AND status='open'",
+                "SELECT options,task_id,required FROM questions WHERE id=? AND status='open'",
                 (question_id,),
             ).fetchone()
             if not row or (task_id is not None and row["task_id"] != task_id):
@@ -1184,13 +1445,42 @@ class QuestionRepository:
             options = json.loads(row["options"])
             if options and answer not in options:
                 return False
-            return (
+            changed = (
                 c.execute(
                     "UPDATE questions SET answer=?,status='answered',answered_at=? WHERE id=? AND status='open'",
                     (answer, self.db.now(), question_id),
                 ).rowcount
                 == 1
             )
+            if changed and row["required"]:
+                pending = c.execute(
+                    "SELECT purpose FROM questions WHERE task_id=? AND status='open' AND required=1 ORDER BY id DESC LIMIT 1",
+                    (row["task_id"],),
+                ).fetchone()
+                if pending is not None:
+                    status = {
+                        "input": "waiting_human",
+                        "decision": "waiting_decision",
+                        "approval": "waiting_approval",
+                    }[pending["purpose"]]
+                    task = c.execute(
+                        "SELECT status FROM tasks WHERE id=?", (row["task_id"],)
+                    ).fetchone()
+                    if task is not None and task["status"] != status:
+                        c.execute(
+                            "UPDATE tasks SET status=?,updated_at=? WHERE id=?",
+                            (status, self.db.now(), row["task_id"]),
+                        )
+                        c.execute(
+                            "INSERT INTO events(task_id,kind,payload,created_at) VALUES(?,?,?,?)",
+                            (
+                                row["task_id"],
+                                "task.status",
+                                json.dumps({"from": task["status"], "status": status}),
+                                self.db.now(),
+                            ),
+                        )
+            return changed
 
     def consume_answer(self, question_id):
         with self.db.connect() as c:
@@ -1347,7 +1637,7 @@ class ModelRunRepository:
             rows = connection.execute(
                 "SELECT id,task_id,agent,profile,complexity,provider,model,status,"
                 "started_at,finished_at,latency_ms,fallback_index,prompt_tokens,"
-                "completion_tokens,cached_tokens,reasoning_tokens,cost,error_type "
+                "completion_tokens,cached_tokens,reasoning_tokens,cost,error_type,error_category "
                 f"FROM model_runs{where} "
                 "ORDER BY COALESCE(started_at,created_at) DESC,id DESC LIMIT ? OFFSET ?",
                 [*parameters, limit, offset],
@@ -1438,9 +1728,17 @@ class AuditRepository:
         elapsed,
         usage=None,
         error_type=None,
+        error_category=None,
         provider=None,
         model=None,
     ):
+        if error_category is not None:
+            from .errors import FailureCategory
+
+            try:
+                error_category = FailureCategory(error_category).value
+            except ValueError as error:
+                raise ValueError("unsupported model failure category") from error
         with self.db.connect() as connection:
             values = (
                 (
@@ -1456,6 +1754,14 @@ class AuditRepository:
                 else (provider, model, None, None, None, None, None)
             )
             connection.execute(
-                "UPDATE model_runs SET status=?,finished_at=?,latency_ms=?,provider=COALESCE(?,provider),model=COALESCE(?,model),prompt_tokens=?,completion_tokens=?,cost=?,cached_tokens=?,reasoning_tokens=?,error_type=? WHERE id=?",
-                (status, self.db.now(), elapsed, *values, error_type, run_id),
+                "UPDATE model_runs SET status=?,finished_at=?,latency_ms=?,provider=COALESCE(?,provider),model=COALESCE(?,model),prompt_tokens=?,completion_tokens=?,cost=?,cached_tokens=?,reasoning_tokens=?,error_type=?,error_category=? WHERE id=?",
+                (
+                    status,
+                    self.db.now(),
+                    elapsed,
+                    *values,
+                    error_type,
+                    error_category,
+                    run_id,
+                ),
             )

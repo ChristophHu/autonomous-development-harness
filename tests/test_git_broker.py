@@ -402,6 +402,22 @@ def test_stop_group_handles_concurrent_exit(monkeypatch):
     assert waits == [True]
 
 
+def test_stop_group_falls_back_to_direct_child_when_group_signal_is_denied(monkeypatch):
+    actions = []
+    process = SimpleNamespace(
+        pid=123,
+        poll=lambda: None,
+        kill=lambda: actions.append("kill"),
+        wait=lambda: actions.append("wait"),
+    )
+    monkeypatch.setattr(
+        "harness.git_broker.os.killpg",
+        lambda *a: (_ for _ in ()).throw(PermissionError()),
+    )
+    stop_group(process)
+    assert actions == ["kill", "wait"]
+
+
 def approved_push(tmp_path, monkeypatch, args=None):
     store, harness, task, git, repo = git_runtime(tmp_path, monkeypatch)
     remote = tmp_path / "remote.git"

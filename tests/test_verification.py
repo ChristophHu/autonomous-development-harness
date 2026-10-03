@@ -60,6 +60,28 @@ def test_verification_report_replaces_managed_summary_and_counts_matrix_rows(tmp
     assert report["matrix_sha256"] == hashlib.sha256(matrix.read_bytes()).hexdigest()
 
 
+def test_verification_report_removes_stale_unmanaged_gap_totals(tmp_path):
+    matrix = tmp_path / "GAP_MATRIX.md"
+    matrix.write_text(
+        "# Gap\n\n<!-- VERIFY-RESULT:START -->\nstale\n<!-- VERIFY-RESULT:END -->\n"
+        "| 1 | One | Erfüllt | evidence |\n| 2 | Two | Teilweise | evidence |\n\n"
+        "Erfüllt: 0/109 (0 %). Teilweise: 109/109. Offen: 0/109. "
+        "Codecoverage bleibt ein separates Qualitätsmaß.\n"
+    )
+    coverage = tmp_path / "coverage.json"
+    coverage.write_text(json.dumps(coverage_report()))
+    junit = tmp_path / "junit.xml"
+    junit.write_text('<testsuite tests="1"><testcase /></testsuite>')
+
+    write_verification_report(matrix, coverage, junit, tmp_path / "report.json")
+    content = matrix.read_text()
+
+    assert "1 erfüllt, 1 teilweise, 0 offen" in content
+    assert "Erfüllt: 0/109" not in content
+    assert "Aktuelle GAP-Zahlen stehen ausschließlich" in content
+    assert "Codecoverage bleibt ein separates Qualitätsmaß." in content
+
+
 @pytest.mark.parametrize(
     "markers",
     [

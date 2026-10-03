@@ -12,13 +12,32 @@ from .filesystem import FilesystemServer, _schema, serve_stdio
 from .filesystem import _response as base_response
 
 MAX_SCAN = 1000
-READ_TOOLS = {"read_note", "list_notes", "search_notes"}
+READ_TOOLS = {
+    "read_note",
+    "list_notes",
+    "search_notes",
+    "knowledge_note",
+    "backlinks",
+    "knowledge_search",
+}
 _LIMIT = {"limit": {"type": "integer", "minimum": 1, "maximum": 100}}
 TOOLS = {
     "read_note": _schema({"path": {"type": "string", "minLength": 1}}, ["path"]),
     "list_notes": _schema(_LIMIT, []),
     "search_notes": _schema(
         {"query": {"type": "string", "minLength": 1}, **_LIMIT}, ["query"]
+    ),
+    "knowledge_note": _schema({"path": {"type": "string", "minLength": 1}}, ["path"]),
+    "backlinks": _schema(
+        {"path": {"type": "string", "minLength": 1}, **_LIMIT}, ["path"]
+    ),
+    "knowledge_search": _schema(
+        {
+            "query": {"type": "string", "minLength": 1},
+            **_LIMIT,
+            "context_chars": {"type": "integer", "minimum": 20, "maximum": 1000},
+        },
+        ["query"],
     ),
 }
 OUTPUTS = {
@@ -29,12 +48,48 @@ OUTPUTS = {
     "search_notes": _schema(
         {"matches": {"type": "array", "items": {"type": "string"}}}, ["matches"]
     ),
+    "knowledge_note": _schema(
+        {
+            "path": {"type": "string"},
+            "metadata": {"type": "object"},
+            "headings": {"type": "array", "items": {"type": "string"}},
+            "links": {"type": "array", "items": {"type": "string"}},
+            "content": {"type": "string"},
+        },
+        ["path", "metadata", "headings", "links", "content"],
+    ),
+    "backlinks": _schema(
+        {"matches": {"type": "array", "items": {"type": "string"}}}, ["matches"]
+    ),
+    "knowledge_search": _schema(
+        {
+            "matches": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "excerpt": {"type": "string"},
+                    },
+                    "required": ["path", "excerpt"],
+                    "additionalProperties": False,
+                },
+            }
+        },
+        ["matches"],
+    ),
 }
 
 
 class ObsidianServer:
     def __init__(self, vault):
         self.files = FilesystemServer(vault, read_only=True)
+
+    @property
+    def knowledge(self):
+        from ..vault_knowledge import VaultKnowledgeService
+
+        return VaultKnowledgeService(self.files.root, _server=self)
 
     def _parts(self, path):
         parts = self.files._parts(path)
@@ -73,6 +128,22 @@ class ObsidianServer:
         if name not in TOOLS:
             raise ValueError("unknown Obsidian tool")
         Draft202012Validator(TOOLS[name]).validate(arguments)
+        if name == "knowledge_note":
+            return self.knowledge.get_note(arguments["path"])
+        if name == "backlinks":
+            return {
+                "matches": self.knowledge.backlinks(
+                    arguments["path"], limit=arguments.get("limit", 100)
+                )
+            }
+        if name == "knowledge_search":
+            return {
+                "matches": self.knowledge.search(
+                    arguments["query"],
+                    limit=arguments.get("limit", 100),
+                    context_chars=arguments.get("context_chars", 160),
+                )
+            }
         if name == "read_note":
             return {"content": self.files._read(self._parts(arguments["path"]))}
         notes = self._notes()

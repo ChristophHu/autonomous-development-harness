@@ -269,6 +269,18 @@ def test_config_rejects_enabled_provider_without_url(tmp_path):
             "memory.embeddings.dimensions must be a positive integer",
         ),
         (
+            {"memory": {"monitoring": {"interval_seconds": 4}}},
+            "memory.monitoring.interval_seconds must be an integer between 5 and 3600",
+        ),
+        (
+            {"memory": {"monitoring": {"interval_seconds": True}}},
+            "memory.monitoring.interval_seconds must be an integer between 5 and 3600",
+        ),
+        (
+            {"memory": {"monitoring": {"evidence_max_age_hours": 8761}}},
+            "memory.monitoring.evidence_max_age_hours must be an integer between 1 and 8760",
+        ),
+        (
             {"models": {"providers": {"x": {"enabled": "yes"}}}},
             "models.providers.x.enabled must be a boolean",
         ),

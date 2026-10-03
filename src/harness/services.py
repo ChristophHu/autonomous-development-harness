@@ -1,4 +1,4 @@
-"""Shared application boundary for task creation, editing and execution."""
+"""Shared application boundary for API and command-line operations."""
 
 import asyncio
 import threading
@@ -7,8 +7,36 @@ import uuid
 import httpx
 
 from .domain import EventKind, Status, Task
+from .evidence import EvidenceRepository, audit_evidence
 from .process_control import RunControl, TaskCancelled, use_run_control
 from .providers import ProviderHealth
+
+
+class VerificationEvidenceService:
+    """Application boundary shared by HTTP and command-line evidence workflows."""
+
+    def __init__(self, database):
+        self.repository = EvidenceRepository(database)
+
+    def record(self, payload):
+        return self.repository.record(payload)
+
+    def list(self, *, kind=None, limit=100):
+        return self.repository.list(kind=kind, limit=limit)
+
+    def audit(self, *, subject_sha256, max_age_hours=168):
+        return audit_evidence(
+            self.list(limit=500),
+            expected_subject_sha256=subject_sha256,
+            max_age_hours=max_age_hours,
+        )
+
+    def audit_kind(self, kind, *, subject_sha256, max_age_hours=168):
+        return audit_evidence(
+            self.list(kind=kind, limit=500),
+            expected_subject_sha256=subject_sha256,
+            max_age_hours=max_age_hours,
+        )
 
 
 class ConfigurationApplicationService:
@@ -268,9 +296,11 @@ class TaskService:
             raise ValueError("correction not found")
         return self.store.corrections.set_status(item_id, status)
 
-    def ask_question(self, task_id, question, reason, options=None, required=True):
+    def ask_question(
+        self, task_id, question, reason, options=None, required=True, purpose="input"
+    ):
         self.get(task_id)
-        return self.store.ask(task_id, question, reason, options, required)
+        return self.store.ask(task_id, question, reason, options, required, purpose)
 
     def model_usage(self, **filters):
         return self.store.model_usage.report(**filters)
@@ -346,9 +376,10 @@ class TaskService:
                 task_id,
                 question_id,
             )
-        if (
-            task.status != Status.WAITING_HUMAN
-            or self.store.questions.has_open_required(task_id)
-        ):
+        if task.status not in {
+            Status.WAITING_HUMAN,
+            Status.WAITING_DECISION,
+            Status.WAITING_APPROVAL,
+        } or self.store.questions.has_open_required(task_id):
             return self.get(task_id)
         return await self.start(task_id)

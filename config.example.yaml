@@ -32,6 +32,11 @@ memory:
     model: <EXACT-EMBEDDING-MODEL-ID>
     dimensions: 1024
     batch_size: 32
+  monitoring:
+    # Start with `harness memory watch` only when explicitly enabled.
+    enabled: false
+    interval_seconds: 60
+    evidence_max_age_hours: 168
 models:
   defaults:
     provider: lmstudio

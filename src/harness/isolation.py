@@ -7,8 +7,90 @@ profile file. The kernel applies restrictions to descendants and resolved paths.
 
 import json
 import shutil
+import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
+
+_MACHO_MAGICS = {
+    b"\xca\xfe\xba\xbe",
+    b"\xbe\xba\xfe\xca",
+    b"\xce\xfa\xed\xfe",
+    b"\xfe\xed\xfa\xce",
+    b"\xcf\xfa\xed\xfe",
+    b"\xfe\xed\xfa\xcf",
+}
+_SYSTEM_LIBRARY_PREFIXES = ("/System/", "/usr/lib/")
+_OTOOL_POPEN = subprocess.Popen
+
+
+def _run_otool(command, **_kwargs):
+    with _OTOOL_POPEN(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    ) as process:
+        stdout, stderr = process.communicate()
+    if process.returncode:
+        raise subprocess.CalledProcessError(
+            process.returncode, command, output=stdout, stderr=stderr
+        )
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+
+
+_OTOOL_RUN = _run_otool
+
+
+def _git_runtime_dylibs(executables):
+    """Resolve non-system dylibs loaded by trusted Git executables/helpers."""
+    pending = [Path(path).resolve(strict=True) for path in executables]
+    inspected = set()
+    allowed = set()
+    while pending:
+        executable = pending.pop()
+        if executable in inspected:
+            continue
+        inspected.add(executable)
+        try:
+            with executable.open("rb") as stream:
+                magic = stream.read(4)
+        except OSError as error:
+            raise PermissionError("Git runtime executable is unavailable") from error
+        if magic not in _MACHO_MAGICS:
+            continue
+        try:
+            result = _OTOOL_RUN(
+                ("/usr/bin/otool", "-L", str(executable)),
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        except (OSError, subprocess.CalledProcessError) as error:
+            raise PermissionError(
+                "Git runtime dependencies cannot be inspected"
+            ) from error
+        for line in result.stdout.splitlines()[1:]:
+            entry = line.strip()
+            if not entry:
+                continue
+            install_name = entry.split(" (compatibility ", 1)[0]
+            if install_name.startswith(_SYSTEM_LIBRARY_PREFIXES):
+                continue
+            dependency = Path(install_name)
+            if not dependency.is_absolute():
+                raise PermissionError("Git runtime dependency path is unresolved")
+            try:
+                resolved = dependency.resolve(strict=True)
+            except OSError as error:
+                raise PermissionError(
+                    "Git runtime dependency is unavailable"
+                ) from error
+            if not resolved.is_file():
+                raise PermissionError("Git runtime dependency is unavailable")
+            allowed.update((dependency, resolved))
+            pending.append(resolved)
+    return tuple(sorted(allowed, key=str))
 
 
 def _stat_if_present(path):
@@ -98,6 +180,49 @@ def trusted_git_metadata(cwd):
     return ()
 
 
+@dataclass(frozen=True)
+class ProcessAccessProfile:
+    """Explicit filesystem and socket permissions for one child-process class."""
+
+    name: str
+    read_roots: tuple[Path, ...] = ()
+    write_roots: tuple[Path, ...] = ()
+    executable_paths: tuple[Path, ...] = ()
+    unix_sockets: tuple[Path, ...] = ()
+
+    @classmethod
+    def workspace(cls, *, read_roots=(), write_roots=()):
+        return cls(
+            "workspace", tuple(map(Path, read_roots)), tuple(map(Path, write_roots))
+        )
+
+    @classmethod
+    def mcp_stdio(cls, *, read_roots=(), executable_paths=()):
+        return cls(
+            "mcp_stdio",
+            tuple(map(Path, read_roots)),
+            executable_paths=tuple(map(Path, executable_paths)),
+        )
+
+    @classmethod
+    def broker(
+        cls,
+        name,
+        *,
+        read_roots=(),
+        write_roots=(),
+        executable_paths=(),
+        unix_sockets=(),
+    ):
+        return cls(
+            name,
+            tuple(map(Path, read_roots)),
+            tuple(map(Path, write_roots)),
+            tuple(map(Path, executable_paths)),
+            tuple(map(Path, unix_sockets)),
+        )
+
+
 def isolated_command(
     command,
     cwd,
@@ -110,47 +235,139 @@ def isolated_command(
     unix_sockets=(),
     git_shell=False,
     read_roots=None,
+    write_roots=None,
+    access_profile=None,
 ):
     if sys.platform != "darwin":
         raise PermissionError("process isolation requires macOS sandbox-exec")
     root = Path(cwd or Path.cwd()).resolve(strict=True)
     if root == Path(root.anchor):
         raise PermissionError("filesystem root cannot be an isolated workspace")
+    if access_profile is not None and (
+        read_roots is not None or write_roots is not None
+    ):
+        raise ValueError("use either an access profile or legacy root arguments")
+    if access_profile is None:
+        access_profile = (
+            ProcessAccessProfile.workspace(
+                read_roots=read_roots or (), write_roots=write_roots or ()
+            )
+            if not git
+            else ProcessAccessProfile.broker("git")
+        )
+    if not isinstance(access_profile, ProcessAccessProfile):
+        raise TypeError("access_profile must be a ProcessAccessProfile")
+    command = list(command)
+    if command and Path(command[0]).is_absolute():
+        try:
+            command[0] = str(Path(command[0]).resolve(strict=True))
+        except OSError as error:
+            raise PermissionError("process executable is unavailable") from error
+    git_executable = None
+    git_runtime_dylibs = ()
+    if git:
+        selected_git = shutil.which("git", path="/opt/homebrew/bin:/usr/bin:/bin")
+        if not selected_git:
+            raise PermissionError("Git executable is unavailable")
+        git_executable = Path(selected_git).resolve(strict=True)
+        if git_executable.is_relative_to(root):
+            raise PermissionError(
+                "Git executable must be outside the writable workspace"
+            )
+        command = [str(git_executable), *command[1:]]
+        if any(not Path(helper).is_absolute() for helper in git_helpers):
+            raise PermissionError("Git helper path must be absolute")
+        runtime_executables = [git_executable]
+        runtime_executables.extend(Path(path) for path in git_helpers)
+        if git_shell:
+            runtime_executables.extend((Path("/bin/sh"), Path("/bin/bash")))
+        git_runtime_dylibs = _git_runtime_dylibs(runtime_executables)
     rules = [
         "(version 1)",
         "(deny default)",
         "(allow process-fork)",
         "(allow process-exec)",
         "(allow sysctl-read)",
-        "(allow file-read*)",
+        '(allow file-read-data (literal "/dev/null"))',
         '(allow file-write* (literal "/dev/null"))',
     ]
-    if read_roots is not None:
-        for protected in ("/Users", "/private/var/folders", "/private/tmp", "/Volumes"):
-            rules.append(f"(deny file-read-data (subpath {json.dumps(protected)}))")
-        for path in read_roots:
+    system_roots = (
+        Path("/System"),
+        Path("/usr/lib"),
+        Path("/usr/bin"),
+        Path("/bin"),
+        Path("/private/etc"),
+    )
+    read_candidates = [
+        *system_roots,
+        Path(sys.prefix),
+        Path(sys.base_prefix),
+        Path(sys.base_prefix).parent.parent,
+        root,
+        *access_profile.read_roots,
+        *access_profile.executable_paths,
+    ]
+    if git:
+        read_candidates.append(git_executable)
+        read_candidates.extend(trusted_git_metadata(root))
+    executable = Path(command[0]) if command else None
+    if executable is not None and executable.is_absolute():
+        read_candidates.append(executable)
+    for path in dict.fromkeys(read_candidates):
+        candidate = Path(path)
+        if not candidate.is_absolute():
+            raise PermissionError("process read root must be absolute")
+        try:
+            candidate = candidate.resolve(strict=True)
+        except OSError as error:
+            raise PermissionError("process read root is unavailable") from error
+        rules.append(f"(allow file-read* (subpath {json.dumps(str(candidate))}))")
+        for parent in candidate.parents:
+            rules.append(
+                f"(allow file-read-metadata (literal {json.dumps(str(parent))}))"
+            )
+    for dependency in git_runtime_dylibs:
+        rules.append(f"(allow file-read* (literal {json.dumps(str(dependency))}))")
+        for parent in dependency.parents:
+            rules.append(
+                f"(allow file-read-metadata (literal {json.dumps(str(parent))}))"
+            )
+    # Runtime startup may inspect the root directory entry itself. Permit
+    # reading that entry without granting access to the rest of the filesystem.
+    rules.append('(allow file-read-data (literal "/"))')
+    executable_mapping_roots = (
+        *system_roots,
+        Path(sys.prefix),
+        Path(sys.base_prefix),
+        Path(sys.base_prefix).parent.parent,
+    )
+    for path in dict.fromkeys(executable_mapping_roots):
+        try:
+            candidate = Path(path).resolve(strict=True)
+        except OSError as error:
+            raise PermissionError("process runtime root is unavailable") from error
+        if candidate.is_relative_to(root):
+            continue
+        rules.append(
+            f"(allow file-map-executable (subpath {json.dumps(str(candidate))}))"
+        )
+    for dependency in git_runtime_dylibs:
+        rules.append(
+            f"(allow file-map-executable (literal {json.dumps(str(dependency))}))"
+        )
+    if not read_only:
+        rules.append(f"(allow file-write* (subpath {json.dumps(str(root))}))")
+        for path in access_profile.write_roots:
             candidate = Path(path)
             if not candidate.is_absolute():
-                raise PermissionError("MCP read root must be absolute")
+                raise PermissionError("process write root must be absolute")
             try:
                 candidate = candidate.resolve(strict=True)
             except OSError as error:
-                raise PermissionError("MCP read root is unavailable") from error
-            rules.append(
-                f"(allow file-read-data (subpath {json.dumps(str(candidate))}))"
-            )
-    if not read_only:
-        rules.append(f"(allow file-write* (subpath {json.dumps(str(root))}))")
+                raise PermissionError("process write root is unavailable") from error
+            rules.append(f"(allow file-write* (subpath {json.dumps(str(candidate))}))")
     if git:
         # Never trust task/profile PATH or an executable written by a task.
-        executable = shutil.which("git", path="/opt/homebrew/bin:/usr/bin:/bin")
-        if not executable:
-            raise PermissionError("Git executable is unavailable")
-        command = [str(Path(executable).resolve()), *command[1:]]
-        if Path(command[0]).is_relative_to(root):
-            raise PermissionError(
-                "Git executable must be outside the writable workspace"
-            )
         rules.extend(
             [
                 "(deny process-exec)",
@@ -158,7 +375,10 @@ def isolated_command(
             ]
         )
         for helper in git_helpers:
-            helper = Path(helper).resolve(strict=True)
+            helper_path = Path(helper)
+            helper = helper_path.resolve(strict=True)
+            for parent in {helper_path.parent, helper.parent}:
+                rules.append(f"(allow file-read* (subpath {json.dumps(str(parent))}))")
             rules.append(f"(allow process-exec (literal {json.dumps(str(helper))}))")
         if git_shell:
             # Git runs the fixed, quoted SSH command through /bin/sh (bash on
@@ -171,7 +391,11 @@ def isolated_command(
                 ]
             )
         if network_proxy is not None:
-            if not isinstance(network_proxy, int) or not 1 <= network_proxy <= 65535:
+            if (
+                isinstance(network_proxy, bool)
+                or not isinstance(network_proxy, int)
+                or not 1 <= network_proxy <= 65535
+            ):
                 raise ValueError("network proxy port is invalid")
             rules.append("(allow system-socket (socket-domain AF_INET))")
             rules.append(
@@ -181,27 +405,13 @@ def isolated_command(
             if (
                 not isinstance(host, str)
                 or not host
+                or isinstance(port, bool)
                 or not isinstance(port, int)
                 or not 1 <= port <= 65535
             ):
                 raise ValueError("network remote is invalid")
             target = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
             rules.append(f'(allow network-outbound (remote ip "{target}"))')
-        if unix_sockets:
-            rules.append("(allow system-socket (socket-domain AF_UNIX))")
-            for socket_path in unix_sockets:
-                try:
-                    socket_path = Path(socket_path).resolve(strict=True)
-                except OSError as error:
-                    raise PermissionError(
-                        "allowed Unix socket is unavailable"
-                    ) from error
-                if not socket_path.is_socket():
-                    raise PermissionError("allowed Unix socket is unavailable")
-                rules.append(
-                    "(allow network-outbound (remote unix-socket "
-                    f"(literal {json.dumps(str(socket_path))})))"
-                )
         if not read_only:
             for path in trusted_git_metadata(root):
                 rules.append(f"(allow file-write* (subpath {json.dumps(str(path))}))")
@@ -214,5 +424,40 @@ def isolated_command(
         )
         for path in sorted(git_metadata(root)):
             rules.append(f"(deny file-write* (subpath {json.dumps(str(path))}))")
+    executable_files = set(access_profile.executable_paths)
+    executable_files.update(git_helpers)
+    if command and Path(command[0]).is_absolute():
+        executable_files.add(Path(command[0]))
+    for path in sorted(
+        (Path(item).resolve(strict=True) for item in executable_files), key=str
+    ):
+        rules.append(f"(allow file-map-executable (literal {json.dumps(str(path))}))")
+    if access_profile.executable_paths:
+        rules.append("(deny process-exec)")
+        allowed_executables = {
+            Path(command[0]).resolve(strict=True),
+            *(
+                Path(item).resolve(strict=True)
+                for item in access_profile.executable_paths
+            ),
+        }
+        for executable_path in sorted(allowed_executables, key=str):
+            rules.append(
+                f"(allow process-exec (literal {json.dumps(str(executable_path))}))"
+            )
+    socket_paths = (*unix_sockets, *access_profile.unix_sockets)
+    if socket_paths:
+        rules.append("(allow system-socket (socket-domain AF_UNIX))")
+        for socket_path in socket_paths:
+            try:
+                socket_path = Path(socket_path).resolve(strict=True)
+            except OSError as error:
+                raise PermissionError("allowed Unix socket is unavailable") from error
+            if not socket_path.is_socket():
+                raise PermissionError("allowed Unix socket is unavailable")
+            rules.append(
+                "(allow network-outbound (remote unix-socket "
+                f"(literal {json.dumps(str(socket_path))})))"
+            )
     profile = "\n".join(rules)
     return ["/usr/bin/sandbox-exec", "-p", profile, *command]

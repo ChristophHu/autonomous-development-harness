@@ -1,7 +1,44 @@
+from datetime import UTC, datetime
+
 import pytest
 from test_evidence_workflow import ready_runtime
 
 from harness.providers import ProviderHealth
+
+
+def test_verification_evidence_service_audits_each_required_kind_independently(
+    tmp_path,
+):
+    store, _orchestrator, _task = ready_runtime(tmp_path)
+    from harness.services import VerificationEvidenceService
+
+    service = VerificationEvidenceService(store.database)
+    observed_at = datetime.now(UTC)
+    service.record(
+        {
+            "kind": "ci",
+            "source_id": "ci:service-boundary",
+            "observed_at": observed_at,
+            "subject_sha256": "a" * 64,
+            "passed": True,
+            "checks": {"tests": True},
+        }
+    )
+    service.record(
+        {
+            "kind": "provider",
+            "source_id": "provider:service-boundary",
+            "observed_at": observed_at,
+            "subject_sha256": "b" * 64,
+            "passed": True,
+            "checks": {"health": True},
+        }
+    )
+
+    assert service.audit_kind("ci", subject_sha256="a" * 64)["healthy"] is True
+    provider_audit = service.audit_kind("provider", subject_sha256="a" * 64)
+    assert provider_audit["healthy"] is False
+    assert provider_audit["items"][0]["reason"] == "subject_mismatch"
 
 
 def test_task_service_shares_status_queries_and_sanitized_task_inspection(tmp_path):

@@ -18,7 +18,7 @@ from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError, ValidationError
 
 from .http_control import request as http_request
-from .isolation import isolated_command
+from .isolation import ProcessAccessProfile, isolated_command
 from .process_control import _terminate, current_run_control
 
 PROTOCOL_VERSION = "2025-11-25"
@@ -31,7 +31,9 @@ class MCPError(RuntimeError):
 
 
 class MCPClient:
-    def __init__(self, command, workspace, *, timeout=10, read_roots=None):
+    def __init__(
+        self, command, workspace, *, timeout=10, read_roots=None, executable_paths=()
+    ):
         self.workspace = Path(workspace).resolve(strict=True)
         if (
             not isinstance(command, list)
@@ -52,13 +54,19 @@ class MCPClient:
         self.command = command
         self.timeout = timeout
         self.read_roots = read_roots
+        self.executable_paths = tuple(Path(path) for path in executable_paths)
 
     def _exchange(self, method, params):
         control = current_run_control()
         if control is not None:
             control.check()
         command = isolated_command(
-            self.command, self.workspace, read_roots=self.read_roots
+            self.command,
+            self.workspace,
+            access_profile=ProcessAccessProfile.mcp_stdio(
+                read_roots=self.read_roots or (),
+                executable_paths=self.executable_paths,
+            ),
         )
         env = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}
         if "TMPDIR" in os.environ:
@@ -446,3 +454,7 @@ def builtin_filesystem_command(workspace, *, read_only=True, allow_delete=False)
 
 def builtin_obsidian_command(vault):
     return [sys.executable, "-m", "harness.mcp_servers.obsidian", str(vault)]
+
+
+def builtin_apple_shell_command(workspace):
+    return [sys.executable, "-m", "harness.mcp_servers.apple_shell", str(workspace)]

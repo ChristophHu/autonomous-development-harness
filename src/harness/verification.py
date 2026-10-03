@@ -65,6 +65,16 @@ def _matrix_status_counts(content):
 
 def _refresh_matrix(path, report_line):
     content = path.read_text(encoding="utf-8")
+    # Older matrix revisions repeated status totals in an unmanaged paragraph.
+    # Keep explanatory text, but make the managed block the only source of totals.
+    content = re.sub(
+        r"^Erfüllt:\s*\d+/\d+\s*\([^)]+\)\.\s*Teilweise:\s*\d+/\d+\.\s*"
+        r"Offen:\s*\d+/\d+\.\s*",
+        "Aktuelle GAP-Zahlen stehen ausschließlich im automatisch gepflegten "
+        "Verifikationsblock oben. ",
+        content,
+        flags=re.MULTILINE,
+    )
     block = f"{_MATRIX_REPORT_START}\n{report_line}\n{_MATRIX_REPORT_END}"
     markers_present = _MATRIX_REPORT_START in content or _MATRIX_REPORT_END in content
     if markers_present:

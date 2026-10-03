@@ -12,6 +12,7 @@ from harness.core import Config, Orchestrator, Store, Task
 def client(tmp_path, monkeypatch):
     config = Config()
     config.data["paths"]["database"] = str(tmp_path / "api.db")
+    config.data["paths"]["obsidian_vault"] = str(tmp_path / "vault")
     config.data["profiles"] = {
         k: {"model": {"primary": "local"}}
         for k in ["planner", "software-architect", "coding", "validator"]
@@ -479,6 +480,36 @@ def test_delete_running_and_questions_block_resume(client):
             f"/tasks/{item.id}/answers", json={"question_id": q2, "answer": "yes"}
         ).json()["status"]
         == "waiting_human"
+    )
+
+
+def test_decision_question_purpose_is_exposed_and_persisted(client):
+    http, store, _ = client
+    item = store.create(Task(title="decision state"))
+    response = http.post(
+        f"/tasks/{item.id}/questions",
+        json={
+            "question": "Choose a migration strategy?",
+            "reason": "Compatibility choice",
+            "options": ["preserve", "reset"],
+            "purpose": "decision",
+        },
+    )
+
+    assert response.status_code == 200
+    listed = http.get(f"/tasks/{item.id}/questions").json()
+    assert listed[0]["purpose"] == "decision"
+    assert store.get(item.id).status == "waiting_decision"
+    assert (
+        http.post(
+            f"/tasks/{item.id}/questions",
+            json={
+                "question": "Approve?",
+                "reason": "bad purpose",
+                "purpose": "approval",
+            },
+        ).status_code
+        == 422
     )
 
 

@@ -1,5 +1,6 @@
 """Prevent silent row-update failures and inconsistent progress counts."""
 
+import re
 from pathlib import Path
 
 
@@ -13,13 +14,17 @@ def test_matrix_has_all_requirements_and_consistent_counts():
     assert [int(row[1]) for row in rows] == list(range(1, 110))
     statuses = [row[3].strip() for row in rows]
     assert set(statuses) <= {"Erfüllt", "Teilweise", "Offen"}
-    for status in ("Erfüllt", "Teilweise", "Offen"):
-        assert f"{status}: {statuses.count(status)}/109" in text
+    assert (
+        f"GAP-Zählung aus Matrixzeilen: {statuses.count('Erfüllt')} erfüllt, "
+        f"{statuses.count('Teilweise')} teilweise, {statuses.count('Offen')} offen."
+    ) in text
+    assert not re.search(r"Erfüllt:\s*\d+/109", text)
     by_id = {int(row[1]): row for row in rows}
     for number in (
         6,
         12,
         14,
+        15,
         16,
         52,
         53,

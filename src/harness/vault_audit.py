@@ -205,6 +205,84 @@ def _source_findings(text, note_path, source_root):
     return findings
 
 
+def _decision_projection_findings(root, decision_rows):
+    from .memory_projection import DecisionProjection
+
+    projection = DecisionProjection(root)
+    findings = []
+    try:
+        registered = set(projection._read_manifest())
+        expected = {
+            f"decisions/{row['id']}.md": projection._render(row)
+            for row in decision_rows
+        }
+        for name in sorted(set(expected) - registered):
+            findings.append(
+                _finding(
+                    "decision_projection_missing",
+                    f"_harness/{name}",
+                    "SQLite decision is not registered in the projection manifest",
+                )
+            )
+        for name in sorted(registered):
+            path = projection._inside_vault(projection.root / name)
+            if name not in expected:
+                if not path.exists():
+                    findings.append(
+                        _finding(
+                            "decision_projection_stale",
+                            f"_harness/{name}",
+                            "Manifest entry has no authoritative SQLite decision",
+                        )
+                    )
+                    continue
+                content = path.read_text(encoding="utf-8")
+                if not DecisionProjection._is_owned(content):
+                    findings.append(
+                        _finding(
+                            "decision_projection_unowned",
+                            f"_harness/{name}",
+                            "Stale manifest entry points to a note without the Harness marker",
+                        )
+                    )
+                    continue
+                findings.append(
+                    _finding(
+                        "decision_projection_stale",
+                        f"_harness/{name}",
+                        "Projection has no authoritative SQLite decision",
+                    )
+                )
+                continue
+            if not path.is_file():
+                findings.append(
+                    _finding(
+                        "decision_projection_missing",
+                        f"_harness/{name}",
+                        "SQLite decision projection file is missing",
+                    )
+                )
+                continue
+            content = path.read_text(encoding="utf-8")
+            if not DecisionProjection._is_owned(content) or content != expected[name]:
+                findings.append(
+                    _finding(
+                        "decision_projection_conflict",
+                        f"_harness/{name}",
+                        "Projection differs from authoritative SQLite decision or is not Harness-owned",
+                    )
+                )
+    except (OSError, UnicodeError, ValueError, PermissionError):
+        findings.append(
+            _finding(
+                "decision_projection_unreadable",
+                "_harness",
+                "Decision projection cannot be safely audited",
+            )
+        )
+    return findings
+
+
 def audit_vault(
     vault: str | Path,
     *,
@@ -346,53 +424,7 @@ def audit_vault(
             )
 
     if decision_rows is not None:
-        from .memory_projection import DecisionProjection
-
-        projection = DecisionProjection(root)
-        try:
-            projected = projection._read_manifest()
-            expected = {
-                f"decisions/{row['id']}.md": projection._render(row)
-                for row in decision_rows
-            }
-            actual = set(projected)
-            for name in sorted(set(expected) - actual):
-                findings.append(
-                    _finding(
-                        "decision_projection_missing",
-                        f"_harness/{name}",
-                        "SQLite decision is not projected",
-                    )
-                )
-            for name in sorted(actual - set(expected)):
-                findings.append(
-                    _finding(
-                        "decision_projection_stale",
-                        f"_harness/{name}",
-                        "Projection has no authoritative SQLite decision",
-                    )
-                )
-            for name in sorted(actual & set(expected)):
-                path = projection._inside_vault(projection.root / name)
-                if (
-                    not path.is_file()
-                    or path.read_text(encoding="utf-8") != expected[name]
-                ):
-                    findings.append(
-                        _finding(
-                            "decision_projection_conflict",
-                            f"_harness/{name}",
-                            "Projection differs from authoritative SQLite decision",
-                        )
-                    )
-        except (OSError, UnicodeError, ValueError, PermissionError):
-            findings.append(
-                _finding(
-                    "decision_projection_unreadable",
-                    "_harness",
-                    "Decision projection cannot be safely audited",
-                )
-            )
+        findings.extend(_decision_projection_findings(root, decision_rows))
 
     findings.sort(key=lambda item: (item["path"], item["code"], item["message"]))
     return {

@@ -14,6 +14,7 @@ memory:
   obsidian: {enabled: true}
   qdrant: {enabled: true, url: http://127.0.0.1:6333, collection: harness-memory, timeout: {total: 5, connect: 2, read: 5}}
   embeddings: {provider: lmstudio, base_url: http://127.0.0.1:1234/v1, model: text-embedding-qwen3-embedding-0.6b, dimensions: 1024, batch_size: 32, timeout: {total: 30, connect: 5, read: 30}}
+  monitoring: {enabled: true, interval_seconds: 60, evidence_max_age_hours: 168}
 models:
   defaults: {provider: lmstudio}
   providers:
@@ -24,18 +25,18 @@ profiles:
   planner:
     model: {primary: lmstudio, fallback: [openai]}
     instructions: Produce grounded, executable dependency plans; never invent completion evidence.
-    tools: [mcp.vault.read_note, mcp.vault.list_notes, mcp.vault.search_notes]
+    tools: [mcp.vault.read_note, mcp.vault.list_notes, mcp.vault.search_notes, mcp.vault.knowledge_note, mcp.vault.backlinks, mcp.vault.knowledge_search]
     permissions: [obsidian]
   coding:
     model: {primary: lmstudio, fallback: [openai]}
     instructions: Implement the assigned step using workspace tools and report actual observations.
-    tools: [filesystem.read, filesystem.search, filesystem.write, filesystem.create, search.text, search.symbols, search.files, test.run_tests, test.run_file, test.run_coverage, quality.lint, quality.format, quality.typecheck, shell.execute, mcp.vault.read_note, mcp.vault.list_notes, mcp.vault.search_notes]
+    tools: [filesystem.read, filesystem.search, filesystem.write, filesystem.create, search.text, search.symbols, search.files, test.run_tests, test.run_file, test.run_coverage, quality.lint, quality.format, quality.typecheck, shell.execute, mcp.vault.read_note, mcp.vault.list_notes, mcp.vault.search_notes, mcp.vault.knowledge_note, mcp.vault.backlinks, mcp.vault.knowledge_search]
     permissions: [filesystem, shell, obsidian]
     max_steps: 20
   validator:
     model: {primary: lmstudio, fallback: [openai]}
     instructions: Independently inspect observed artifacts, tests and requirements; fail closed on missing evidence.
-    tools: [mcp.vault.read_note, mcp.vault.list_notes, mcp.vault.search_notes]
+    tools: [mcp.vault.read_note, mcp.vault.list_notes, mcp.vault.search_notes, mcp.vault.knowledge_note, mcp.vault.backlinks, mcp.vault.knowledge_search]
     permissions: [obsidian]
 api: {host: 127.0.0.1, port: 8080, swagger: true}
 logging: {level: INFO, file: ./logs/harness.log}

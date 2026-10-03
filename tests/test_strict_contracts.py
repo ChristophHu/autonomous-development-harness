@@ -183,7 +183,43 @@ def test_duplicate_ids_and_terminal_transitions():
     assert not may_transition("completed", "failed")
     assert not TaskLifecycle.can_start("failed", True)
     assert TaskLifecycle.can_start("waiting_human")
+    assert TaskLifecycle.can_start("waiting_decision")
+    assert TaskLifecycle.can_start("waiting_approval")
     assert not TaskLifecycle.can_start("executing")
+    assert may_transition("executing", "waiting_decision")
+    assert may_transition("executing", "waiting_approval")
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "analyzing",
+        "planning",
+        "ready",
+        "executing",
+        "testing",
+        "validating",
+        "correcting",
+        "waiting_human",
+        "waiting_decision",
+        "waiting_approval",
+        "failed",
+        "blocked",
+    ],
+)
+def test_nonterminal_interrupted_task_can_enter_recovering(source):
+    assert may_transition(source, "recovering")
+
+
+@pytest.mark.parametrize("source", ["pending", "completed", "cancelled"])
+def test_recovery_entry_rejects_unstarted_or_terminal_task(source):
+    assert not may_transition(source, "recovering")
+
+
+def test_recovering_task_resumes_only_through_analysis():
+    assert may_transition("recovering", "analyzing")
+    assert not may_transition("recovering", "executing")
+    assert TaskLifecycle.can_start("recovering")
 
 
 def test_plan_cycles_duplicates_and_order():
@@ -796,7 +832,7 @@ def test_validator_rejects_bad_fresh_coverage_file(tmp_path):
     task = specification()
     task.coverage_command = ["coverage"]
 
-    def write_invalid_coverage(command, cwd=None):
+    def write_invalid_coverage(command, cwd=None, **_kwargs):
         (tmp_path / task.coverage_report).write_text("{")
         return subprocess.CompletedProcess(command, 0, "", "")
 
@@ -902,7 +938,7 @@ def test_validator_shell_commands_use_audited_test_tools(tmp_path):
     task.test_commands = [["/usr/bin/true"]]
     task.lint_commands = [["/usr/bin/true"]]
     task.coverage_command = []
-    orchestrator.tools.executor.shell = lambda command, cwd=None: (
+    orchestrator.tools.executor.shell = lambda command, cwd=None, **_kwargs: (
         subprocess.CompletedProcess(command, 0, "ok", "")
     )
 

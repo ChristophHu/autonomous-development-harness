@@ -1,5 +1,6 @@
 import json
 import multiprocessing
+import os
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -32,13 +33,170 @@ def _initialize_database_process(path, barrier, queue):
     queue.put("ok")
 
 
+def _claim_task_process(path, task_id, owner, barrier, queue):
+    db = Database(Path(path))
+    barrier.wait(timeout=10)
+    queue.put(TaskRepository(db).claim(task_id, owner))
+
+
+def _crash_during_task_update(path, task_id):
+    connection = sqlite3.connect(path, timeout=5)
+    connection.execute("BEGIN IMMEDIATE")
+    connection.execute("UPDATE tasks SET title=? WHERE id=?", ("uncommitted", task_id))
+    os._exit(73)
+
+
+def _downgrade_schema(connection, target_version):
+    """Build a historical fixture by reversing the checked-in migrations."""
+    reverse_steps = {
+        15: ("ALTER TABLE model_runs DROP COLUMN error_category",),
+        14: ("ALTER TABLE questions DROP COLUMN purpose",),
+        13: ("ALTER TABLE memory_health_snapshots DROP COLUMN source_sha256",),
+        12: (
+            "DROP TRIGGER memory_ops_evidence_no_update",
+            "DROP TRIGGER memory_ops_evidence_no_delete",
+            "DROP INDEX memory_ops_evidence_latest",
+            "DROP TABLE memory_ops_evidence",
+        ),
+        11: (
+            "DROP INDEX memory_health_latest",
+            "DROP TABLE memory_health_snapshots",
+        ),
+        10: (
+            "DROP INDEX model_discovery_latest",
+            "DROP TABLE model_discovery_snapshots",
+            "DROP TABLE qdrant_probe_snapshots",
+        ),
+        9: (
+            "DROP TRIGGER verification_evidence_no_update",
+            "DROP TRIGGER verification_evidence_no_delete",
+            "DROP INDEX verification_evidence_kind_time",
+            "DROP TABLE verification_evidence",
+        ),
+        8: (
+            "DROP INDEX decisions_supersedes",
+            "ALTER TABLE decisions DROP COLUMN supersedes_id",
+        ),
+        7: ("DROP INDEX artifacts_task_key", "DROP TABLE artifacts"),
+        6: (
+            "ALTER TABLE decisions DROP COLUMN tags",
+            "ALTER TABLE decisions DROP COLUMN outcome",
+            "ALTER TABLE decisions DROP COLUMN alternatives",
+        ),
+        5: ("DROP INDEX correction_items_task_status", "DROP TABLE correction_items"),
+        4: (
+            "ALTER TABLE decisions DROP COLUMN question_id",
+            "ALTER TABLE decisions DROP COLUMN field_names",
+            "ALTER TABLE decisions DROP COLUMN evidence",
+            "ALTER TABLE decisions DROP COLUMN source",
+            "ALTER TABLE decisions DROP COLUMN category",
+        ),
+        3: (
+            "DROP INDEX tool_calls_identity",
+            "ALTER TABLE tool_calls DROP COLUMN risk",
+            "ALTER TABLE tool_calls DROP COLUMN profile",
+            "ALTER TABLE tool_calls DROP COLUMN agent_run_id",
+            "ALTER TABLE tool_calls DROP COLUMN call_id",
+            "ALTER TABLE model_runs DROP COLUMN error_type",
+            "ALTER TABLE model_runs DROP COLUMN fallback_index",
+            "ALTER TABLE model_runs DROP COLUMN reasoning_tokens",
+            "ALTER TABLE model_runs DROP COLUMN cached_tokens",
+            "ALTER TABLE model_runs DROP COLUMN latency_ms",
+            "ALTER TABLE model_runs DROP COLUMN finished_at",
+            "ALTER TABLE model_runs DROP COLUMN started_at",
+            "ALTER TABLE model_runs DROP COLUMN complexity",
+            "ALTER TABLE model_runs DROP COLUMN status",
+            "ALTER TABLE model_runs DROP COLUMN profile",
+            "ALTER TABLE model_runs DROP COLUMN agent",
+            "ALTER TABLE model_runs DROP COLUMN task_id",
+        ),
+        2: (
+            "DROP TABLE task_leases",
+            "ALTER TABLE subtasks DROP COLUMN plan_id",
+            "ALTER TABLE tasks DROP COLUMN metadata",
+        ),
+    }
+    for version in range(Database.CURRENT_SCHEMA_VERSION, target_version, -1):
+        for statement in reverse_steps[version]:
+            connection.execute(statement)
+    connection.execute(
+        "DELETE FROM schema_versions WHERE version > ?", (target_version,)
+    )
+
+
+def _seed_latest_schema(connection):
+    connection.execute(
+        "INSERT INTO tasks(id,title,description,status,result,created_at,updated_at,metadata) "
+        "VALUES(1,'preserved task','description','pending','result','t0','t0','{\"k\":\"v\"}')"
+    )
+    connection.execute(
+        "INSERT INTO plans(id,task_id,summary,payload,created_at) VALUES(1,1,'plan','{}','t1')"
+    )
+    connection.execute(
+        "INSERT INTO questions(id,task_id,question,reason,created_at,purpose) "
+        "VALUES(1,1,'preserved question','migration fixture','t2','approval')"
+    )
+    connection.execute(
+        "INSERT INTO decisions(id,task_id,decision,rationale,created_at,category,source,evidence,field_names,question_id,alternatives,outcome,tags) "
+        "VALUES(1,1,'preserved decision','rationale','t3','architecture','human','[]','[]',1,'[]','accepted','[]')"
+    )
+    connection.execute(
+        "INSERT INTO subtasks(id,task_id,external_id,title,description,profile,status,plan_id) "
+        "VALUES(1,1,'step-1','subtask','description','coding','completed',1)"
+    )
+    connection.execute(
+        "INSERT INTO events(id,task_id,kind,payload,created_at) VALUES(1,1,'task.created','{}','t4')"
+    )
+    connection.execute(
+        "INSERT INTO tool_calls(id,task_id,tool,status,input,started_at,call_id,profile,risk) "
+        "VALUES(1,1,'shell','completed','{}','t5','call-1','coding','LOW')"
+    )
+    connection.execute(
+        "INSERT INTO model_runs(id,provider,model,created_at,task_id,agent,profile,complexity,status) "
+        "VALUES(1,'local','model','t6',1,'planner','planner','normal','completed')"
+    )
+    connection.execute(
+        "INSERT INTO correction_items(id,task_id,category,source,rule,message,affected_paths,evidence,expected,created_at,updated_at) "
+        "VALUES(?,1,'test','validator','rule','message','[]','[]','pass','t7','t7')",
+        ("a" * 64,),
+    )
+    connection.execute(
+        "INSERT INTO artifacts(task_id,artifact_key,version,content,sha256,created_at) "
+        "VALUES(1,'agent/step-1',1,'output',?,'t8')",
+        ("b" * 64,),
+    )
+    connection.execute(
+        "INSERT INTO verification_evidence(kind,source_id,observed_at,subject_sha256,passed,checks_json,digest) "
+        "VALUES('ci','ci:fixture','t9',?,1,'{\"tests\":true}',?)",
+        ("c" * 64, "d" * 64),
+    )
+    connection.execute(
+        "INSERT INTO model_discovery_snapshots(provider,observed_at,status,discovery_failed,models_json) "
+        "VALUES('local','t10','available',0,'[]')"
+    )
+    connection.execute(
+        "INSERT INTO qdrant_probe_snapshots(observed_at,healthy,status,latency_ms,collection_exists) "
+        "VALUES('t11',1,'healthy',1.0,1)"
+    )
+    connection.execute(
+        "INSERT INTO memory_health_snapshots(observed_at,healthy,checks_json,source_sha256) "
+        "VALUES('t12',1,'{}',?)",
+        ("e" * 64,),
+    )
+    connection.execute(
+        "INSERT INTO memory_ops_evidence(observed_at,subject_sha256,passed,checks_json,digest) "
+        "VALUES('t13',?,1,'{}',?)",
+        ("f" * 64, "1" * 64),
+    )
+
+
 def test_failed_artifact_migration_does_not_record_version(tmp_path):
     path = tmp_path / "migration.sqlite"
     Database(path)
     with closing(sqlite3.connect(path)) as connection, connection:
         connection.execute("DROP INDEX artifacts_task_key")
         connection.execute("DROP TABLE artifacts")
-        connection.execute("DELETE FROM schema_versions WHERE version=7")
+        connection.execute("DELETE FROM schema_versions WHERE version>=7")
         connection.execute(
             "CREATE TABLE artifacts(id INTEGER PRIMARY KEY, task_id INTEGER)"
         )
@@ -58,6 +216,188 @@ def test_failed_artifact_migration_does_not_record_version(tmp_path):
                 "SELECT 1 FROM sqlite_master WHERE type='index' AND name='artifacts_task_key'"
             ).fetchone()
             is None
+        )
+
+
+def test_database_rejects_future_schema_version_without_mutating_it(tmp_path):
+    path = tmp_path / "future-schema.sqlite"
+    Database(path)
+    with closing(sqlite3.connect(path)) as connection, connection:
+        connection.execute(
+            "INSERT INTO schema_versions(version, applied_at) VALUES(16, 'future')"
+        )
+
+    with pytest.raises(RuntimeError, match="newer than this Harness"):
+        Database(path)
+
+    with closing(sqlite3.connect(path)) as connection:
+        assert connection.execute("PRAGMA table_info(questions)").fetchall()
+        assert (
+            connection.execute(
+                "SELECT version FROM schema_versions ORDER BY version DESC LIMIT 1"
+            ).fetchone()[0]
+            == 16
+        )
+
+
+def test_database_rejects_gapped_migration_history_without_mutating_it(tmp_path):
+    path = tmp_path / "gapped-schema.sqlite"
+    Database(path)
+    with closing(sqlite3.connect(path)) as connection, connection:
+        connection.execute("DELETE FROM schema_versions WHERE version=7")
+
+    with pytest.raises(RuntimeError, match="migration history is incomplete"):
+        Database(path)
+
+    with closing(sqlite3.connect(path)) as connection:
+        assert (
+            connection.execute(
+                "SELECT 1 FROM schema_versions WHERE version=7"
+            ).fetchone()
+            is None
+        )
+
+
+def test_version_13_database_migrates_without_losing_question_data(tmp_path):
+    path = tmp_path / "schema-13.sqlite"
+    Database(path)
+    with closing(sqlite3.connect(path)) as connection, connection:
+        connection.execute(
+            "INSERT INTO tasks(title,status,created_at,updated_at) VALUES('legacy','pending','t0','t0')"
+        )
+        task_id = connection.execute("SELECT id FROM tasks").fetchone()[0]
+        connection.execute(
+            "INSERT INTO questions(task_id,question,reason,created_at) VALUES(?,?,?,?)",
+            (task_id, "Keep this question", "migration", "t1"),
+        )
+        connection.execute("ALTER TABLE questions DROP COLUMN purpose")
+        connection.execute("ALTER TABLE model_runs DROP COLUMN error_category")
+        connection.execute("DELETE FROM schema_versions WHERE version=15")
+        connection.execute("DELETE FROM schema_versions WHERE version=14")
+
+    Database(path)
+    with closing(sqlite3.connect(path)) as connection:
+        row = connection.execute(
+            "SELECT question, reason, status, purpose FROM questions"
+        ).fetchone()
+        assert row == ("Keep this question", "migration", "open", "input")
+        assert (
+            connection.execute(
+                "SELECT version FROM schema_versions ORDER BY version DESC LIMIT 1"
+            ).fetchone()[0]
+            == 15
+        )
+    Database(path)
+
+
+def test_version_14_migration_preserves_model_error_and_adds_category(tmp_path):
+    path = tmp_path / "schema-14-model-errors.sqlite"
+    database = Database(path)
+    with database.connect() as connection:
+        connection.execute(
+            "INSERT INTO model_runs(provider,model,created_at,error_type) VALUES(?,?,?,?)",
+            ("local", "fixture", "t0", "RuntimeError"),
+        )
+        connection.execute("ALTER TABLE model_runs DROP COLUMN error_category")
+        connection.execute("DELETE FROM schema_versions WHERE version=15")
+
+    Database(path)
+
+    with database.connect() as connection:
+        row = connection.execute(
+            "SELECT error_type,error_category FROM model_runs"
+        ).fetchone()
+        assert tuple(row) == ("RuntimeError", None)
+        assert (
+            connection.execute(
+                "SELECT version FROM schema_versions ORDER BY version DESC LIMIT 1"
+            ).fetchone()[0]
+            == Database.CURRENT_SCHEMA_VERSION
+        )
+
+
+@pytest.mark.parametrize(
+    "starting_version", range(1, Database.CURRENT_SCHEMA_VERSION + 1)
+)
+def test_every_supported_historical_schema_migrates_without_data_loss(
+    tmp_path, starting_version
+):
+    path = tmp_path / f"schema-{starting_version}.sqlite"
+    Database(path)
+    with Database(path).connect() as connection:
+        _seed_latest_schema(connection)
+    with closing(sqlite3.connect(path)) as connection, connection:
+        _downgrade_schema(connection, starting_version)
+
+    db = Database(path)
+    Database(path)  # Reopening a migrated fixture must be idempotent.
+
+    with db.connect() as connection:
+        versions = [
+            row[0]
+            for row in connection.execute(
+                "SELECT version FROM schema_versions ORDER BY version"
+            )
+        ]
+        assert versions == list(range(1, Database.CURRENT_SCHEMA_VERSION + 1))
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert tuple(
+            connection.execute(
+                "SELECT title,result,metadata FROM tasks WHERE id=1"
+            ).fetchone()
+        ) == (
+            "preserved task",
+            "result",
+            '{"k":"v"}' if starting_version >= 2 else "{}",
+        )
+        assert tuple(
+            connection.execute(
+                "SELECT question,answer,purpose FROM questions WHERE id=1"
+            ).fetchone()
+        ) == (
+            "preserved question",
+            None,
+            "approval" if starting_version >= 14 else "input",
+        )
+        decision = connection.execute(
+            "SELECT decision,category,source,alternatives,outcome,tags FROM decisions WHERE id=1"
+        ).fetchone()
+        assert tuple(decision) == (
+            "preserved decision",
+            "architecture" if starting_version >= 4 else "legacy",
+            "human" if starting_version >= 4 else "legacy",
+            "[]",
+            "accepted" if starting_version >= 6 else None,
+            "[]",
+        )
+        assert (
+            connection.execute("SELECT kind FROM events WHERE id=1").fetchone()[0]
+            == "task.created"
+        )
+        assert connection.execute("SELECT plan_id FROM subtasks WHERE id=1").fetchone()[
+            0
+        ] == (1 if starting_version >= 2 else None)
+        assert connection.execute(
+            "SELECT call_id FROM tool_calls WHERE id=1"
+        ).fetchone()[0] == ("call-1" if starting_version >= 3 else None)
+        feature_tables = {
+            "correction_items": 5,
+            "artifacts": 7,
+            "verification_evidence": 9,
+            "model_discovery_snapshots": 10,
+            "qdrant_probe_snapshots": 10,
+            "memory_health_snapshots": 11,
+            "memory_ops_evidence": 12,
+        }
+        for table, introduced_version in feature_tables.items():
+            count = connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+            assert count == (1 if starting_version >= introduced_version else 0)
+        source_hash_row = connection.execute(
+            "SELECT source_sha256 FROM memory_health_snapshots WHERE id=1"
+        ).fetchone()
+        assert (source_hash_row[0] if source_hash_row else None) == (
+            "e" * 64 if starting_version >= 13 else None
         )
 
 
@@ -81,7 +421,57 @@ def test_simultaneous_process_database_initialization_is_serialized(tmp_path):
     assert sorted(queue.get(timeout=2) for _ in processes) == ["ok", "ok"]
     with closing(sqlite3.connect(path)) as connection:
         versions = connection.execute("SELECT version FROM schema_versions").fetchall()
-    assert [row[0] for row in versions] == list(range(1, 11))
+        assert [row[0] for row in versions] == list(range(1, 16))
+
+
+def test_independent_processes_cannot_claim_the_same_task(tmp_path):
+    path = tmp_path / "multiprocess-lease.sqlite"
+    db = Database(path)
+    task_id = TaskRepository(db).create("single owner")
+    context = multiprocessing.get_context("spawn")
+    barrier = context.Barrier(3)
+    queue = context.Queue()
+    processes = [
+        context.Process(
+            target=_claim_task_process,
+            args=(str(path), task_id, f"owner-{index}", barrier, queue),
+        )
+        for index in range(2)
+    ]
+
+    for process in processes:
+        process.start()
+    barrier.wait(timeout=10)
+    results = [queue.get(timeout=10) for _ in processes]
+    for process in processes:
+        process.join(timeout=10)
+
+    assert [process.exitcode for process in processes] == [0, 0]
+    assert sorted(results) == [False, True]
+    with db.connect() as connection:
+        lease = connection.execute(
+            "SELECT owner FROM task_leases WHERE task_id=?", (task_id,)
+        ).fetchone()
+    assert lease["owner"] in {"owner-0", "owner-1"}
+
+
+def test_sqlite_recovers_atomically_after_process_crashes_mid_transaction(tmp_path):
+    path = tmp_path / "crash-atomicity.sqlite"
+    db = Database(path)
+    tasks = TaskRepository(db)
+    task_id = tasks.create("committed title")
+    context = multiprocessing.get_context("spawn")
+    process = context.Process(
+        target=_crash_during_task_update, args=(str(path), task_id)
+    )
+
+    process.start()
+    process.join(timeout=10)
+
+    assert process.exitcode == 73
+    assert tasks.get(task_id)["title"] == "committed title"
+    with db.connect() as connection:
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
 
 
 def test_legacy_migration(tmp_path):
@@ -113,7 +503,7 @@ def test_legacy_migration(tmp_path):
             for row in connection.execute(
                 "SELECT version FROM schema_versions ORDER BY version"
             )
-        ] == list(range(1, 11))
+        ] == list(range(1, 16))
     legacy_decision = DecisionRepository(db).get(3)
     assert legacy_decision["decision"] == "old decision"
     assert legacy_decision["category"] == legacy_decision["source"] == "legacy"
@@ -154,6 +544,27 @@ def test_database_rollback_and_repository_lifecycle(tmp_path):
     )
     usage = ModelUsage("local", "m", 2, 3, 0.1)
     assert ModelRunRepository(db).record(usage, run_id)
+
+
+def test_recovery_state_transition_is_persisted_and_audited(tmp_path):
+    db = Database(tmp_path / "recovery-state.sqlite")
+    tasks = TaskRepository(db)
+    task_id = tasks.create("recovery state")
+
+    for status in ("analyzing", "planning", "ready", "executing", "recovering"):
+        tasks.transition(task_id, status)
+
+    assert tasks.get(task_id)["status"] == "recovering"
+    statuses = [
+        json.loads(event["payload"])["status"]
+        for event in EventRepository(db).list(task_id, EventKind.TASK_STATUS)
+    ]
+    assert statuses[-1] == "recovering"
+    tasks.transition(task_id, "analyzing")
+    assert tasks.get(task_id)["status"] == "analyzing"
+
+    with pytest.raises(ValueError, match="invalid task transition"):
+        tasks.transition(task_id, "executing")
 
 
 def test_database_busy_timeout_serializes_concurrent_writers(tmp_path):
@@ -649,9 +1060,11 @@ def test_question_ask_is_idempotent_and_atomically_records_state_and_event(tmp_p
         rows = connection.execute(
             "SELECT kind,payload FROM events WHERE task_id=?", (task_id,)
         ).fetchall()
-    assert len(rows) == 1
-    assert rows[0]["kind"] == EventKind.QUESTION_ASKED.value
-    assert json.loads(rows[0]["payload"]) == {
+    assert [row["kind"] for row in rows] == [
+        EventKind.TASK_STATUS.value,
+        EventKind.QUESTION_ASKED.value,
+    ]
+    assert json.loads(rows[1]["payload"]) == {
         "question_id": question_id,
         "question": "Need input",
         "required": True,
@@ -684,7 +1097,7 @@ def test_concurrent_duplicate_question_asks_create_one_question_and_event(tmp_pa
             connection.execute(
                 "SELECT count(*) FROM events WHERE task_id=?", (task_id,)
             ).fetchone()[0]
-            == 1
+            == 2
         )
 
 
@@ -728,3 +1141,55 @@ def test_question_ask_rejects_missing_or_terminal_task_and_supports_optional(tmp
             "SELECT payload FROM events WHERE task_id=?", (task_id,)
         ).fetchone()
     assert json.loads(event["payload"]) == {"question_id": question_id}
+
+
+@pytest.mark.parametrize(
+    "purpose,status",
+    [
+        ("input", "waiting_human"),
+        ("decision", "waiting_decision"),
+        ("approval", "waiting_approval"),
+    ],
+)
+def test_question_purpose_persists_a_distinct_task_lifecycle_state(
+    tmp_path, purpose, status
+):
+    db = Database(tmp_path / f"question-{purpose}.sqlite")
+    tasks = TaskRepository(db)
+    questions = QuestionRepository(db)
+    task_id = tasks.create("typed question")
+
+    question_id = questions.ask(task_id, "Continue?", "needs input", purpose=purpose)
+
+    assert tasks.get(task_id)["status"] == status
+    assert questions.get(question_id)["purpose"] == purpose
+    assert not questions.answer(question_id, "yes", task_id + 1)
+    assert questions.answer(question_id, "yes", task_id)
+    assert questions.get(question_id)["status"] == "answered"
+
+
+def test_question_purpose_rejects_unknown_value_without_persisting(tmp_path):
+    db = Database(tmp_path / "question-purpose-invalid.sqlite")
+    tasks = TaskRepository(db)
+    questions = QuestionRepository(db)
+    task_id = tasks.create("invalid purpose")
+
+    with pytest.raises(ValueError, match="purpose"):
+        questions.ask(task_id, "Continue?", "reason", purpose="unknown")
+    assert tasks.get(task_id)["status"] == "pending"
+    assert questions.list(task_id) == []
+
+
+def test_answering_one_of_multiple_purposes_keeps_remaining_state(tmp_path):
+    db = Database(tmp_path / "question-purpose-multiple.sqlite")
+    tasks = TaskRepository(db)
+    questions = QuestionRepository(db)
+    task_id = tasks.create("multiple purposes")
+    question = questions.ask(task_id, "Choose?", "decision", purpose="decision")
+    questions.ask(task_id, "Approve?", "approval", purpose="approval")
+
+    assert questions.answer(question + 1, "yes", task_id)
+    assert tasks.get(task_id)["status"] == "waiting_decision"
+    assert questions.answer(question, "yes", task_id)
+    assert tasks.get(task_id)["status"] == "waiting_decision"
+    assert not questions.has_open_required(task_id)

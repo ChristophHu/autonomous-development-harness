@@ -182,6 +182,7 @@ class ApprovalService:
             target.reason(),
             ["approve", "deny"],
             required=required,
+            purpose="approval",
         )
 
     def request_tool(self, target: ToolApprovalTarget, required=True):
