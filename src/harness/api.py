@@ -51,6 +51,23 @@ class AnswerRequest(BaseModel):
     answer: str = Field(min_length=1, examples=["Implement the local-only option"])
 
 
+class ModelTestRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    model: StrictStr = Field(min_length=1, max_length=200)
+
+
+class ModelTestResponse(BaseModel):
+    model: str
+    status: Literal["successful", "failed"]
+    error_type: str | None = None
+
+
+class TaskKnowledgeResponse(BaseModel):
+    task_id: int
+    query: str
+    hits: list[dict[str, Any]]
+
+
 class QuestionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     question: str = Field(
@@ -354,6 +371,15 @@ def model_inventory():
     return {"providers": orchestrator.model_operations.model_inventory()}
 
 
+@router.post(
+    "/models/test",
+    response_model=ModelTestResponse,
+    response_model_exclude_none=True,
+)
+def test_model(payload: ModelTestRequest):
+    return orchestrator.model_operations.test_model(payload.model)
+
+
 @router.get("/decisions", response_model=list[Decision])
 def list_decisions(
     task_id: int | None = Query(default=None, gt=0),
@@ -409,6 +435,22 @@ def create(task: Task):
 @router.get("/tasks", response_model=list[Task])
 def list_tasks(status: Status | None = None):
     return orchestrator.service.list(status)
+
+
+@router.get(
+    "/tasks/{task_id}/knowledge",
+    response_model=TaskKnowledgeResponse,
+    responses={404: {"model": ErrorResponse}, 422: {"model": ErrorResponse}},
+)
+def task_knowledge_search(
+    task_id: int,
+    query: str = Query(min_length=1, max_length=1000),
+    limit: int = Query(default=5, ge=1, le=20),
+):
+    try:
+        return orchestrator.service.knowledge_search(task_id, query, limit=limit)
+    except ValueError as exc:
+        raise _service_error(exc) from exc
 
 
 @router.patch(

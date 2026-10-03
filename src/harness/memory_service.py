@@ -159,13 +159,26 @@ class MemoryService:
         }
 
     def search(self, query, limit=5):
+        return self.verified_search_points(self.vectors.search(query, limit=limit))
+
+    def verified_search_points(self, points):
+        """Resolve only current, Vault-backed hits from one vector search response."""
+        if not isinstance(points, list):
+            raise TypeError("vector search response must be a list")
         results, seen = [], set()
-        for point in self.vectors.search(query, limit=limit):
+        for point in points:
+            if not isinstance(point, dict):
+                raise TypeError("vector search hit must be an object")
             payload = point.get("payload", {})
+            if not isinstance(payload, dict):
+                raise TypeError("vector search payload must be an object")
             name = payload.get("source")
-            if not name or name in seen:
+            if not isinstance(name, str) or not name or name in seen:
                 continue
-            content = self.notes.read(name)
+            try:
+                content = self.notes.read(name)
+            except (PermissionError, ValueError):
+                continue
             if content is None or self.digest(content) != payload.get("source_hash"):
                 continue
             seen.add(name)

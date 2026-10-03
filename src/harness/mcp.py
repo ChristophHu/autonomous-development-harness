@@ -32,7 +32,14 @@ class MCPError(RuntimeError):
 
 class MCPClient:
     def __init__(
-        self, command, workspace, *, timeout=10, read_roots=None, executable_paths=()
+        self,
+        command,
+        workspace,
+        *,
+        timeout=10,
+        read_roots=None,
+        executable_paths=(),
+        python_import_roots=(),
     ):
         self.workspace = Path(workspace).resolve(strict=True)
         if (
@@ -55,6 +62,16 @@ class MCPClient:
         self.timeout = timeout
         self.read_roots = read_roots
         self.executable_paths = tuple(Path(path) for path in executable_paths)
+        roots = []
+        for root in python_import_roots:
+            path = Path(root)
+            if not path.is_absolute() or os.pathsep in str(path):
+                raise ValueError("MCP Python import root must be an absolute directory")
+            path = path.resolve(strict=True)
+            if not path.is_dir():
+                raise ValueError("MCP Python import root must be an absolute directory")
+            roots.append(path)
+        self.python_import_roots = tuple(roots)
 
     def _exchange(self, method, params):
         control = current_run_control()
@@ -69,6 +86,8 @@ class MCPClient:
             ),
         )
         env = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}
+        if self.python_import_roots:
+            env["PYTHONPATH"] = os.pathsep.join(map(str, self.python_import_roots))
         if "TMPDIR" in os.environ:
             env["TMPDIR"] = os.environ["TMPDIR"]
         try:
@@ -452,8 +471,11 @@ def builtin_filesystem_command(workspace, *, read_only=True, allow_delete=False)
     return command
 
 
-def builtin_obsidian_command(vault):
-    return [sys.executable, "-m", "harness.mcp_servers.obsidian", str(vault)]
+def builtin_obsidian_command(vault, source_root=None):
+    command = [sys.executable, "-m", "harness.mcp_servers.obsidian", str(vault)]
+    if source_root is not None:
+        command.append(str(source_root))
+    return command
 
 
 def builtin_apple_shell_command(workspace):

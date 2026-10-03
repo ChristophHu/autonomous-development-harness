@@ -11,35 +11,52 @@ from posixpath import normpath
 
 import yaml
 
+from .vault_review import classify_review
+
 DEFAULT_REQUIRED_NOTES = (
     "Willkommen.md",
     "Vault-Übersicht.md",
     "rules/Harness-Prinzipien.md",
+    "rules/Coding-Standards.md",
+    "rules/Konventionen.md",
     "architecture/Systemarchitektur.md",
     "architecture/Vault und Memory.md",
     "architecture/Modelle und Routing.md",
     "architecture/Git und Isolation.md",
     "operations/Lokaler Betrieb.md",
     "decisions/Entscheidungsregister.md",
+    "decisions/Architekturentscheidungen.md",
+    "decisions/Technische Entscheidungen.md",
     "agents/Agentenprofile.md",
     "tasks/Task-Register.md",
+    "knowledge/Projektwissen.md",
+    "knowledge/Lessons Learned.md",
+    "knowledge/Bekannte Probleme.md",
+    "docs/Dokumentation.md",
 )
 CURATED_NOTE_TYPES = {
     "Willkommen.md": "vault-home",
     "Vault-Übersicht.md": "vault-index",
     "rules/Harness-Prinzipien.md": "project-rules",
+    "rules/Coding-Standards.md": "coding-standards",
+    "rules/Konventionen.md": "conventions",
     "architecture/Systemarchitektur.md": "architecture",
     "architecture/Vault und Memory.md": "architecture",
     "architecture/Modelle und Routing.md": "model-routing",
     "architecture/Git und Isolation.md": "git-isolation-architecture",
     "operations/Lokaler Betrieb.md": "operations-guide",
     "decisions/Entscheidungsregister.md": "decision-index",
+    "decisions/Architekturentscheidungen.md": "architecture-decisions",
+    "decisions/Technische Entscheidungen.md": "technical-decisions",
     "agents/Agentenprofile.md": "agent-index",
     "tasks/Task-Register.md": "task-index",
+    "knowledge/Projektwissen.md": "project-knowledge",
+    "knowledge/Lessons Learned.md": "lessons-learned",
+    "knowledge/Bekannte Probleme.md": "known-problems",
+    "docs/Dokumentation.md": "documentation-index",
 }
 WIKILINK = re.compile(r"!?\[\[([^\]|#]+)")
 FRONTMATTER = re.compile(r"\A---\s*\n(.*?)\n---(?:\s*\n|\Z)", re.DOTALL)
-REVIEWED = re.compile(r"^last_reviewed\s*:\s*(.*?)\s*$", re.MULTILINE)
 
 
 def _excluded(path: Path, root: Path) -> bool:
@@ -61,18 +78,20 @@ def _excluded(path: Path, root: Path) -> bool:
         return True
 
 
-def _review_date(text: str):
+def _review_date(text: str, reference_date: date, max_age_days: int):
     frontmatter = FRONTMATTER.match(text)
     if frontmatter is None:
         return "missing", None
-    match = REVIEWED.search(frontmatter.group(1))
-    if match is None:
-        return "missing", None
-    raw = match.group(1).strip().strip("\"'")
     try:
-        return "valid", date.fromisoformat(raw)
-    except ValueError:
+        metadata = yaml.safe_load(frontmatter.group(1))
+    except yaml.YAMLError:
         return "invalid", None
+    if not isinstance(metadata, dict):
+        return "invalid", None
+    state, reviewed = classify_review(metadata, reference_date, max_age_days)
+    if state == "unreviewed":
+        return "missing", None
+    return state, reviewed
 
 
 def _finding(code: str, path: str, message: str) -> dict[str, str]:
@@ -357,7 +376,9 @@ def audit_vault(
             findings.extend(
                 _source_findings(text, relative, source_root or root.parent)
             )
-        review_state, reviewed = _review_date(text)
+        review_state, _reviewed = _review_date(
+            text, reference_date, max_review_age_days
+        )
         if review_state == "missing":
             findings.append(
                 _finding("review_missing", relative, "last_reviewed is missing")
@@ -366,11 +387,11 @@ def audit_vault(
             findings.append(
                 _finding("review_invalid", relative, "last_reviewed must be YYYY-MM-DD")
             )
-        elif reviewed > reference_date:
+        elif review_state == "future":
             findings.append(
                 _finding("review_future", relative, "last_reviewed is in the future")
             )
-        elif (reference_date - reviewed).days > max_review_age_days:
+        elif review_state == "stale":
             findings.append(
                 _finding(
                     "review_stale", relative, "last_reviewed exceeds the age limit"

@@ -1434,6 +1434,43 @@ class QuestionRepository:
                 is not None
             )
 
+    def supersede_conflict_questions(self, task_id, keep_reasons=()):
+        """Close obsolete, unanswered requirement-conflict questions atomically."""
+        from .domain import EventKind
+
+        keep = set(keep_reasons)
+        superseded = []
+        with self.db.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                "SELECT id,reason FROM questions WHERE task_id=? AND status='open' "
+                "AND required=1 AND purpose='decision' AND reason LIKE 'requirements:conflict:%'",
+                (task_id,),
+            ).fetchall()
+            for row in rows:
+                if row["reason"] in keep:
+                    continue
+                connection.execute(
+                    "UPDATE questions SET status='superseded' WHERE id=? AND status='open'",
+                    (row["id"],),
+                )
+                connection.execute(
+                    "INSERT INTO events(task_id,kind,payload,created_at) VALUES(?,?,?,?)",
+                    (
+                        task_id,
+                        EventKind.QUESTION_SUPERSEDED.value,
+                        json.dumps(
+                            {
+                                "question_id": row["id"],
+                                "reason_kind": "requirements:conflict",
+                            }
+                        ),
+                        self.db.now(),
+                    ),
+                )
+                superseded.append(row["id"])
+        return superseded
+
     def answer(self, question_id, answer, task_id=None):
         with self.db.connect() as c:
             row = c.execute(

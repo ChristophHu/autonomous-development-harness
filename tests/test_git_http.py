@@ -752,6 +752,54 @@ def test_sandbox_profile_allows_only_the_local_proxy_and_trusted_helper(
     assert "(allow network-outbound)" not in profile
 
 
+def test_https_transport_grants_only_configured_ca_bundle_read_access(
+    tmp_path, monkeypatch
+):
+    from contextlib import contextmanager
+
+    ca_bundle = tmp_path / "ca.pem"
+    ca_bundle.write_text("test ca")
+    transport = HttpsTransport(
+        ("fetch", "origin", "main"),
+        tmp_path,
+        "https://git.example.com/repo.git",
+        1,
+        tmp_path / "git-remote-https",
+        {},
+        ca_bundle=str(ca_bundle),
+    )
+
+    @contextmanager
+    def proxy(_hosts):
+        yield 43127
+
+    monkeypatch.setattr("harness.git_broker.https_proxy", proxy)
+    captured = {}
+
+    def isolated(command, *_args, **kwargs):
+        captured.update(kwargs)
+        return command
+
+    monkeypatch.setattr("harness.git_broker.isolated_command", isolated)
+    monkeypatch.setattr(
+        "harness.git_broker.subprocess.Popen",
+        lambda *_args, **_kwargs: type(
+            "Client",
+            (),
+            {
+                "returncode": 0,
+                "__enter__": lambda self: self,
+                "__exit__": lambda *_args: False,
+                "communicate": lambda *_args, **_kwargs: (b"", b""),
+                "poll": lambda self: 0,
+            },
+        )(),
+    )
+    transport.run()
+    assert captured["read_roots"] == (ca_bundle,)
+    assert tmp_path not in captured["read_roots"]
+
+
 @pytest.mark.parametrize("port", [0, -1, 65536, "443"])
 def test_sandbox_rejects_invalid_proxy_ports(tmp_path, monkeypatch, port):
     from harness.isolation import isolated_command

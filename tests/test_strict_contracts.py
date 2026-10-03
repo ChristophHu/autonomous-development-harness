@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import subprocess
 from types import SimpleNamespace
@@ -13,6 +14,7 @@ from harness.agents import (
     PlannerOutput,
     Subtask,
 )
+from harness.claim_evidence import IndependentClaimVerifier
 from harness.core import Event, TaskLifecycle
 from harness.domain import AcceptanceCriterion, Task, may_transition
 from harness.providers import (
@@ -411,6 +413,13 @@ def test_requirement_sources_answers_and_derivation(tmp_path):
 
     def derive(prompt, **_kwargs):
         payload = json.loads(prompt.split("\n", 1)[1])
+        assert (
+            sum(
+                item["source"] == "memory_and_repository" for item in payload["sources"]
+            )
+            == 1
+        )
+        assert not any(item["source"] == "context" for item in payload["sources"])
         context_ref = next(
             item["ref"]
             for item in payload["sources"]
@@ -466,6 +475,379 @@ def test_requirement_completion_rejects_uncited_agent_fields(tmp_path):
     )
     assert completed.goal == ""
     assert store.decisions.list(task.id) == []
+
+
+def test_requirement_completion_rejects_context_exceeding_its_envelope_budget(tmp_path):
+    store, orchestrator = runtime(tmp_path)
+    task = store.create(Task(title="bounded evidence"))
+    with pytest.raises(ValueError, match="declared byte budget"):
+        RequirementCompleter(store, orchestrator.router).complete(
+            task,
+            {
+                "fragments": [{"ref": "context:test/source", "text": "evidence"}],
+                "budget_bytes": 1,
+                "used_bytes": 1,
+            },
+        )
+
+
+def test_conflicting_context_and_human_claims_block_requirement_completion(tmp_path):
+    store, orchestrator = runtime(tmp_path)
+    task = store.create(Task(title="conflicted"))
+    for value in ("human alpha", "human beta"):
+        question = store.ask(task.id, f"specify {value}", "requirements:incomplete")
+        store.answer(question, json.dumps({"goal": value}), task.id)
+
+    def derive(prompt, **_kwargs):
+        payload = json.loads(prompt.split("\n", 1)[1])
+        context_ref = next(
+            item["ref"]
+            for item in payload["sources"]
+            if item["source"] == "memory_and_repository"
+        )
+        assert "goal" in payload["blocked_by_conflict"]
+        return json.dumps(
+            {
+                "fields": {"goal": "model guess"},
+                "rationale": "attempted conflict override",
+                "evidence": {"goal": [{"source": "context", "ref": context_ref}]},
+            }
+        )
+
+    orchestrator.models.register("fixture", SimpleNamespace(complete=derive))
+    retrieved = {
+        "text": "vault and vector disagree",
+        "fragments": [
+            {
+                "kind": "vault",
+                "ref": "context:vault/constraints.md#Goal",
+                "text": "goal alpha",
+            }
+        ],
+        "claims": {
+            "goal": [
+                {"ref": "context:vault/constraints.md#Goal", "value": "vault alpha"},
+                {"ref": "context:qdrant/p1", "value": "vector beta"},
+            ]
+        },
+        "conflicts": {
+            "goal": {
+                "sources": [
+                    {
+                        "ref": "context:vault/constraints.md#Goal",
+                        "value": "vault alpha",
+                    },
+                    {"ref": "context:qdrant/p1", "value": "vector beta"},
+                ]
+            }
+        },
+        "budget_bytes": 1024,
+        "used_bytes": 24,
+    }
+    completed, _ = RequirementCompleter(store, orchestrator.router).complete(
+        task, retrieved
+    )
+    assert completed.goal == ""
+    assert store.decisions.list(task.id) == []
+
+
+def test_context_claim_with_unknown_reference_is_quarantined(tmp_path):
+    store, orchestrator = runtime(tmp_path)
+    task = store.create(Task(title="unlinked claim"))
+    calls = []
+
+    def derive(prompt, **_kwargs):
+        payload = json.loads(prompt.split("\n", 1)[1])
+        calls.append(payload)
+        assert "goal" in payload["blocked_by_conflict"]
+        return json.dumps(
+            {
+                "fields": {"goal": "untrusted"},
+                "rationale": "Claim has no supplied source.",
+                "evidence": {
+                    "goal": [{"source": "context", "ref": "context:invented"}]
+                },
+            }
+        )
+
+    orchestrator.models.register("fixture", SimpleNamespace(complete=derive))
+    completed, _ = RequirementCompleter(store, orchestrator.router).complete(
+        task,
+        {
+            "fragments": [{"ref": "context:vault/actual.md#Goal", "text": "source"}],
+            "claims": {
+                "goal": [{"ref": "context:vault/fabricated.md#Goal", "value": "x"}]
+            },
+        },
+    )
+    assert calls
+    assert completed.goal == ""
+    assert store.list_questions(task.id) == []
+
+
+def test_repository_claim_is_rejected_if_source_changes_after_context_build(tmp_path):
+    store, orchestrator = runtime(tmp_path)
+    task = store.create(Task(title="repository provenance"))
+    source = tmp_path / "src" / "module.py"
+    source.parent.mkdir()
+    source.write_text("def original():\n    return True\n")
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    source.write_text("def changed():\n    return False\n")
+    reference = "context:repository/src/module.py#original"
+    completed, context = RequirementCompleter(store, orchestrator.router).complete(
+        task,
+        {
+            "fragments": [
+                {
+                    "kind": "repository_symbol",
+                    "ref": reference,
+                    "text": "original implementation",
+                    "provenance": {"sha256": digest},
+                }
+            ],
+            "claims": {"goal": [{"ref": reference, "value": "stale goal"}]},
+        },
+    )
+    assert completed.goal != "stale goal"
+    memory_context = next(
+        item["data"]
+        for item in json.loads(context)
+        if item["source"] == "memory_and_repository"
+    )
+    assert memory_context["fragments"] == []
+    assert memory_context["rejected_sources"] == [
+        {"ref": reference, "status": "stale_or_unavailable"}
+    ]
+    assert "goal" in memory_context["claim_issues"]
+
+
+def test_repository_claim_accepts_current_hash_bound_source(tmp_path):
+    store, orchestrator = runtime(tmp_path)
+    task = store.create(Task(title="repository provenance"))
+    source = tmp_path / "src" / "module.py"
+    source.parent.mkdir()
+    source.write_text("def original():\n    return 'current goal'\n")
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    reference = "context:repository/src/module.py#original"
+    _, context = RequirementCompleter(store, orchestrator.router).complete(
+        task,
+        {
+            "fragments": [
+                {
+                    "kind": "repository_symbol",
+                    "ref": reference,
+                    "text": "current goal",
+                    "provenance": {"sha256": digest},
+                }
+            ],
+            "claims": {"goal": [{"ref": reference, "value": "current goal"}]},
+        },
+    )
+    memory_context = next(
+        item["data"]
+        for item in json.loads(context)
+        if item["source"] == "memory_and_repository"
+    )
+    assert memory_context["fragments"][0]["ref"] == reference
+    assert memory_context["claims"]["goal"] == [
+        {
+            "ref": reference,
+            "value": "current goal",
+            "evidence_quote": "current goal",
+            "verification_method": "exact",
+        }
+    ]
+
+
+def test_context_claim_without_source_quote_is_quarantined(tmp_path):
+    store, orchestrator = runtime(tmp_path)
+    task = store.create(Task(title="fabricated claim"))
+    _, context = RequirementCompleter(store, orchestrator.router).complete(
+        task,
+        {
+            "fragments": [
+                {"ref": "context:vault/source.md#Goal", "text": "the actual alpha goal"}
+            ],
+            "claims": {
+                "goal": [
+                    {"ref": "context:vault/source.md#Goal", "value": "secret beta"}
+                ]
+            },
+        },
+    )
+    memory_context = next(
+        item["data"]
+        for item in json.loads(context)
+        if item["source"] == "memory_and_repository"
+    )
+    assert memory_context["claims"]["goal"] == []
+    assert memory_context["claim_issues"]["goal"] == [
+        "claim lacks exact support in its cited source"
+    ]
+
+
+def test_independent_claim_verifier_allows_cited_paraphrase(tmp_path):
+    store, orchestrator = runtime(tmp_path)
+    task = store.create(Task(title="semantic claim"))
+    verifier = IndependentClaimVerifier(
+        lambda _value, _text: {"status": "supported", "quote": "source passage"},
+        identity="separate-reviewer",
+        author_identity="retrieval-claim-writer",
+    )
+    _, context = RequirementCompleter(
+        store, orchestrator.router, claim_verifier=verifier
+    ).complete(
+        task,
+        {
+            "fragments": [
+                {"ref": "context:vault/source.md#Goal", "text": "A source passage."}
+            ],
+            "claims": {
+                "goal": [
+                    {"ref": "context:vault/source.md#Goal", "value": "a paraphrase"}
+                ]
+            },
+        },
+    )
+    memory_context = next(
+        item["data"]
+        for item in json.loads(context)
+        if item["source"] == "memory_and_repository"
+    )
+    claim = memory_context["claims"]["goal"][0]
+    assert claim["verification_method"] == "independent"
+    assert claim["evidence_quote"] == "source passage"
+    assert claim["verifier_id"] == "separate-reviewer"
+
+
+def test_conflict_resolution_pauses_for_selection_and_records_human_decision(
+    tmp_path,
+):
+    store, orchestrator = runtime(tmp_path)
+    task = store.create(Task(title="resolve sources"))
+    retrieved = {
+        "fragments": [
+            {"ref": "context:vault/goal.md#Goal", "text": "goal alpha"},
+            {"ref": "context:qdrant/point-2", "text": "goal beta"},
+        ],
+        "claims": {
+            "goal": [
+                {"ref": "context:vault/goal.md#Goal", "value": "alpha"},
+                {"ref": "context:qdrant/point-2", "value": "beta"},
+            ]
+        },
+    }
+    completer = RequirementCompleter(store, orchestrator.router)
+    task, _ = completer.complete(task, retrieved)
+    questions = store.list_questions(task.id)
+    assert len(questions) == 1
+    question = questions[0]
+    assert question["purpose"] == "decision"
+    assert question["status"] == "open"
+    selected = json.dumps(
+        {"ref": "context:qdrant/point-2", "value": "beta"},
+        separators=(",", ":"),
+    )
+
+    assert store.answer(question["id"], selected, task.id)
+    task, _ = completer.complete(store.get(task.id), retrieved)
+
+    assert task.goal == "beta"
+    decisions = store.decisions.list(task.id)
+    assert len(decisions) == 1
+    assert decisions[0]["source"] == "human"
+    assert decisions[0]["question_id"] == question["id"]
+
+
+def test_orchestrator_keeps_conflict_decision_without_generic_input_question(
+    tmp_path,
+):
+    store, orchestrator = runtime(tmp_path)
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "first.md").write_text(
+        "---\nlast_reviewed: 2026-10-01\nclaims: {goal: alpha}\n---\n# First\nDecision conflict alpha"
+    )
+    (vault / "second.md").write_text(
+        "---\nlast_reviewed: 2026-10-01\nclaims: {goal: beta}\n---\n# Second\nDecision conflict beta"
+    )
+    task = store.create(Task(title="Decision conflict"))
+
+    result = asyncio.run(orchestrator.run(task.id))
+
+    assert result.status == "waiting_decision"
+    questions = store.list_questions(task.id)
+    assert len(questions) == 1
+    assert questions[0]["purpose"] == "decision"
+
+
+def test_conflict_resolution_accepts_validated_human_alternative(tmp_path):
+    store, orchestrator = runtime(tmp_path)
+    task = store.create(Task(title="new resolution"))
+    retrieved = {
+        "fragments": [
+            {"ref": "context:vault/a.md#Goal", "text": "alpha"},
+            {"ref": "context:qdrant/b", "text": "beta"},
+        ],
+        "claims": {
+            "goal": [
+                {"ref": "context:vault/a.md#Goal", "value": "alpha"},
+                {"ref": "context:qdrant/b", "value": "beta"},
+            ]
+        },
+    }
+    completer = RequirementCompleter(store, orchestrator.router)
+    completer.complete(task, retrieved)
+    question = store.list_questions(task.id)[0]
+    answer = json.dumps(
+        {"value": "gamma", "rationale": "The linked product brief is authoritative."}
+    )
+    assert store.answer(question["id"], answer, task.id)
+
+    task, _ = completer.complete(store.get(task.id), retrieved)
+
+    assert task.goal == "gamma"
+    assert store.decisions.list(task.id)[0]["rationale"] == (
+        "The linked product brief is authoritative."
+    )
+
+
+def test_conflict_resolution_rejects_selection_after_sources_change(tmp_path):
+    store, orchestrator = runtime(tmp_path)
+    task = store.create(Task(title="changed sources"))
+    completer = RequirementCompleter(store, orchestrator.router)
+
+    def context(second):
+        return {
+            "fragments": [
+                {"ref": "context:vault/a.md#Goal", "text": "alpha"},
+                {"ref": f"context:qdrant/{second}", "text": second},
+            ],
+            "claims": {
+                "goal": [
+                    {"ref": "context:vault/a.md#Goal", "value": "alpha"},
+                    {"ref": f"context:qdrant/{second}", "value": second},
+                ]
+            },
+        }
+
+    completer.complete(task, context("beta"))
+    old_question = store.list_questions(task.id)[0]
+    assert store.answer(
+        old_question["id"],
+        json.dumps({"ref": "context:qdrant/beta", "value": "beta"}),
+        task.id,
+    )
+    task, _ = completer.complete(store.get(task.id), context("gamma"))
+
+    assert task.goal == ""
+    assert store.decisions.list(task.id) == []
+    open_decisions = [
+        item
+        for item in store.list_questions(task.id)
+        if item["status"] == "open" and item["purpose"] == "decision"
+    ]
+    assert len(open_decisions) == 1
 
 
 @pytest.mark.parametrize(

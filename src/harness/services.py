@@ -178,6 +178,58 @@ class ModelOperationsService:
             )
         return inventory
 
+    def test_model(self, model_name):
+        """Run a minimal model check and return a secret-safe outcome."""
+        try:
+            provider, model_id = self.registry.resolve(model_name)
+            response = provider.complete(
+                "Reply with exactly: OK", **({"model": model_id} if model_id else {})
+            )
+            text = response[0] if isinstance(response, tuple) else response
+            if not isinstance(text, str) or not text.strip():
+                raise ValueError("empty model response")
+        except (OSError, RuntimeError, TypeError, ValueError, httpx.HTTPError) as error:
+            return {
+                "model": model_name,
+                "status": "failed",
+                "error_type": type(error).__name__,
+            }
+        return {"model": model_name, "status": "successful"}
+
+
+class VaultKnowledgeApplicationService:
+    """Shared, read-only and redacted Vault retrieval for task/API/CLI callers."""
+
+    def __init__(self, vault, source_root, sanitizer=None):
+        self.vault = vault
+        self.source_root = source_root
+        self._knowledge = None
+        self.sanitizer = sanitizer or (lambda value: value)
+
+    @property
+    def knowledge(self):
+        if self._knowledge is None:
+            from .vault_knowledge import VaultKnowledgeService
+
+            self._knowledge = VaultKnowledgeService(
+                self.vault, source_root=self.source_root
+            )
+        return self._knowledge
+
+    def search(self, query, *, limit=5):
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= 20
+        ):
+            raise ValueError("limit must be between 1 and 20")
+        return self.sanitizer(
+            {
+                "query": query,
+                "hits": self.knowledge.search(query, limit=limit),
+            }
+        )
+
 
 class TaskService:
     def __init__(self, store, orchestrator):
@@ -244,6 +296,11 @@ class TaskService:
         return {
             status.value: len(self.store.tasks.list(status.value)) for status in Status
         }
+
+    def knowledge_search(self, task_id, query, *, limit=5):
+        self.get(task_id)
+        result = self.orchestrator.knowledge_operations.search(query, limit=limit)
+        return {"task_id": task_id, **result}
 
     def events(self, task_id, *filters):
         self.get(task_id)

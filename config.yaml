@@ -11,6 +11,7 @@ agents:
   contract_mode: required
 git: {enabled: false, main: main, dev: dev, remote: null}
 memory:
+  context: {max_bytes: 65536}
   obsidian: {enabled: true}
   qdrant: {enabled: true, url: http://127.0.0.1:6333, collection: harness-memory, timeout: {total: 5, connect: 2, read: 5}}
   embeddings: {provider: lmstudio, base_url: http://127.0.0.1:1234/v1, model: text-embedding-qwen3-embedding-0.6b, dimensions: 1024, batch_size: 32, timeout: {total: 30, connect: 5, read: 30}}

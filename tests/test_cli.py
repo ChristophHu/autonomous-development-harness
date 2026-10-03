@@ -49,6 +49,11 @@ def harness_context(tmp_path, monkeypatch):
     store = Store(cfg)
     orchestrator = Orchestrator(store, cfg)
     monkeypatch.setattr(cli, "build", lambda: (cfg, store, orchestrator))
+    monkeypatch.setattr(
+        cli,
+        "_build_embedding_acceptance",
+        lambda: (cfg, store, orchestrator.qdrant, orchestrator.memory_service),
+    )
     monkeypatch.setattr(cli, "ROOT", tmp_path)
     return cfg, store, orchestrator, tmp_path
 
@@ -531,7 +536,9 @@ def test_status_and_doctor(harness_context, monkeypatch, capsys):
     cfg, _, orchestrator, _root = harness_context
     cfg.data["memory"]["qdrant"]["enabled"] = False
     cli.status()
-    assert "stopped" in capsys.readouterr().out
+    initial_status = capsys.readouterr().out
+    assert "stopped" in initial_status
+    assert "SQLite schema: 15/15 (available)" in initial_status
 
     class LifecycleFixture:
         def __init__(self):
@@ -582,7 +589,15 @@ def test_status_and_doctor(harness_context, monkeypatch, capsys):
         lambda *a, **k: (_ for _ in ()).throw(OSError()),
     )
     cli.doctor()
-    assert "✓" in capsys.readouterr().out
+    assert "✓ SQLite Schema" in capsys.readouterr().out
+    monkeypatch.setattr(
+        cli,
+        "inspect_sqlite",
+        lambda _path: {"version_history_complete": False},
+    )
+    with pytest.raises(cli.typer.Exit):
+        cli.doctor()
+    assert "✗ SQLite Schema" in capsys.readouterr().out
 
 
 def test_status_and_doctor_fail_safe_diagnostics(harness_context, monkeypatch, capsys):
@@ -1073,6 +1088,31 @@ def test_model_test_accepts_usage_tuple_and_rejects_empty_response(
     with pytest.raises(cli.typer.Exit):
         cli.model_test("coding-model")
     assert "ValueError" in capsys.readouterr().out
+
+
+def test_task_knowledge_search_cli_uses_shared_task_service(harness_context, capsys):
+    _, store, orchestrator, _root = harness_context
+    from typer.testing import CliRunner
+
+    task = store.create(Task(title="CLI knowledge task"))
+    vault = orchestrator.context.memory.vault
+    (vault / "CLI.md").write_text(
+        "---\ntype: architecture\nreviewed_on: 2026-10-03\n---\n"
+        "# Architecture\nCLI task routing uses shared services.\n",
+        encoding="utf-8",
+    )
+    result = CliRunner().invoke(
+        cli.app, ["tasks", "knowledge-search", str(task.id), "routing"]
+    )
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["task_id"] == task.id
+    assert "context:vault/CLI.md#Architecture" in result.output
+
+    missing = CliRunner().invoke(
+        cli.app, ["tasks", "knowledge-search", "999999", "routing"]
+    )
+    assert missing.exit_code == 1
+    assert "task not found" in missing.output
 
 
 def test_secret_commands(harness_context, monkeypatch, capsys):
@@ -1859,7 +1899,7 @@ def test_memory_audit_reports_read_only_health(tmp_path, monkeypatch, capsys):
 
     report = json.loads(capsys.readouterr().out)
     assert report["healthy"] is True
-    assert report["audited_notes"] == 11
+    assert report["audited_notes"] == len(CURATED_NOTE_TYPES)
     assert all(
         (vault / relative).is_file()
         for relative in (
@@ -2024,6 +2064,226 @@ def test_qdrant_config_audit_cli_accepts_compose_and_optional_config(tmp_path):
     assert json.loads(result.output) == {"healthy": True, "findings": []}
 
 
+def test_knowledge_proposal_cli_requires_review_and_applies_only_confirmed_content(
+    tmp_path, monkeypatch
+):
+    from typer.testing import CliRunner
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    source = root / "source.py"
+    source.write_text("def verified():\n    return True\n")
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    knowledge = vault / "knowledge"
+    knowledge.mkdir()
+    source_digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    (knowledge / "Projektwissen.md").write_text(
+        "---\ntype: project-knowledge\nlast_reviewed: 2026-10-03\n"
+        f"sources: [{{path: source.py, sha256: {source_digest}}}]\n---\n# Wissen\n"
+    )
+    (vault / "Willkommen.md").write_text(
+        "---\ntype: vault-home\nlast_reviewed: 2026-10-03\n"
+        f"sources: [{{path: source.py, sha256: {source_digest}}}]\n---\n"
+        "# Willkommen\n\n[[knowledge/Projektwissen]]\n"
+    )
+    body_file = tmp_path / "proposal.md"
+    body_file.write_text("Never persist api_key=private-value in notes.\n")
+    config = SimpleNamespace(
+        path=lambda name: vault if name == "obsidian_vault" else tmp_path / "db"
+    )
+    audit = SimpleNamespace(
+        sanitize=lambda value: value.replace("private-value", "[REDACTED]")
+    )
+    store = SimpleNamespace(audit=audit)
+    monkeypatch.setattr(cli, "ROOT", root)
+    monkeypatch.setattr(cli, "Config", lambda: config)
+    monkeypatch.setattr(cli, "_build_memory_store", lambda: (config, store))
+    runner = CliRunner()
+    args = [
+        "memory",
+        "knowledge-propose",
+        "--task-id",
+        "TASK-42",
+        "--title",
+        "Verified lesson",
+        "--category",
+        "lessons-learned",
+        "--source",
+        "source.py",
+        "--body-file",
+        str(body_file),
+    ]
+    proposed = runner.invoke(cli.app, args)
+    assert proposed.exit_code == 0, proposed.output
+    proposal = json.loads(proposed.output)
+    assert not (vault / proposal["target"]).exists()
+    listed = runner.invoke(cli.app, ["memory", "knowledge-proposals"])
+    assert listed.exit_code == 0, listed.output
+    assert "[REDACTED]" in listed.output
+    assert "private-value" not in listed.output
+    no_confirm = runner.invoke(
+        cli.app,
+        ["memory", "knowledge-approve", proposal["id"], "--sha256", proposal["digest"]],
+    )
+    assert no_confirm.exit_code != 0
+    approved = runner.invoke(
+        cli.app,
+        [
+            "memory",
+            "knowledge-approve",
+            proposal["id"],
+            "--sha256",
+            proposal["digest"],
+            "--confirm",
+        ],
+    )
+    assert approved.exit_code == 0, approved.output
+    note = (vault / proposal["target"]).read_text()
+    assert "[REDACTED]" in note
+    assert "private-value" not in note
+
+
+def test_knowledge_proposal_cli_rejects_invalid_source_and_records_rejection(
+    tmp_path, monkeypatch
+):
+    from typer.testing import CliRunner
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    source = root / "source.py"
+    source.write_text("source\n")
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    knowledge = vault / "knowledge"
+    knowledge.mkdir()
+    source_digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    (knowledge / "Projektwissen.md").write_text(
+        "---\ntype: project-knowledge\nlast_reviewed: 2026-10-03\n"
+        f"sources: [{{path: source.py, sha256: {source_digest}}}]\n---\n# Wissen\n"
+    )
+    (vault / "Willkommen.md").write_text(
+        "---\ntype: vault-home\nlast_reviewed: 2026-10-03\n"
+        f"sources: [{{path: source.py, sha256: {source_digest}}}]\n---\n"
+        "# Willkommen\n\n[[knowledge/Projektwissen]]\n"
+    )
+    body_file = tmp_path / "proposal.md"
+    body_file.write_text("Body\n")
+    config = SimpleNamespace(path=lambda _name: vault)
+    store = SimpleNamespace(audit=SimpleNamespace(sanitize=lambda value: value))
+    monkeypatch.setattr(cli, "ROOT", root)
+    monkeypatch.setattr(cli, "Config", lambda: config)
+    monkeypatch.setattr(cli, "_build_memory_store", lambda: (config, store))
+    runner = CliRunner()
+    bad = runner.invoke(
+        cli.app,
+        [
+            "memory",
+            "knowledge-propose",
+            "--task-id",
+            "TASK-1",
+            "--title",
+            "Bad",
+            "--category",
+            "lessons-learned",
+            "--source",
+            "../outside.py",
+            "--body-file",
+            str(body_file),
+        ],
+    )
+    assert bad.exit_code == 2
+    proposal = runner.invoke(
+        cli.app,
+        [
+            "memory",
+            "knowledge-propose",
+            "--task-id",
+            "TASK-2",
+            "--title",
+            "Rejected lesson",
+            "--category",
+            "project-knowledge",
+            "--source",
+            "source.py",
+            "--body-file",
+            str(body_file),
+        ],
+    )
+    result = json.loads(proposal.output)
+    rejected = runner.invoke(
+        cli.app,
+        [
+            "memory",
+            "knowledge-reject",
+            result["id"],
+            "--sha256",
+            result["digest"],
+            "--confirm",
+        ],
+    )
+    assert rejected.exit_code == 0, rejected.output
+    assert json.loads(rejected.output)["status"] == "rejected"
+
+
+@pytest.mark.parametrize(
+    ("proposal_state", "expected_exit", "expected_ready"),
+    [("current", 0, True), ("stale_or_unavailable", 1, False)],
+)
+def test_knowledge_review_combines_vault_health_and_stale_proposals(
+    tmp_path, monkeypatch, proposal_state, expected_exit, expected_ready
+):
+    from typer.testing import CliRunner
+
+    from harness import vault_audit, vault_steward
+
+    vault = tmp_path / "vault"
+    root = tmp_path / "repo"
+    database = tmp_path / "missing.db"
+    vault.mkdir()
+    root.mkdir()
+    config = SimpleNamespace(
+        path=lambda name: {
+            "obsidian_vault": vault,
+            "database": database,
+        }[name]
+    )
+    monkeypatch.setattr(cli, "Config", lambda: config)
+    monkeypatch.setattr(cli, "ROOT", root)
+    monkeypatch.setattr(
+        vault_audit,
+        "audit_vault",
+        lambda *_args, **_kwargs: {
+            "healthy": True,
+            "findings": [],
+            "audited_notes": 19,
+        },
+    )
+
+    class Steward:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def pending(self):
+            return [
+                {
+                    "id": "a" * 24,
+                    "status": "pending",
+                    "source_state": proposal_state,
+                }
+            ]
+
+    monkeypatch.setattr(vault_steward, "VaultKnowledgeSteward", Steward)
+    result = CliRunner().invoke(cli.app, ["memory", "knowledge-review"])
+    report = json.loads(result.output)
+    assert result.exit_code == expected_exit
+    assert report["ready"] is expected_ready
+    assert report["proposal_counts"]["pending"] == 1
+    assert report["stale_pending_proposals"] == (
+        [] if proposal_state == "current" else ["a" * 24]
+    )
+
+
 def test_qdrant_upgrade_smoke_requires_confirmation(capsys):
     with pytest.raises(cli.typer.Exit) as exc:
         cli.qdrant_upgrade_smoke(
@@ -2090,6 +2350,8 @@ def test_qdrant_status_reports_disabled_service_and_exits_on_bad_health(
     harness_context, monkeypatch, capsys
 ):
     _cfg, _store, orchestrator, _root = harness_context
+    monkeypatch.setattr(cli, "_build_memory_store", lambda: (_cfg, _store))
+    monkeypatch.setattr(cli, "_memory_qdrant", lambda _conf: orchestrator.qdrant)
     _cfg.data["memory"]["qdrant"]["enabled"] = False
     monkeypatch.setattr(
         orchestrator.qdrant,
@@ -2260,6 +2522,26 @@ def test_qdrant_acceptance_requires_explicit_confirmation(capsys):
     assert "No provider request sent" in capsys.readouterr().out
 
 
+def test_embedding_acceptance_factory_does_not_initialize_mcp(tmp_path, monkeypatch):
+    cfg = Config()
+    cfg.data["paths"]["database"] = str(tmp_path / "acceptance.db")
+    cfg.data["paths"]["obsidian_vault"] = str(tmp_path / "vault")
+    store = Store(cfg)
+    monkeypatch.setattr(cli, "_build_memory_store", lambda: (cfg, store))
+    monkeypatch.setattr(
+        cli,
+        "build",
+        lambda: (_ for _ in ()).throw(AssertionError("orchestrator started")),
+    )
+
+    conf, result_store, qdrant, service = cli._build_embedding_acceptance()
+
+    assert conf is cfg and result_store is store
+    assert qdrant.embedder.model == cfg.data["memory"]["embeddings"]["model"]
+    assert service.vectors is qdrant
+    assert not (tmp_path / "vault").exists()
+
+
 def test_qdrant_acceptance_checks_enabled_health_and_read_only_search(
     harness_context, monkeypatch, capsys
 ):
@@ -2268,14 +2550,29 @@ def test_qdrant_acceptance_checks_enabled_health_and_read_only_search(
     cfg.data["memory"]["embeddings"].update(
         {"model": "local-embed", "dimensions": 1024}
     )
+    orchestrator.qdrant.embedder.model = "local-embed"
     monkeypatch.setattr(cli, "build", lambda: (cfg, store, orchestrator))
     monkeypatch.setattr(cli, "source_tree_sha256", lambda _root: "a" * 64)
     calls = []
-    monkeypatch.setattr(orchestrator.qdrant, "health_report", lambda: {"healthy": True})
+    monkeypatch.setattr(
+        orchestrator.qdrant,
+        "health_report",
+        lambda: {"healthy": True, "dimension": 1024},
+    )
+    orchestrator.context.memory.write("acceptance", "verified source")
+    source_hash = orchestrator.memory_service.digest("verified source")
     monkeypatch.setattr(
         orchestrator.qdrant,
         "search",
-        lambda query, limit: calls.append((query, limit)) or [{"id": "not-output"}],
+        lambda query, limit: (
+            calls.append((query, limit))
+            or [
+                {
+                    "id": "not-output",
+                    "payload": {"source": "acceptance", "source_hash": source_hash},
+                }
+            ]
+        ),
     )
 
     cli.qdrant_acceptance(confirm=True)
@@ -2289,6 +2586,7 @@ def test_qdrant_acceptance_checks_enabled_health_and_read_only_search(
         "model": "local-embed",
         "dimension": 1024,
         "matches": 1,
+        "candidates": 1,
         "evidence_id": 1,
         "evidence_kind": "embedding",
     }
@@ -2305,6 +2603,7 @@ def test_qdrant_acceptance_checks_enabled_health_and_read_only_search(
         "embedding_dimension_match": True,
         "qdrant_collection_healthy": True,
         "read_only_search": True,
+        "source_hash_validated": True,
     }
     assert "not-output" not in json.dumps(item)
 
@@ -2317,8 +2616,20 @@ def test_qdrant_acceptance_fails_if_live_evidence_cannot_be_persisted(
     cfg, store, orchestrator, _root = harness_context
     cfg.data["memory"]["qdrant"]["enabled"] = True
     monkeypatch.setattr(cli, "build", lambda: (cfg, store, orchestrator))
-    monkeypatch.setattr(orchestrator.qdrant, "health_report", lambda: {"healthy": True})
-    monkeypatch.setattr(orchestrator.qdrant, "search", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        orchestrator.qdrant,
+        "health_report",
+        lambda: {"healthy": True, "dimension": 1024},
+    )
+    orchestrator.context.memory.write("acceptance", "current source")
+    source_hash = orchestrator.memory_service.digest("current source")
+    monkeypatch.setattr(
+        orchestrator.qdrant,
+        "search",
+        lambda *_args, **_kwargs: [
+            {"payload": {"source": "acceptance", "source_hash": source_hash}}
+        ],
+    )
     monkeypatch.setattr(cli, "source_tree_sha256", lambda _root: "a" * 64)
 
     from harness.evidence import EvidenceRepository
@@ -2338,6 +2649,59 @@ def test_qdrant_acceptance_fails_if_live_evidence_cannot_be_persisted(
         "stage": "evidence_persist",
         "error_type": "OperationalError",
     }
+
+
+def test_qdrant_acceptance_does_not_record_evidence_without_current_source(
+    harness_context, monkeypatch, capsys
+):
+    cfg, store, orchestrator, _root = harness_context
+    cfg.data["memory"]["qdrant"]["enabled"] = True
+    monkeypatch.setattr(
+        orchestrator.qdrant,
+        "health_report",
+        lambda: {"healthy": True, "dimension": 1024},
+    )
+    monkeypatch.setattr(
+        orchestrator.qdrant,
+        "search",
+        lambda *_args, **_kwargs: [
+            {"payload": {"source": "missing", "source_hash": "stale"}}
+        ],
+    )
+    with pytest.raises(cli.typer.Exit) as error:
+        cli.qdrant_acceptance(confirm=True)
+    assert error.value.exit_code == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "healthy": False,
+        "stage": "source_validation",
+        "errors": ["no_current_source_match"],
+        "candidates": 1,
+    }
+    from harness.evidence import EvidenceRepository
+
+    assert EvidenceRepository(store.database).list(kind="embedding") == []
+
+
+def test_qdrant_acceptance_rejects_embedding_contract_drift_before_search(
+    harness_context, monkeypatch, capsys
+):
+    cfg, _store, orchestrator, _root = harness_context
+    cfg.data["memory"]["qdrant"]["enabled"] = True
+    monkeypatch.setattr(orchestrator.qdrant.embedder, "model", "wrong-model")
+    monkeypatch.setattr(
+        orchestrator.qdrant,
+        "health_report",
+        lambda: {"healthy": True, "dimension": orchestrator.qdrant.dimension},
+    )
+    monkeypatch.setattr(
+        orchestrator.qdrant,
+        "search",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("searched")),
+    )
+    with pytest.raises(cli.typer.Exit) as error:
+        cli.qdrant_acceptance(confirm=True)
+    assert error.value.exit_code == 1
+    assert json.loads(capsys.readouterr().out)["stage"] == "embedding_contract"
 
 
 def test_qdrant_acceptance_fails_closed_when_service_is_disabled_or_unhealthy(
@@ -2370,7 +2734,11 @@ def test_qdrant_acceptance_redacts_errors_and_rejects_invalid_results(
     cfg, store, orchestrator, _root = harness_context
     cfg.data["memory"]["qdrant"]["enabled"] = True
     monkeypatch.setattr(cli, "build", lambda: (cfg, store, orchestrator))
-    monkeypatch.setattr(orchestrator.qdrant, "health_report", lambda: {"healthy": True})
+    monkeypatch.setattr(
+        orchestrator.qdrant,
+        "health_report",
+        lambda: {"healthy": True, "dimension": 1024},
+    )
     if isinstance(search_result, Exception):
 
         def fail_search(*_args, **_kwargs):

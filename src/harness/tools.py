@@ -8,6 +8,7 @@ import shlex
 import socket
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import uuid
 from collections.abc import Callable
@@ -794,7 +795,7 @@ class ToolRegistry:
                     allow_delete=settings.allow_delete,
                 )
             elif settings.builtin == "obsidian":
-                command = builtin_obsidian_command(vault)
+                command = builtin_obsidian_command(vault, self.workspace)
             elif settings.builtin == "apple_shell":
                 if sys.platform != "darwin":
                     raise ValueError("Apple Shell MCP requires macOS")
@@ -819,6 +820,12 @@ class ToolRegistry:
                     self.workspace,
                     timeout=settings.timeout,
                     read_roots=read_roots,
+                    python_import_roots=(
+                        Path(__file__).resolve().parents[1],
+                        Path(sysconfig.get_paths()["purelib"]),
+                    )
+                    if settings.builtin
+                    else (),
                     executable_paths=(
                         tuple(APPLE_SHELL_EXECUTABLES.values())
                         if settings.builtin == "apple_shell"

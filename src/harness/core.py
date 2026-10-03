@@ -75,6 +75,7 @@ CONFIG_DEFAULTS = {
     "git": {"enabled": False, "main": "main", "dev": "dev", "remote": None},
     "memory": {
         "obsidian": {"enabled": True},
+        "context": {"max_bytes": 65536},
         "qdrant": {
             "enabled": False,
             "url": "http://127.0.0.1:6333",
@@ -966,6 +967,16 @@ class Orchestrator:
             notes,
             self.tools,
             self.memory_service if qdrant.get("enabled", False) else None,
+            max_bytes=self.config.data.get("memory", {})
+            .get("context", {})
+            .get("max_bytes", 65536),
+        )
+        from .services import VaultKnowledgeApplicationService
+
+        self.knowledge_operations = VaultKnowledgeApplicationService(
+            self.config.path("obsidian_vault"),
+            workspace,
+            sanitizer=self.store.audit.sanitize,
         )
 
     def _tool_event(self, kind, payload):
@@ -1091,6 +1102,7 @@ class Orchestrator:
                 )
             transition(Status.ANALYZING)
             task = self.store.get(task_id)
+            from .claim_evidence import RoutedClaimVerifier
             from .requirements import RequirementCompleter
 
             task, context = await asyncio.to_thread(
@@ -1098,9 +1110,19 @@ class Orchestrator:
                 task,
                 "requirements",
                 self.requirements_profile,
-                RequirementCompleter(self.store, self.router).complete,
+                RequirementCompleter(
+                    self.store,
+                    self.router,
+                    claim_verifier=RoutedClaimVerifier(
+                        self.router,
+                        author_profile=self.requirements_profile,
+                        verifier_profile=self.validator_profile,
+                    ),
+                ).complete,
                 task,
-                lambda: self.context.build(task, str(self.config.path("workspace"))),
+                lambda: self.context.build_evidence(
+                    task, str(self.config.path("workspace"))
+                ),
             )
             missing = [
                 name
@@ -1114,6 +1136,15 @@ class Orchestrator:
                 if not getattr(task, name)
             ]
             if missing:
+                pending_conflict_decision = any(
+                    item["status"] == "open"
+                    and item.get("required")
+                    and item.get("purpose") == "decision"
+                    and item.get("reason", "").startswith("requirements:conflict:")
+                    for item in self.store.list_questions(task_id)
+                )
+                if pending_conflict_decision:
+                    return self.store.get(task_id)
                 self.store.ask(
                     task_id,
                     "Bitte ergänze die fehlenden Taskfelder: " + ", ".join(missing),

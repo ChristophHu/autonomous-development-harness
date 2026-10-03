@@ -13,6 +13,63 @@ from .http_control import request
 EMBEDDING_DIMENSION_DEFAULT = 1024
 EMBEDDING_BATCH_SIZE_DEFAULT = 32
 EMBEDDING_BATCH_SIZE_MAX = 256
+CONTEXT_CLAIM_FIELDS = {
+    "goal",
+    "requirements",
+    "acceptance_criteria",
+    "test_commands",
+    "coverage_command",
+}
+CONTEXT_CLAIMS_MAX = 32
+CONTEXT_CLAIM_BYTES_MAX = 4096
+CONTEXT_CLAIMS_BYTES_MAX = 8192
+CONTEXT_EVIDENCE_FIELDS = (
+    "fragments",
+    "omitted_sources",
+    "truncated_sources",
+    "rejected_sources",
+    "conflicts",
+    "claims",
+    "claim_issues",
+    "budget_bytes",
+)
+
+
+def context_evidence_envelope(context):
+    """Return the exact context evidence object serialized to requirement agents."""
+    envelope = {}
+    for name in CONTEXT_EVIDENCE_FIELDS:
+        if name not in context:
+            continue
+        if name == "fragments":
+            keys = (
+                "kind",
+                "ref",
+                "text",
+                "required",
+                "truncated",
+                "review_state",
+                "provenance",
+            )
+            envelope[name] = [
+                {key: fragment[key] for key in keys if key in fragment}
+                for fragment in context[name]
+                if isinstance(fragment, dict)
+            ]
+        else:
+            envelope[name] = context[name]
+    return envelope
+
+
+def context_evidence_size(context):
+    encoded = json.dumps(
+        context_evidence_envelope(context),
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        default=str,
+    )
+    return len(encoded.encode("utf-8"))
 
 
 def validate_vector(vector, dimension=None):
@@ -97,37 +154,293 @@ class ObsidianMemory:
 
 
 class ContextBuilder:
-    def __init__(self, memory: ObsidianMemory, tools, qdrant=None):
+    def __init__(self, memory: ObsidianMemory, tools, qdrant=None, max_bytes=65536):
+        if (
+            isinstance(max_bytes, bool)
+            or not isinstance(max_bytes, int)
+            or max_bytes < 1
+        ):
+            raise ValueError("context max_bytes must be a positive integer")
         self.memory = memory
         self.tools = tools
         self.qdrant = qdrant
+        self.max_bytes = max_bytes
 
     def build(self, task, workspace: str):
-        fragments = [
-            f"Task: {task.title}",
-            f"Description: {task.description}",
-            f"Workspace: {workspace}",
-            f"Memory: {self.memory.read('decisions') or 'none'}",
-        ]
-        fragments.extend(
-            f"Obsidian match: {path}\n{Path(path).read_text()[:16000]}"
-            for path in self.memory.search(task.title)[:5]
+        return self.build_evidence(task, workspace)["text"]
+
+    @staticmethod
+    def _selection_priority(fragment):
+        kind = fragment["kind"]
+        if kind == "decision_memory":
+            return 0 if "Memory: none" not in fragment["text"] else 8
+        if kind == "vault":
+            if fragment.get("review_state") == "current":
+                return (
+                    1
+                    if fragment.get("provenance", {}).get("source_state") == "current"
+                    else 2
+                )
+            return 6
+        return {
+            "repository_symbol": 3,
+            "qdrant": 4,
+            "repository": 5,
+            "qdrant_status": 9,
+        }.get(kind, 7)
+
+    @classmethod
+    def _ordered_fragments(cls, fragments, task):
+        terms = set(
+            re.findall(r"\w{2,}", f"{task.title} {task.description}".casefold())
         )
+
+        def key(fragment):
+            content = fragment["text"].casefold()
+            relevance = sum(content.count(term) for term in terms)
+            return cls._selection_priority(fragment), -relevance, fragment["ref"]
+
+        return [fragment for fragment in fragments if fragment["required"]] + sorted(
+            (fragment for fragment in fragments if not fragment["required"]), key=key
+        )
+
+    def build_evidence(self, task, workspace: str):
+        fragments = [
+            {
+                "kind": "task",
+                "ref": "context:task/title",
+                "text": f"Task: {task.title}",
+                "required": True,
+            },
+            {
+                "kind": "task",
+                "ref": "context:task/description",
+                "text": f"Description: {task.description}",
+                "required": True,
+            },
+            {
+                "kind": "task",
+                "ref": "context:task/workspace",
+                "text": f"Workspace: {workspace}",
+                "required": True,
+            },
+        ]
+        decisions = self.memory.read("decisions")
+        fragments.append(
+            {
+                "kind": "decision_memory",
+                "ref": "context:vault/decisions.md",
+                "text": f"Memory decisions:\n{decisions}"
+                if decisions
+                else "Memory: none",
+                "required": False,
+            }
+        )
+        if task.title.strip() and self.memory.vault.is_dir():
+            from .vault_knowledge import VaultKnowledgeService
+
+            service = VaultKnowledgeService(self.memory.vault, source_root=workspace)
+            rejected_sources = []
+            for match in service.search(task.title, limit=5, context_chars=1000):
+                source_state = match["provenance"]["source_state"]
+                if source_state not in {"current", "unverified"} or match[
+                    "review_state"
+                ] in {"stale", "future", "invalid"}:
+                    rejected_sources.append(
+                        {
+                            "ref": match["source_ref"],
+                            "status": source_state
+                            if source_state not in {"current", "unverified"}
+                            else match["review_state"],
+                        }
+                    )
+                    continue
+                fragments.append(
+                    {
+                        "kind": "vault",
+                        "ref": match["source_ref"],
+                        "text": f"Obsidian match: {match['path']}\n{match['excerpt']}",
+                        "required": False,
+                        "review_state": match["review_state"],
+                        "provenance": match["provenance"],
+                        "claims": match["claims"],
+                    }
+                )
+        else:
+            rejected_sources = []
         if self.qdrant:
             try:
-                fragments.extend(
-                    f"Related memory: {point.get('payload', {}).get('text', '')}"
-                    for point in self.qdrant.search(task.title, limit=3)
-                )
+                for point in self.qdrant.search(task.title, limit=3):
+                    payload = point.get("payload", {})
+                    point_id = str(point.get("id", len(fragments)))
+                    fragments.append(
+                        {
+                            "kind": "qdrant",
+                            "ref": f"context:qdrant/{point_id}",
+                            "text": str(payload.get("text", "")),
+                            "required": False,
+                            "claims": payload.get("claims", {}),
+                        }
+                    )
             except httpx.HTTPError:
-                fragments.append("Related memory: Qdrant unavailable")
+                fragments.append(
+                    {
+                        "kind": "qdrant_status",
+                        "ref": "context:qdrant/unavailable",
+                        "text": "Related memory: Qdrant unavailable",
+                        "required": False,
+                    }
+                )
+        workspace_root = Path(workspace).resolve()
         for name in ("README.md", "pyproject.toml", "package.json"):
-            path = Path(workspace) / name
-            if path.is_file() and path.resolve().is_relative_to(
-                Path(workspace).resolve()
+            path = workspace_root / name
+            if path.is_file() and path.resolve().is_relative_to(workspace_root):
+                fragments.append(
+                    {
+                        "kind": "repository",
+                        "ref": f"context:repository/{name}",
+                        "text": path.read_text()[:16000],
+                        "required": False,
+                    }
+                )
+        repository_query = f"{task.title} {task.description}"
+        if (
+            re.search(r"[A-Za-z_][A-Za-z0-9_]{1,63}", repository_query)
+            and (workspace_root / "src").is_dir()
+        ):
+            from .repository_context import RepositoryContextService
+
+            for match in RepositoryContextService(workspace_root).search(
+                repository_query, limit=5
             ):
-                fragments.append(f"Repository {name}:\n{path.read_text()[:16000]}")
-        return "\n".join(fragments)
+                fragments.append(
+                    {
+                        "kind": match["kind"],
+                        "ref": match["ref"],
+                        "text": (
+                            f"{match['path']}:{match['line_start']}-"
+                            f"{match['line_end']} ({match['symbol']})\n{match['text']}\n"
+                            f"Related tests: {', '.join(match['test_paths']) or 'none found'}"
+                        ),
+                        "required": False,
+                        "provenance": match["provenance"],
+                    }
+                )
+
+        fragments = self._ordered_fragments(fragments, task)
+        rendered = []
+        included = []
+        omitted = []
+        truncated = []
+        used = 0
+        for fragment in fragments:
+            prefix = f"[{fragment['ref']}]\n"
+            separator = "\n" if rendered else ""
+            available = (
+                self.max_bytes - used - len((separator + prefix).encode("utf-8"))
+            )
+            content = fragment["text"]
+            if available < 0 or (available == 0 and content):
+                if fragment["required"]:
+                    raise ValueError("required context exceeds configured byte budget")
+                omitted.append(fragment["ref"])
+                continue
+            if len(content.encode("utf-8")) > available:
+                if fragment["required"]:
+                    raise ValueError("required context exceeds configured byte budget")
+                omitted.append(fragment["ref"])
+                continue
+            rendered.append(prefix + content)
+            used += len((separator + prefix + content).encode("utf-8"))
+            included.append({**fragment, "truncated": False})
+
+        while True:
+            claims = {}
+            claim_issues = {}
+            claim_count = 0
+            claim_bytes = 0
+            for fragment in included:
+                values = fragment.get("claims", {})
+                if not isinstance(values, dict):
+                    continue
+                for name, value in values.items():
+                    if name not in CONTEXT_CLAIM_FIELDS:
+                        continue
+                    try:
+                        encoded = json.dumps(value, sort_keys=True, allow_nan=False)
+                    except (TypeError, ValueError):
+                        claim_issues.setdefault(name, []).append(
+                            "claim is not valid JSON"
+                        )
+                        continue
+                    encoded_size = len(encoded.encode("utf-8"))
+                    if encoded_size > CONTEXT_CLAIM_BYTES_MAX:
+                        claim_issues.setdefault(name, []).append(
+                            "claim exceeds the evidence size limit"
+                        )
+                        continue
+                    if claim_count >= CONTEXT_CLAIMS_MAX:
+                        claim_issues.setdefault(name, []).append(
+                            "context claim count exceeds the evidence limit"
+                        )
+                        continue
+                    if claim_bytes + encoded_size > CONTEXT_CLAIMS_BYTES_MAX:
+                        claim_issues.setdefault(name, []).append(
+                            "total context claim payload exceeds the evidence limit"
+                        )
+                        continue
+                    claims.setdefault(name, []).append(
+                        {"ref": fragment["ref"], "value": value}
+                    )
+                    claim_count += 1
+                    claim_bytes += encoded_size
+            conflicts = {}
+            for name, entries in claims.items():
+                distinct = {
+                    json.dumps(item["value"], sort_keys=True, default=str)
+                    for item in entries
+                }
+                if len(distinct) > 1:
+                    conflicts[name] = {
+                        "sources": entries,
+                        "values": [item["value"] for item in entries],
+                    }
+            text = "\n".join(f"[{item['ref']}]\n{item['text']}" for item in included)
+            result = {
+                "text": text,
+                "fragments": included,
+                "omitted_sources": list(dict.fromkeys(omitted)),
+                "truncated_sources": truncated,
+                "rejected_sources": rejected_sources,
+                "conflicts": conflicts,
+                "claims": claims,
+                "claim_issues": claim_issues,
+                "budget_bytes": self.max_bytes,
+                "used_bytes": 0,
+            }
+            result["used_bytes"] = context_evidence_size(result)
+            if result["used_bytes"] <= self.max_bytes:
+                return result
+            optional_indices = [
+                index
+                for index, fragment in enumerate(included)
+                if not fragment["required"]
+            ]
+            if not optional_indices:
+                raise ValueError(
+                    "required context evidence exceeds configured byte budget"
+                )
+            optional_index = max(
+                optional_indices,
+                key=lambda index: (
+                    self._selection_priority(included[index]),
+                    len(included[index]["text"].encode("utf-8")),
+                    included[index]["ref"],
+                ),
+            )
+            removed = included.pop(optional_index)
+            omitted.append(removed["ref"])
+            truncated = [ref for ref in truncated if ref != removed["ref"]]
 
 
 class QdrantMemory:

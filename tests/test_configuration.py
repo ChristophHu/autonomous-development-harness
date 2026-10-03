@@ -252,6 +252,79 @@ def test_model_fallback_policy_is_bounded_and_validated():
         )
 
 
+def test_model_input_token_budget_accepts_one_explicit_local_tokenizer():
+    settings = HarnessConfig.model_validate(
+        {
+            "models": {
+                "input_token_budgets": {
+                    "model-id": {
+                        "encoding": "cl100k_base",
+                        "max_input_tokens": 12000,
+                        "framing_tokens": 256,
+                    }
+                }
+            }
+        }
+    )
+    assert settings.models.input_token_budgets["model-id"].max_input_tokens == 12000
+    assert settings.models.input_token_budgets["model-id"].framing_tokens == 256
+    assert settings.models.input_token_budgets["model-id"].safety_margin_percent == 20
+    approximate = HarnessConfig.model_validate(
+        {
+            "models": {
+                "input_token_budgets": {
+                    "approx": {
+                        "characters_per_token": 3.5,
+                        "max_input_tokens": 4000,
+                        "safety_margin_percent": 30,
+                    }
+                }
+            }
+        }
+    )
+    assert approximate.models.input_token_budgets["approx"].characters_per_token == 3.5
+    assert approximate.models.input_token_budgets["approx"].safety_margin_percent == 30
+    local = HarnessConfig.model_validate(
+        {
+            "models": {
+                "input_token_budgets": {
+                    "local-model": {
+                        "tokenizer_file": "/models/local/tokenizer.json",
+                        "max_input_tokens": 8000,
+                    }
+                }
+            }
+        }
+    )
+    assert local.models.input_token_budgets["local-model"].tokenizer_file.endswith(
+        "tokenizer.json"
+    )
+
+
+@pytest.mark.parametrize(
+    "budget",
+    [
+        {"max_input_tokens": 10},
+        {"encoding": "x", "tokenizer_file": "local.json", "max_input_tokens": 10},
+        {"encoding": "x", "max_input_tokens": 0},
+        {"encoding": "x", "max_input_tokens": 10, "framing_tokens": -1},
+        {"tokenizer_file": "bad\x00path", "max_input_tokens": 10},
+        {"characters_per_token": 0, "max_input_tokens": 10},
+        {"characters_per_token": 4, "encoding": "x", "max_input_tokens": 10},
+        {
+            "characters_per_token": 4,
+            "max_input_tokens": 10,
+            "safety_margin_percent": 101,
+        },
+    ],
+)
+def test_model_input_token_budget_rejects_incomplete_or_unsafe_settings(budget):
+    with pytest.raises(ValidationError):
+        HarnessConfig.model_validate(
+            {"models": {"input_token_budgets": {"model-id": budget}}}
+        )
+
+
 @pytest.mark.parametrize(
     "strategy",
     [
@@ -706,6 +779,11 @@ def test_configuration_service_reload_is_atomic_and_refreshes_sources(
             {"memory": {"embeddings": {"batch_size": 257}}},
             "memory.embeddings.batch_size",
         ),
+        ({"memory": {"context": {"max_bytes": 255}}}, "memory.context.max_bytes"),
+        (
+            {"memory": {"context": {"max_bytes": 1048577}}},
+            "memory.context.max_bytes",
+        ),
         (
             {"testing": {"coverage": {"branches": 101}}},
             "testing.coverage.branches",
@@ -721,3 +799,13 @@ def test_typed_config_rejects_invalid_known_fields(payload, path):
         HarnessConfig.model_validate(payload)
 
     assert path in str(error.value)
+
+
+def test_memory_context_budget_is_typed_and_defaulted():
+    assert HarnessConfig.model_validate({}).memory.context.max_bytes == 65536
+    assert (
+        HarnessConfig.model_validate(
+            {"memory": {"context": {"max_bytes": 2048}}}
+        ).memory.context.max_bytes
+        == 2048
+    )

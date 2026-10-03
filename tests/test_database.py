@@ -1180,6 +1180,43 @@ def test_question_purpose_rejects_unknown_value_without_persisting(tmp_path):
     assert questions.list(task_id) == []
 
 
+def test_supersede_obsolete_conflict_questions_is_audited_and_not_answerable(tmp_path):
+    db = Database(tmp_path / "question-supersede.sqlite")
+    task_id = TaskRepository(db).create("conflict refresh")
+    questions = QuestionRepository(db)
+    obsolete = questions.ask(
+        task_id,
+        "Choose old evidence",
+        "requirements:conflict:goal:oldhash",
+        purpose="decision",
+    )
+    retained = questions.ask(
+        task_id,
+        "Choose current evidence",
+        "requirements:conflict:goal:newhash",
+        purpose="decision",
+    )
+    unrelated = questions.ask(task_id, "Provide input", "requirements:incomplete")
+
+    assert questions.supersede_conflict_questions(
+        task_id, {"requirements:conflict:goal:newhash"}
+    ) == [obsolete]
+    assert questions.get(obsolete)["status"] == "superseded"
+    assert questions.get(retained)["status"] == "open"
+    assert questions.get(unrelated)["status"] == "open"
+    assert not questions.answer(obsolete, "{}", task_id)
+    with db.connect() as connection:
+        event = connection.execute(
+            "SELECT kind,payload FROM events WHERE task_id=? ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+    assert event["kind"] == EventKind.QUESTION_SUPERSEDED.value
+    assert json.loads(event["payload"]) == {
+        "question_id": obsolete,
+        "reason_kind": "requirements:conflict",
+    }
+
+
 def test_answering_one_of_multiple_purposes_keeps_remaining_state(tmp_path):
     db = Database(tmp_path / "question-purpose-multiple.sqlite")
     tasks = TaskRepository(db)

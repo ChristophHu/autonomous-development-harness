@@ -6,7 +6,7 @@ import pytest
 import yaml
 
 from harness.memory_projection import DecisionProjection
-from harness.vault_audit import audit_vault
+from harness.vault_audit import DEFAULT_REQUIRED_NOTES, audit_vault
 
 
 def note(path, body, *, reviewed=None):
@@ -18,27 +18,15 @@ def note(path, body, *, reviewed=None):
 
 def test_audit_accepts_required_notes_and_resolves_wikilinks(tmp_path):
     vault = tmp_path / "vault"
-    required = (
-        "Willkommen.md",
-        "Vault-Übersicht.md",
-        "rules/Harness-Prinzipien.md",
-        "architecture/Systemarchitektur.md",
-        "architecture/Vault und Memory.md",
-        "architecture/Modelle und Routing.md",
-        "architecture/Git und Isolation.md",
-        "operations/Lokaler Betrieb.md",
-        "decisions/Entscheidungsregister.md",
-        "agents/Agentenprofile.md",
-        "tasks/Task-Register.md",
-    )
+    required = DEFAULT_REQUIRED_NOTES
     for path in required:
         note(vault / path, "# Root knowledge\n\nSiehe [[Harness-Prinzipien]].")
     report = audit_vault(vault)
     assert report == {
         "vault": str(vault.resolve()),
         "exists": True,
-        "markdown_notes": 11,
-        "audited_notes": 11,
+        "markdown_notes": len(required),
+        "audited_notes": len(required),
         "note_hashes": {
             path: hashlib.sha256(
                 (vault / path).read_text(encoding="utf-8").encode("utf-8")
@@ -102,6 +90,34 @@ def test_audit_reports_future_review_dates(tmp_path):
     note(vault / "Future.md", "# Future", reviewed="2026-01-02")
     report = audit_vault(vault, required_notes=(), today=date(2026, 1, 1))
     assert [item["code"] for item in report["findings"]] == ["review_future"]
+
+
+def test_audit_and_knowledge_share_legacy_review_policy(tmp_path):
+    from harness.vault_knowledge import VaultKnowledgeService
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "Legacy.md").write_text(
+        "---\nreviewed_on: 2026-10-02\n---\n# Legacy\nVault review",
+        encoding="utf-8",
+    )
+    report = audit_vault(
+        vault, required_notes=(), today=date(2026, 10, 3), max_review_age_days=180
+    )
+    match = VaultKnowledgeService(vault, today=date(2026, 10, 3)).search("review")[0]
+    assert report["findings"] == []
+    assert match["review_state"] == "current"
+
+
+def test_audit_accepts_yaml_timestamp_review_date(tmp_path):
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "Timestamp.md").write_text(
+        "---\nlast_reviewed: 2026-10-02T12:30:00Z\n---\n# Timestamp",
+        encoding="utf-8",
+    )
+    report = audit_vault(vault, required_notes=(), today=date(2026, 10, 3))
+    assert report["findings"] == []
 
 
 def test_audit_reports_frontmatter_without_review_date(tmp_path):

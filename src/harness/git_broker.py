@@ -887,6 +887,7 @@ class SshTransport:
                 network_proxy=proxy_port,
                 unix_sockets=(self.agent_socket,),
                 git_shell=True,
+                read_roots=(config.parent,),
             )
             env = {
                 **self.env,
@@ -1235,6 +1236,7 @@ class HttpsTransport:
                 git=True,
                 network_proxy=proxy_port,
                 git_helpers=(self.helper,),
+                read_roots=(Path(self.ca_bundle),) if self.ca_bundle else (),
             )
             env = {
                 **self.env,

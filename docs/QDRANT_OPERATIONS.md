@@ -8,11 +8,16 @@ be copied into a command transcript.
 ## Read-only checks
 
 - `harness memory qdrant-status` checks HTTP health and the configured collection's
-  status, vector dimension, distance metric, and point counts.
+  status, vector dimension, distance metric, and point counts. It does not start
+  the MCP registry.
 - `harness memory qdrant-acceptance --confirm` additionally sends one generic
-  embedding query and performs a Qdrant search. It does not create, update, or
-  delete points. The explicit flag is required because the embedding call may
-  use a metered provider.
+  embedding query and performs a Qdrant search after checking the configured
+  model ID and vector dimensions. The report distinguishes raw candidates from
+  hits backed by a current Vault source hash; stale or missing source documents
+  do not count as matches. At least one current source is required before the
+  command stores successful embedding evidence. It does not create, update, or delete points. The
+  explicit flag is required because the embedding call may use a metered provider.
+  This command also works without starting MCP servers.
 - `harness doctor` reports the same service and collection health as a startup
   diagnostic; it does not repair the service.
 - `harness memory qdrant-config-audit PATH --config PATH` statically reviews an

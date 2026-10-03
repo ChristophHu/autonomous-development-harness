@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "cases": [
+    {"id": "exact-text", "claim": "alpha beta", "source": "Required: alpha beta.", "supported": true},
+    {"id": "case-fold", "claim": "ALPHA", "source": "alpha is enabled", "supported": true},
+    {"id": "exact-number", "claim": 12, "source": "retries: 12", "supported": true},
+    {"id": "number-prefix", "claim": 12, "source": "retries: 120", "supported": false},
+    {"id": "partial-word", "claim": "auth", "source": "authorization is required", "supported": false},
+    {"id": "unquoted-paraphrase", "claim": "must retry", "source": "retries are mandatory", "supported": false},
+    {"id": "incomplete-list", "claim": ["alpha", "gamma"], "source": "alpha beta", "supported": false},
+    {"id": "negation-mismatch", "claim": true, "source": "enabled=false", "supported": false}
+  ]
+}

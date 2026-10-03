@@ -100,10 +100,15 @@ class EmbeddingSettings(ExtensibleSettings):
     timeout: TimeoutValue = 30
 
 
+class MemoryContextSettings(ExtensibleSettings):
+    max_bytes: StrictInt = Field(default=65536, ge=256, le=1048576)
+
+
 class MemorySettings(ExtensibleSettings):
     obsidian: ObsidianSettings = Field(default_factory=ObsidianSettings)
     qdrant: QdrantSettings = Field(default_factory=QdrantSettings)
     embeddings: EmbeddingSettings = Field(default_factory=EmbeddingSettings)
+    context: MemoryContextSettings = Field(default_factory=MemoryContextSettings)
     monitoring: MemoryMonitoringSettings = Field(
         default_factory=MemoryMonitoringSettings
     )
@@ -165,6 +170,35 @@ class ModelRate(BaseModel):
     output: Annotated[Number, Field(ge=0)]
 
 
+class ModelInputTokenBudget(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    encoding: Annotated[StrictStr, Field(min_length=1)] | None = None
+    tokenizer_file: Annotated[StrictStr, Field(min_length=1)] | None = None
+    characters_per_token: Number | None = Field(default=None, gt=0)
+    max_input_tokens: StrictInt = Field(ge=1)
+    framing_tokens: StrictInt = Field(default=0, ge=0)
+    safety_margin_percent: StrictInt = Field(default=20, ge=0, le=100)
+
+    @model_validator(mode="after")
+    def exactly_one_tokenizer(self):
+        configured_methods = sum(
+            value is not None
+            for value in (
+                self.encoding,
+                self.tokenizer_file,
+                self.characters_per_token,
+            )
+        )
+        if configured_methods != 1:
+            raise ValueError(
+                "configure exactly one tokenizer encoding, tokenizer_file, or characters_per_token"
+            )
+        if self.tokenizer_file is not None and "\x00" in self.tokenizer_file:
+            raise ValueError("tokenizer_file contains an invalid path")
+        return self
+
+
 class ModelRoutingSettings(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
@@ -199,6 +233,9 @@ class ModelSettings(ExtensibleSettings):
     providers: dict[StrictStr, ProviderSettings] = Field(default_factory=dict)
     registry: dict[StrictStr, ModelDefinition] = Field(default_factory=dict)
     rates: dict[StrictStr, ModelRate] = Field(default_factory=dict)
+    input_token_budgets: dict[StrictStr, ModelInputTokenBudget] = Field(
+        default_factory=dict
+    )
     strategies: dict[StrictStr, ModelStrategy] = Field(default_factory=dict)
     routing: ModelRoutingSettings = Field(default_factory=ModelRoutingSettings)
 

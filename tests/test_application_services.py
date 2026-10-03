@@ -196,6 +196,52 @@ def test_model_inventory_can_run_without_persistence(tmp_path):
     assert result[0]["models"][0]["id"] == "model-a"
 
 
+def test_model_operations_test_returns_only_safe_success_or_failure():
+    from types import SimpleNamespace
+
+    from harness.services import ModelOperationsService
+
+    registry = SimpleNamespace(
+        resolve=lambda name: (SimpleNamespace(complete=lambda *_a, **_k: "OK"), "id")
+    )
+    service = ModelOperationsService(registry)
+    assert service.test_model("local") == {"model": "local", "status": "successful"}
+
+    registry.resolve = lambda _name: (_ for _ in ()).throw(
+        RuntimeError("secret provider response")
+    )
+    assert service.test_model("local") == {
+        "model": "local",
+        "status": "failed",
+        "error_type": "RuntimeError",
+    }
+
+
+def test_task_knowledge_search_is_task_scoped_redacted_and_read_only(tmp_path):
+    store, orchestrator, task = ready_runtime(tmp_path)
+    created = store.create(task)
+    store.audit.secrets["fixture"] = "PRIVATE-CANARY"
+    vault = orchestrator.context.memory.vault
+    vault.mkdir(parents=True)
+    (vault / "Guide.md").write_text(
+        "---\ntype: architecture\nreviewed_on: 2026-10-03\n---\n"
+        "# Architecture\nThe fixture stores PRIVATE-CANARY safely.\n",
+        encoding="utf-8",
+    )
+
+    result = orchestrator.service.knowledge_search(created.id, "fixture")
+    assert result["task_id"] == created.id
+    assert result["hits"][0]["source_ref"] == "context:vault/Guide.md#Architecture"
+    assert "PRIVATE-CANARY" not in result["hits"][0]["excerpt"]
+    assert result["hits"][0]["provenance"]["review_state"] == "current"
+    assert (vault / "Guide.md").read_text(encoding="utf-8").find("PRIVATE-CANARY") >= 0
+
+    with pytest.raises(ValueError, match="task not found"):
+        orchestrator.service.knowledge_search(999999, "fixture")
+    with pytest.raises(ValueError, match="limit"):
+        orchestrator.service.knowledge_search(created.id, "fixture", limit=21)
+
+
 @pytest.mark.parametrize(
     "method,args",
     [

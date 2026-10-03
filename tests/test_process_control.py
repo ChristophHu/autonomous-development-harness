@@ -227,6 +227,7 @@ def test_supervised_popen_registers_and_releases_process():
     ):
         assert process in control._processes
         assert process.wait(timeout=2) == 0
+        process.stdout.close()
     assert not control._processes
 
 
@@ -238,6 +239,7 @@ def test_supervised_popen_without_task_runs_normally():
         text=True,
     ) as process:
         assert process.wait(timeout=2) == 0
+        process.stdout.close()
 
 
 def test_task_abort_kills_process_tree_and_returns_cancelled_task(tmp_path):

@@ -47,7 +47,12 @@ def bind_agent_socket():
     temporary = tempfile.TemporaryDirectory(prefix="ha-", dir="/tmp")
     socket_path = Path(temporary.name) / "agent.sock"
     server = socket.socket(socket.AF_UNIX)
-    server.bind(str(socket_path))
+    try:
+        server.bind(str(socket_path))
+    except BaseException:
+        server.close()
+        temporary.cleanup()
+        raise
     return temporary, server, socket_path
 
 
@@ -345,6 +350,7 @@ def test_ssh_sandbox_allows_only_pinned_host_and_selected_agent_socket(
     )
     assert "(allow system-socket (socket-domain AF_UNIX))" in profile
     assert "(allow network-outbound)" not in profile
+    assert '(allow file-read* (literal "/private/var/select/sh"))' in profile
 
 
 def test_ssh_sandbox_rejects_invalid_remote_and_missing_agent_socket(
@@ -772,6 +778,49 @@ def test_ssh_transport_run_builds_bounded_git_invocations(
         agent_temp.cleanup()
 
 
+def test_ssh_transport_grants_only_generated_ssh_directory_read_access(
+    tmp_path, monkeypatch
+):
+    transport = SshTransport(
+        ("clone", "ssh://git@git.example.com/team/repo.git", "copy"),
+        tmp_path,
+        "ssh://git@git.example.com/team/repo.git",
+        1,
+        {},
+        "git.example.com",
+        22,
+        "8.8.8.8",
+        (("ssh-ed25519", "host-key"),),
+        ("ssh-ed25519", "identity-key"),
+        str(tmp_path / "agent.sock"),
+        (7, 11),
+        Path("/usr/bin/ssh"),
+    )
+    original_lstat = os.lstat
+
+    def lstat(path, *args, **kwargs):
+        if str(path) == transport.agent_socket:
+            return SimpleNamespace(st_dev=7, st_ino=11)
+        return original_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr("harness.git_broker.os.lstat", lstat)
+    monkeypatch.setattr("harness.git_broker.ssh_proxy", lambda *_: nullcontext(43210))
+    monkeypatch.setattr("harness.git_broker.stop_group", lambda _process: None)
+    captured = {}
+
+    def isolated(command, *_args, **kwargs):
+        captured.update(kwargs)
+        return command
+
+    monkeypatch.setattr("harness.git_broker.isolated_command", isolated)
+    _mock_ssh_process(monkeypatch)
+    transport.run()
+    (ssh_root,) = captured["read_roots"]
+    assert ssh_root.name == ".ssh"
+    assert ssh_root.parent.name.startswith("harness-ssh-")
+    assert ssh_root.parent.parent == Path("/private/tmp")
+
+
 def test_ssh_transport_pull_merges_only_after_success(tmp_path, monkeypatch):
     transport, _repo, agent, agent_temp = _prepared_transport(
         tmp_path, monkeypatch, ("pull", "--ff-only", "origin", "main")
@@ -859,8 +908,6 @@ def test_ssh_transport_e2e_pinned_clone_and_approved_push(tmp_path, monkeypatch)
     )
     native(git, remote, "symbolic-ref", "HEAD", "refs/heads/main")
     native(git, repo, "push", str(remote), "main")
-    short_temp = tempfile.TemporaryDirectory(prefix="ha-", dir="/tmp")
-    agent_socket = Path(short_temp.name) / "agent.sock"
     client_key = tmp_path / "client_key"
     host_key = tmp_path / "host_key"
     for key_path in (client_key, host_key):
@@ -888,9 +935,13 @@ def test_ssh_transport_e2e_pinned_clone_and_approved_push(tmp_path, monkeypatch)
         text=True,
     ).stdout.strip()
     port_socket = socket.socket()
-    port_socket.bind(("127.0.0.1", 0))
-    port = port_socket.getsockname()[1]
-    port_socket.close()
+    try:
+        port_socket.bind(("127.0.0.1", 0))
+        port = port_socket.getsockname()[1]
+    finally:
+        port_socket.close()
+    short_temp = tempfile.TemporaryDirectory(prefix="ha-", dir="/tmp")
+    agent_socket = Path(short_temp.name) / "agent.sock"
     account = pwd.getpwuid(os.getuid()).pw_name
     sshd_config = tmp_path / "sshd_config"
     sshd_config.write_text(

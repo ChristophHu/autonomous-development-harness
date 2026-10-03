@@ -13,6 +13,12 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .approvals import ApprovalDenied, ApprovalRequired
+from .context_token_budget import (
+    TokenCounterRegistry,
+    count_with_tiktoken,
+    count_with_tokenizers_file,
+    enforce_token_budget,
+)
 from .domain import TaskComplexity
 from .process_control import TaskCancelled, current_run_control
 from .providers import (
@@ -814,6 +820,24 @@ class ModelRouter:
         self.usage_callback = usage_callback
         self.audit = audit
         self.usage = UsageTracker()
+        self.token_counters = TokenCounterRegistry()
+        self.input_token_budgets = config.data.get("models", {}).get(
+            "input_token_budgets", {}
+        )
+        for model_id, settings in self.input_token_budgets.items():
+            if settings.get("characters_per_token") is not None:
+                self.token_counters.register_estimator(
+                    model_id,
+                    settings["characters_per_token"],
+                    settings.get("safety_margin_percent", 20),
+                )
+            else:
+                counter = (
+                    count_with_tiktoken(settings["encoding"])
+                    if settings.get("encoding") is not None
+                    else count_with_tokenizers_file(settings.get("tokenizer_file", ""))
+                )
+                self.token_counters.register(model_id, counter)
 
     def _candidate_available(self, name, required_capabilities, check_availability):
         definition = self.registry.models.get(name)
@@ -908,7 +932,15 @@ class ModelRouter:
         )[0]
 
     def complete(
-        self, profile, prompt, tools=None, complexity=None, required_capabilities=()
+        self,
+        profile,
+        prompt,
+        tools=None,
+        complexity=None,
+        required_capabilities=(),
+        *,
+        allowed_models=None,
+        route_observer=None,
     ):
         required = set(required_capabilities)
         if tools:
@@ -919,6 +951,10 @@ class ModelRouter:
             required,
             check_availability=complexity is not None,
         )
+        if allowed_models is not None:
+            if not isinstance(allowed_models, (set, frozenset, list, tuple)):
+                raise TypeError("allowed model candidates must be a collection")
+            candidates = [name for name in candidates if name in allowed_models]
         if not candidates:
             raise RuntimeError(
                 "no available model satisfies the profile routing policy"
@@ -1004,6 +1040,45 @@ class ModelRouter:
                     provider, model = self.registry.resolve(
                         name, bool(tools), required_capabilities=required
                     )
+                    resolved_model = model or getattr(provider, "model", None) or name
+                    if route_observer is not None:
+                        route_observer(resolved_model)
+                    token_settings = self.input_token_budgets.get(resolved_model)
+                    if self.input_token_budgets and token_settings is None:
+                        raise ValueError(
+                            "hard input token budgets must cover every routed model"
+                        )
+                    if token_settings is not None:
+                        count = enforce_token_budget(
+                            self.token_counters,
+                            resolved_model,
+                            prompt,
+                            token_settings["max_input_tokens"],
+                            tools,
+                            framing_tokens=token_settings.get("framing_tokens", 0),
+                            safety_margin_percent=token_settings.get(
+                                "safety_margin_percent", 20
+                            ),
+                        )
+                        estimate = self.token_counters.estimate(
+                            resolved_model,
+                            prompt,
+                            tools,
+                            framing_tokens=token_settings.get("framing_tokens", 0),
+                            safety_margin_percent=token_settings.get(
+                                "safety_margin_percent", 20
+                            ),
+                        )
+                        span["input_token_preflight"] = {
+                            "estimated_tokens": count,
+                            "raw_tokens": estimate.raw_tokens,
+                            "method": estimate.method,
+                            "safety_margin_percent": estimate.safety_margin_percent,
+                            "limit": token_settings["max_input_tokens"],
+                            "encoding": token_settings.get("encoding"),
+                            "serialized_request": True,
+                            "provider_exact": False,
+                        }
                     span["provider"] = getattr(
                         provider,
                         "name",
@@ -1025,6 +1100,20 @@ class ModelRouter:
                             self.config.data.get("models", {}).get("rates", {})
                         ).calculate(usage)
                         span["usage"] = usage
+                        estimate_data = span.get("input_token_preflight")
+                        if (
+                            isinstance(estimate_data, dict)
+                            and usage.prompt_tokens is not None
+                        ):
+                            estimated = estimate_data.get("estimated_tokens")
+                            span["input_token_calibration"] = {
+                                "provider_prompt_tokens": usage.prompt_tokens,
+                                "estimated_tokens": estimated,
+                                "estimate_minus_provider": (
+                                    estimated - usage.prompt_tokens
+                                ),
+                                "estimate_method": estimate_data.get("method"),
+                            }
                         if run_context:
                             cost_budget = run_context.get("model_cost_budget")
                             token_budget = run_context.get("model_token_budget")

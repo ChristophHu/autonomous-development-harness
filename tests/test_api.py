@@ -142,6 +142,65 @@ def test_api_model_inventory_uses_shared_model_operations_service(client):
     assert response.json()["providers"][0]["models"][0]["status"] == "available"
 
 
+def test_api_model_test_uses_shared_redacted_service_contract(client):
+    http, _store, orchestrator = client
+    from types import SimpleNamespace
+
+    orchestrator.models.resolve = lambda _name: (
+        SimpleNamespace(complete=lambda *_args, **_kwargs: "OK"),
+        "fixture-model",
+    )
+    success = http.post("/api/models/test", json={"model": "local"})
+    assert success.status_code == 200
+    assert success.json() == {"model": "local", "status": "successful"}
+
+    orchestrator.models.resolve = lambda _name: (_ for _ in ()).throw(
+        RuntimeError("secret response")
+    )
+    failure = http.post("/api/models/test", json={"model": "local"})
+    assert failure.status_code == 200
+    assert failure.json() == {
+        "model": "local",
+        "status": "failed",
+        "error_type": "RuntimeError",
+    }
+    assert http.post("/api/models/test", json={"model": ""}).status_code == 422
+
+
+def test_api_task_knowledge_search_is_read_only_and_returns_provenance(client):
+    http, store, orchestrator = client
+    task = http.post("/api/tasks", json={"title": "Architecture search"}).json()
+    vault = orchestrator.context.memory.vault
+    vault.mkdir(parents=True)
+    (vault / "Architecture.md").write_text(
+        "---\ntype: architecture\nreviewed_on: 2026-10-03\n---\n"
+        "# Design\nArchitecture uses SQLite for task state.\n",
+        encoding="utf-8",
+    )
+    store.audit.secrets["fixture"] = "PRIVATE-CANARY"
+
+    response = http.get(
+        f"/api/tasks/{task['id']}/knowledge", params={"query": "SQLite"}
+    )
+    assert response.status_code == 200
+    assert response.json()["task_id"] == task["id"]
+    hit = response.json()["hits"][0]
+    assert hit["source_ref"] == "context:vault/Architecture.md#Design"
+    assert hit["provenance"]["review_state"] == "current"
+    assert "PRIVATE-CANARY" not in response.text
+    assert (vault / "Architecture.md").exists()
+    assert (
+        http.get("/api/tasks/999999/knowledge", params={"query": "SQLite"}).status_code
+        == 404
+    )
+    assert (
+        http.get(
+            f"/api/tasks/{task['id']}/knowledge", params={"query": " "}
+        ).status_code
+        == 422
+    )
+
+
 def test_api_task_and_question_surfaces_do_not_expose_secret_canary(client):
     http, store, _orchestrator = client
     canary = "SS1-API-CANARY-NEVER-RETURN"

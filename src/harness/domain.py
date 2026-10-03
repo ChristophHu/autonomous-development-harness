@@ -58,6 +58,7 @@ class EventKind(StrEnum):
     REQUIREMENTS_INSPECTED = "requirements.inspected"
     QUESTION_ASKED = "QUESTION_ASKED"
     QUESTION_ANSWERED = "question.answered"
+    QUESTION_SUPERSEDED = "question.superseded"
     DECISION_RECORDED = "decision.recorded"
     RECOVERY_RECONCILED = "recovery.reconciled"
     RECOVERY_INSPECTED = "recovery.inspected"

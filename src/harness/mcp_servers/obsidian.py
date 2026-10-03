@@ -69,9 +69,30 @@ OUTPUTS = {
                     "type": "object",
                     "properties": {
                         "path": {"type": "string"},
+                        "source_ref": {"type": "string"},
+                        "section": {"type": ["string", "null"]},
                         "excerpt": {"type": "string"},
+                        "review_state": {
+                            "enum": [
+                                "current",
+                                "stale",
+                                "future",
+                                "invalid",
+                                "unreviewed",
+                            ]
+                        },
+                        "provenance": {"type": "object"},
+                        "claims": {"type": "object"},
                     },
-                    "required": ["path", "excerpt"],
+                    "required": [
+                        "path",
+                        "source_ref",
+                        "section",
+                        "excerpt",
+                        "review_state",
+                        "provenance",
+                        "claims",
+                    ],
                     "additionalProperties": False,
                 },
             }
@@ -82,14 +103,17 @@ OUTPUTS = {
 
 
 class ObsidianServer:
-    def __init__(self, vault):
+    def __init__(self, vault, source_root=None):
         self.files = FilesystemServer(vault, read_only=True)
+        self.source_root = source_root
 
     @property
     def knowledge(self):
         from ..vault_knowledge import VaultKnowledgeService
 
-        return VaultKnowledgeService(self.files.root, _server=self)
+        return VaultKnowledgeService(
+            self.files.root, source_root=self.source_root, _server=self
+        )
 
     def _parts(self, path):
         parts = self.files._parts(path)
@@ -177,8 +201,9 @@ def _response(server, message):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("vault")
+    parser.add_argument("source_root", nargs="?")
     args = parser.parse_args()
-    serve_stdio(ObsidianServer(args.vault), _response)
+    serve_stdio(ObsidianServer(args.vault, args.source_root), _response)
 
 
 if __name__ == "__main__":

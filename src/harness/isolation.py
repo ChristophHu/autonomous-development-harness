@@ -387,6 +387,9 @@ def isolated_command(
                 [
                     '(allow process-exec (literal "/bin/sh"))',
                     '(allow process-exec (literal "/bin/bash"))',
+                    # OpenSSH resolves its default shell through this macOS
+                    # selector symlink; grant only the selector itself.
+                    '(allow file-read* (literal "/private/var/select/sh"))',
                     '(allow mach-lookup (global-name "com.apple.system.opendirectoryd.libinfo"))',
                 ]
             )

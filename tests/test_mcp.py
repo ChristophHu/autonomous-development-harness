@@ -179,6 +179,29 @@ def test_obsidian_server_reads_only_visible_markdown_in_vault(tmp_path):
         server.call("write_note", {"path": "notes/a.md", "content": "bad"})
 
 
+def test_obsidian_knowledge_note_with_review_date_is_json_rpc_serializable(tmp_path):
+    from harness.mcp_servers import obsidian
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "review.md").write_text(
+        "---\nlast_reviewed: 2026-10-03\n---\n# Review\nVault evidence"
+    )
+    response = obsidian._response(
+        obsidian.ObsidianServer(vault),
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "knowledge_note", "arguments": {"path": "review.md"}},
+        },
+    )
+    assert response["result"]["structuredContent"]["metadata"]["last_reviewed"] == (
+        "2026-10-03"
+    )
+    assert json.loads(json.dumps(response))["id"] == 1
+
+
 def test_obsidian_server_protocol_limits_and_binary_skip(tmp_path, monkeypatch):
     from harness.mcp_servers import obsidian
 
@@ -284,8 +307,11 @@ def test_builtin_mcp_isolation_includes_python_base_runtime(tmp_path, monkeypatc
     captured = {}
 
     class Client:
-        def __init__(self, _command, _workspace, *, read_roots, **_kwargs):
+        def __init__(
+            self, _command, _workspace, *, read_roots, python_import_roots, **_kwargs
+        ):
             captured["read_roots"] = read_roots
+            captured["python_import_roots"] = python_import_roots
 
         def discover(self):
             return []
@@ -293,6 +319,41 @@ def test_builtin_mcp_isolation_includes_python_base_runtime(tmp_path, monkeypatc
     monkeypatch.setattr(mcp, "MCPClient", Client)
     ToolRegistry(Permissions(config), workspace=workspace)
     assert Path(sys.base_prefix) in captured["read_roots"]
+    assert (
+        Path(__file__).resolve().parents[1] / "src" in captured["python_import_roots"]
+    )
+
+
+def test_builtin_python_import_roots_are_scoped_to_builtin_mcp(tmp_path, monkeypatch):
+    from harness import mcp
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = Config()
+    config.data["tools"] = {
+        "mcp": {
+            "servers": {
+                "external": {
+                    "command": ["/bin/echo"],
+                    "trusted_local": True,
+                    "read_roots": ["."],
+                    "allow_tools": ["echo"],
+                }
+            }
+        }
+    }
+    captured = {}
+
+    class Client:
+        def __init__(self, _command, _workspace, *, python_import_roots, **_kwargs):
+            captured["python_import_roots"] = python_import_roots
+
+        def discover(self):
+            return [{"name": "echo", "inputSchema": {"type": "object"}}]
+
+    monkeypatch.setattr(mcp, "MCPClient", Client)
+    ToolRegistry(Permissions(config), workspace=workspace)
+    assert captured["python_import_roots"] == ()
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="macOS sandbox-exec acceptance")
@@ -1003,6 +1064,35 @@ def test_client_configuration_and_transport_limits(tmp_path, monkeypatch):
     monkeypatch.setattr(mcp, "MAX_MESSAGE", 1)
     with pytest.raises(MCPError, match="request is too large"):
         client.discover()
+
+
+def test_client_uses_only_explicit_python_import_roots(tmp_path, monkeypatch):
+    from harness import mcp
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    trusted = tmp_path / "trusted"
+    trusted.mkdir()
+    monkeypatch.setenv("PYTHONPATH", "/untrusted/ambient")
+    monkeypatch.setattr(
+        mcp, "isolated_command", lambda command, *_args, **_kwargs: command
+    )
+    environments = []
+
+    def capture_spawn(*_args, **kwargs):
+        environments.append(kwargs["env"])
+        raise OSError("injected")
+
+    monkeypatch.setattr(mcp.subprocess, "Popen", capture_spawn)
+    for roots in ((), (trusted,)):
+        client = MCPClient([sys.executable], workspace, python_import_roots=roots)
+        with pytest.raises(MCPError, match="could not start"):
+            client.discover()
+    assert "PYTHONPATH" not in environments[0]
+    assert environments[1]["PYTHONPATH"] == str(trusted.resolve())
+    for invalid in (Path("relative"), tmp_path / "missing", workspace / "file"):
+        with pytest.raises((ValueError, FileNotFoundError)):
+            MCPClient([sys.executable], workspace, python_import_roots=(invalid,))
 
 
 def test_client_redacts_spawn_and_read_errors(tmp_path, monkeypatch):

@@ -22,6 +22,9 @@ verification:
 memory:
   obsidian:
     enabled: true
+  context:
+    # Deterministic UTF-8 byte cap; providers do not share a tokenizer contract.
+    max_bytes: 65536
   qdrant:
     enabled: false
     url: http://127.0.0.1:6333
@@ -78,6 +81,13 @@ models:
       base_delay: 0.25
       max_delay: 4
       max_elapsed: 300
+  # Optional local preflight on canonical serialized request JSON.
+  # Every routed model must have an entry when this map is non-empty.
+  # For every routed model choose exactly one local `encoding`, `tokenizer_file`,
+  # or approximate `characters_per_token`. Estimates include a safety margin;
+  # actual provider prompt usage is recorded for calibration when available.
+  # Example: qwen_local: {characters_per_token: 3.5, max_input_tokens: 12000}
+  input_token_budgets: {}
 profiles:
   software-architect:
     model: {primary: openai_astra, fallback: [openai_sol, deepseek_flash]}

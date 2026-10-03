@@ -113,6 +113,186 @@ def test_model_router_returns_typed_usage_with_tool_response():
     assert result.text == "ok"
 
 
+def test_model_router_applies_exact_model_token_budget_before_provider_call(
+    monkeypatch,
+):
+    import harness.agents as agents_module
+
+    provider = FakeProvider("ok")
+    calls = []
+    provider.complete = lambda prompt, **kwargs: calls.append((prompt, kwargs)) or "ok"
+    cfg = config(
+        {
+            "models": {
+                "registry": {"alias": {"provider": "fake", "model": "model-id"}},
+                "input_token_budgets": {
+                    "model-id": {
+                        "encoding": "fixture",
+                        "max_input_tokens": 1,
+                        "framing_tokens": 0,
+                    }
+                },
+            },
+            "profiles": {"p": {"model": {"primary": "alias"}}},
+        }
+    )
+    registry = ModelRegistry(cfg)
+    registry.register("fake", provider)
+    monkeypatch.setattr(
+        agents_module, "count_with_tiktoken", lambda _: lambda text: len(text)
+    )
+
+    with pytest.raises(RuntimeError, match="all model providers failed"):
+        ModelRouter(registry, cfg).complete("p", "too large", tools=[])
+    assert calls == []
+
+
+def test_model_router_enforces_configured_tokenizer_framing_allowance(monkeypatch):
+    import harness.agents as agents_module
+
+    cfg = config(
+        {
+            "models": {
+                "registry": {"alias": {"provider": "fake", "model": "model-id"}},
+                "input_token_budgets": {
+                    "model-id": {
+                        "encoding": "fixture",
+                        "max_input_tokens": 1000,
+                        "framing_tokens": 7,
+                    }
+                },
+            },
+            "profiles": {"p": {"model": {"primary": "alias"}}},
+        }
+    )
+    registry = ModelRegistry(cfg)
+    registry.register("fake", FakeProvider("ok"))
+    monkeypatch.setattr(agents_module, "count_with_tiktoken", lambda _: lambda _text: 0)
+
+    assert ModelRouter(registry, cfg).complete("p", "prompt", tools=[]).text == "ok"
+
+
+def test_model_router_records_estimate_and_provider_usage_calibration():
+    spans = []
+
+    class Audit:
+        @staticmethod
+        @contextmanager
+        def model(*_args):
+            span = {}
+            yield span
+            spans.append(span)
+
+        @staticmethod
+        def sanitize(value):
+            return value
+
+    usage = ModelUsage("fake", "model-id", prompt_tokens=4, completion_tokens=1)
+    cfg = config(
+        {
+            "models": {
+                "registry": {"alias": {"provider": "fake", "model": "model-id"}},
+                "input_token_budgets": {
+                    "model-id": {
+                        "characters_per_token": 100,
+                        "max_input_tokens": 1000,
+                        "safety_margin_percent": 25,
+                    }
+                },
+            },
+            "profiles": {"p": {"model": {"primary": "alias"}}},
+        }
+    )
+    registry = ModelRegistry(cfg)
+    registry.register("fake", FakeProvider(("ok", usage)))
+
+    assert (
+        ModelRouter(registry, cfg, audit=Audit()).complete("p", "hello", tools=[]).text
+        == "ok"
+    )
+    assert spans[0]["input_token_preflight"]["method"] == "characters_per_token"
+    assert spans[0]["input_token_preflight"]["provider_exact"] is False
+    assert spans[0]["input_token_calibration"]["provider_prompt_tokens"] == 4
+    assert spans[0]["input_token_calibration"]["estimate_minus_provider"] == (
+        spans[0]["input_token_preflight"]["estimated_tokens"] - 4
+    )
+
+
+def test_model_router_restricts_allowed_candidates_and_reports_actual_model():
+    cfg = config(
+        {
+            "models": {
+                "registry": {
+                    "writer": {"provider": "writer-provider", "model": "writer-id"},
+                    "reviewer": {
+                        "provider": "reviewer-provider",
+                        "model": "reviewer-id",
+                    },
+                }
+            },
+            "profiles": {
+                "review": {"model": {"primary": "writer", "fallback": ["reviewer"]}}
+            },
+        }
+    )
+    registry = ModelRegistry(cfg)
+    registry.register("writer-provider", FakeProvider("writer"))
+    registry.register("reviewer-provider", FakeProvider("reviewed"))
+    routed = []
+    result = ModelRouter(registry, cfg).complete(
+        "review",
+        "check",
+        allowed_models={"reviewer"},
+        route_observer=routed.append,
+    )
+    assert result == "reviewed"
+    assert routed == ["reviewer-id"]
+
+
+@pytest.mark.parametrize(
+    ("allowed_models", "error"),
+    [("reviewer", TypeError), ({"unknown"}, RuntimeError)],
+)
+def test_model_router_rejects_invalid_or_empty_allowed_model_set(allowed_models, error):
+    cfg = config({"profiles": {"p": {"model": {"primary": "fake"}}}})
+    registry = ModelRegistry(cfg)
+    registry.register("fake", FakeProvider("ok"))
+    with pytest.raises(error):
+        ModelRouter(registry, cfg).complete(
+            "p", "prompt", allowed_models=allowed_models
+        )
+
+
+def test_configured_token_budget_requires_every_fallback_model():
+    cfg = config(
+        {
+            "models": {
+                "registry": {
+                    "first": {"provider": "first-provider", "model": "first-id"},
+                    "fallback": {
+                        "provider": "fallback-provider",
+                        "model": "fallback-id",
+                    },
+                },
+                "input_token_budgets": {
+                    "first-id": {
+                        "characters_per_token": 4,
+                        "max_input_tokens": 1000,
+                    }
+                },
+            },
+            "profiles": {
+                "p": {"model": {"primary": "first", "fallback": ["fallback"]}}
+            },
+        }
+    )
+    registry = ModelRegistry(cfg)
+    registry.register("first-provider", FakeProvider(error=RuntimeError("offline")))
+    registry.register("fallback-provider", FakeProvider("must not be called"))
+    with pytest.raises(RuntimeError, match="all model providers failed"):
+        ModelRouter(registry, cfg).complete("p", "prompt")
+
+
 @pytest.mark.parametrize(
     "paths",
     [

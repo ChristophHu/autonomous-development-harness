@@ -17,6 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Annotated
 
 import httpx
@@ -31,6 +32,7 @@ from .docker_broker import DockerComposeBroker
 from .security import SecretResolver
 from .service_lifecycle import ServiceLifecycle
 from .services import ModelOperationsService
+from .sqlite_operations import inspect_sqlite
 from .verification import source_tree_sha256
 
 app = typer.Typer(no_args_is_help=True)
@@ -489,6 +491,11 @@ def status():
         )
     typer.echo(f"Harness: {service_description}")
     typer.echo(f"SQLite: {_sqlite_health(store)}")
+    sqlite_report = inspect_sqlite(store.db)
+    typer.echo(
+        f"SQLite schema: {sqlite_report['schema_version']}/"
+        f"{sqlite_report['expected_schema_version']} ({sqlite_report['status']})"
+    )
     vault = conf.path("obsidian_vault")
     typer.echo(
         f"Obsidian: {_component_health(lambda: vault.is_dir() and os.access(vault, os.R_OK | os.W_OK))}"
@@ -523,6 +530,7 @@ def runtime_metrics(
 @app.command()
 def doctor():
     conf, store, orchestrator = build()
+    sqlite_report = inspect_sqlite(store.db)
     qdrant_enabled = conf.data.get("memory", {}).get("qdrant", {}).get("enabled", False)
     docker_available = shutil.which("docker") is not None
     compose_available = False
@@ -563,6 +571,7 @@ def doctor():
         "Apple Silicon": platform.machine() == "arm64",
         "Configuration": _config_health(conf),
         "SQLite": _sqlite_health(store) == "available",
+        "SQLite Schema": sqlite_report["version_history_complete"],
         "Git": shutil.which("git") is not None,
         "Docker": docker_available or not qdrant_enabled,
         "Docker Compose": compose_available or not qdrant_enabled,
@@ -601,6 +610,15 @@ def doctor():
     for name, state in providers.items():
         typer.echo(f"Provider {name} status: {state}")
     if not all(checks.values()):
+        raise typer.Exit(1)
+
+
+@app.command("sqlite-health")
+def sqlite_health():
+    """Inspect the configured SQLite database without opening it for writes."""
+    report = inspect_sqlite(Config().path("database"))
+    typer.echo(json.dumps(report, ensure_ascii=False, sort_keys=True))
+    if report["status"] != "available":
         raise typer.Exit(1)
 
 
@@ -707,6 +725,29 @@ def _memory_qdrant(conf):
         timeout=qdrant.get("timeout", 5),
         api_key=conf.data.get("secrets", {}).get("QDRANT__SERVICE__API_KEY"),
     )
+
+
+def _build_embedding_acceptance():
+    """Build the live search path without loading the MCP tool registry."""
+    from .memory import EmbeddingProvider, ObsidianMemory
+    from .memory_service import MemoryService
+
+    conf, store = _build_memory_store()
+    embeddings = conf.data.get("memory", {}).get("embeddings", {})
+    qdrant = _memory_qdrant(conf)
+    qdrant.embedder = EmbeddingProvider(
+        embeddings.get("base_url", "http://127.0.0.1:1234/v1"),
+        embeddings.get("model", "text-embedding-model"),
+        timeout=embeddings.get("timeout", 30),
+        dimension=embeddings.get("dimensions", 1024),
+        batch_size=embeddings.get("batch_size", 32),
+    )
+    service = MemoryService(
+        ObsidianMemory(conf.path("obsidian_vault")),
+        qdrant,
+        batch_size=embeddings.get("batch_size", 32),
+    )
+    return conf, store, qdrant, service
 
 
 @memory.command("status")
@@ -908,6 +949,162 @@ def memory_audit():
         raise typer.Exit(1)
 
 
+@memory.command("knowledge-propose")
+def memory_knowledge_propose(
+    body_file: Annotated[
+        Path, typer.Option("--body-file", exists=True, dir_okay=False, readable=True)
+    ],
+    task_id: str = typer.Option(..., "--task-id"),
+    title: str = typer.Option(..., "--title"),
+    category: str = typer.Option(..., "--category"),
+    source: str = typer.Option(..., "--source"),
+):
+    """Create a source-hash-bound proposal; this does not edit curated notes."""
+    from .vault_steward import VaultKnowledgeSteward
+
+    try:
+        _conf, store = _build_memory_store()
+        body = body_file.read_text(encoding="utf-8")
+        service = VaultKnowledgeSteward(
+            _conf.path("obsidian_vault"), ROOT, redactor=store.audit.sanitize
+        )
+        result = service.propose(
+            task_id=task_id,
+            title=title,
+            body=body,
+            category=category,
+            source_path=source,
+        )
+    except (OSError, UnicodeError, ValueError) as error:
+        typer.echo(f"Knowledge proposal failed: {type(error).__name__}")
+        raise typer.Exit(2) from None
+    typer.echo(json.dumps(result, ensure_ascii=False))
+
+
+@memory.command("knowledge-proposals")
+def memory_knowledge_proposals():
+    """List knowledge proposals and their source evidence for human review."""
+    from .vault_steward import VaultKnowledgeSteward
+
+    try:
+        conf = Config()
+        service = VaultKnowledgeSteward(
+            conf.path("obsidian_vault"), ROOT, create_inbox=False
+        )
+        proposals = service.pending()
+    except (OSError, ValueError) as error:
+        typer.echo(f"Knowledge proposals unavailable: {type(error).__name__}")
+        raise typer.Exit(2) from None
+    typer.echo(json.dumps(proposals, ensure_ascii=False, indent=2))
+
+
+@memory.command("knowledge-review")
+def memory_knowledge_review():
+    """Audit Vault health and report pending proposals with stale source evidence."""
+    from .vault_audit import audit_vault
+    from .vault_steward import VaultKnowledgeSteward
+
+    try:
+        conf = Config()
+        database_path = conf.path("database")
+        decision_rows = None
+        if database_path.is_file():
+            with closing(
+                sqlite3.connect(f"file:{database_path}?mode=ro", uri=True)
+            ) as connection:
+                connection.row_factory = sqlite3.Row
+                rows = connection.execute(
+                    "SELECT * FROM decisions ORDER BY id"
+                ).fetchall()
+            decision_rows = []
+            for row in rows:
+                item = dict(row)
+                for field in ("evidence", "field_names", "alternatives", "tags"):
+                    item[field] = json.loads(item[field])
+                decision_rows.append(item)
+        vault_report = audit_vault(
+            conf.path("obsidian_vault"),
+            decision_rows=decision_rows,
+            content_governance=True,
+            source_root=ROOT,
+        )
+        proposals = VaultKnowledgeSteward(
+            conf.path("obsidian_vault"), ROOT, create_inbox=False
+        ).pending()
+    except (OSError, sqlite3.Error, TypeError, ValueError) as error:
+        typer.echo(f"Knowledge review unavailable: {type(error).__name__}")
+        raise typer.Exit(2) from None
+    stale_pending = [
+        item["id"]
+        for item in proposals
+        if item["status"] == "pending" and item["source_state"] != "current"
+    ]
+    result = {
+        "ready": vault_report["healthy"] and not stale_pending,
+        "vault_healthy": vault_report["healthy"],
+        "findings": vault_report["findings"],
+        "curated_notes": vault_report["audited_notes"],
+        "proposal_counts": {
+            status: sum(item["status"] == status for item in proposals)
+            for status in ("pending", "approved", "rejected")
+        },
+        "stale_pending_proposals": stale_pending,
+    }
+    typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
+    if not result["ready"]:
+        raise typer.Exit(1)
+
+
+@memory.command("knowledge-approve")
+def memory_knowledge_approve(
+    proposal_id: str,
+    sha256: str = typer.Option(..., "--sha256"),
+    confirm: bool = typer.Option(False, "--confirm"),
+):
+    """Apply exactly the reviewed proposal after explicit digest confirmation."""
+    if not confirm:
+        typer.echo(
+            "No action taken. Repeat with --confirm after reviewing the proposal."
+        )
+        raise typer.Exit(2)
+    from .vault_steward import VaultKnowledgeSteward
+
+    try:
+        conf = Config()
+        result = VaultKnowledgeSteward(conf.path("obsidian_vault"), ROOT).approve(
+            proposal_id, sha256
+        )
+    except (OSError, ValueError) as error:
+        typer.echo(f"Knowledge approval failed: {type(error).__name__}")
+        raise typer.Exit(2) from None
+    typer.echo(json.dumps(result, ensure_ascii=False))
+
+
+@memory.command("knowledge-reject")
+def memory_knowledge_reject(
+    proposal_id: str,
+    sha256: str = typer.Option(..., "--sha256"),
+    confirm: bool = typer.Option(False, "--confirm"),
+):
+    """Record rejection of exactly the reviewed proposal."""
+    if not confirm:
+        typer.echo(
+            "No action taken. Repeat with --confirm after reviewing the proposal."
+        )
+        raise typer.Exit(2)
+    from .vault_steward import VaultKnowledgeSteward
+
+    try:
+        conf = Config()
+        result = VaultKnowledgeSteward(conf.path("obsidian_vault"), ROOT).reject(
+            proposal_id, sha256
+        )
+    except (OSError, ValueError) as error:
+        typer.echo(f"Knowledge rejection failed: {type(error).__name__}")
+        raise typer.Exit(2) from None
+    typer.echo(json.dumps(result, ensure_ascii=False))
+
+
 @memory.command("qdrant-config-audit")
 def qdrant_config_audit(
     compose_path: Annotated[
@@ -934,10 +1131,11 @@ def qdrant_config_audit(
 @memory.command("qdrant-status")
 def qdrant_status():
     """Show Qdrant health, collection contract, and persisted point counts."""
-    conf, _store, orchestrator = build()
+    conf, _store = _build_memory_store()
     enabled = conf.data.get("memory", {}).get("qdrant", {}).get("enabled", False)
     started = time.monotonic()
-    report = _qdrant_report(orchestrator, enabled=enabled)
+    qdrant = _memory_qdrant(conf) if enabled else None
+    report = _qdrant_report(SimpleNamespace(qdrant=qdrant), enabled=enabled)
     elapsed_ms = (time.monotonic() - started) * 1000
     if enabled:
         from .database import OperationalSnapshotRepository
@@ -961,12 +1159,12 @@ def qdrant_acceptance(confirm: bool = typer.Option(False, "--confirm")):
             "No provider request sent. Repeat with --confirm to run the live acceptance probe."
         )
         raise typer.Exit(2)
-    conf, store, orchestrator = build()
+    conf, store, qdrant, memory_service = _build_embedding_acceptance()
     qdrant_config = conf.data.get("memory", {}).get("qdrant", {})
     if not qdrant_config.get("enabled", False):
         typer.echo("Qdrant is disabled in configuration")
         raise typer.Exit(1)
-    health = orchestrator.qdrant.health_report()
+    health = qdrant.health_report()
     if not health.get("healthy"):
         typer.echo(
             json.dumps(
@@ -979,12 +1177,32 @@ def qdrant_acceptance(confirm: bool = typer.Option(False, "--confirm")):
             )
         )
         raise typer.Exit(1)
-    try:
-        results = orchestrator.qdrant.search(
-            "Harness live embedding acceptance probe", limit=1
+    embedding = conf.data.get("memory", {}).get("embeddings", {})
+    expected_model = embedding.get("model")
+    expected_dimension = embedding.get("dimensions", 1024)
+    provider = qdrant.embedder
+    if (
+        not isinstance(expected_model, str)
+        or not expected_model.strip()
+        or provider is None
+        or getattr(provider, "model", None) != expected_model
+        or getattr(provider, "dimension", None) != expected_dimension
+        or qdrant.dimension != expected_dimension
+        or health.get("dimension") != expected_dimension
+    ):
+        typer.echo(
+            json.dumps(
+                {
+                    "healthy": False,
+                    "stage": "embedding_contract",
+                    "errors": ["configuration_mismatch"],
+                }
+            )
         )
-        if not isinstance(results, list):
-            raise TypeError("Qdrant search result is invalid")
+        raise typer.Exit(1)
+    try:
+        candidates = qdrant.search("Harness live embedding acceptance probe", limit=1)
+        results = memory_service.verified_search_points(candidates)
     except (OSError, RuntimeError, TypeError, ValueError, httpx.HTTPError) as error:
         typer.echo(
             json.dumps(
@@ -997,7 +1215,18 @@ def qdrant_acceptance(confirm: bool = typer.Option(False, "--confirm")):
             )
         )
         raise typer.Exit(1) from None
-    embedding = conf.data.get("memory", {}).get("embeddings", {})
+    if not results:
+        typer.echo(
+            json.dumps(
+                {
+                    "healthy": False,
+                    "stage": "source_validation",
+                    "errors": ["no_current_source_match"],
+                    "candidates": len(candidates),
+                }
+            )
+        )
+        raise typer.Exit(1)
     from .evidence import EvidenceRepository
 
     try:
@@ -1013,6 +1242,7 @@ def qdrant_acceptance(confirm: bool = typer.Option(False, "--confirm")):
                     "embedding_dimension_match": True,
                     "qdrant_collection_healthy": True,
                     "read_only_search": True,
+                    "source_hash_validated": True,
                 },
             }
         )
@@ -1038,6 +1268,7 @@ def qdrant_acceptance(confirm: bool = typer.Option(False, "--confirm")):
                 "model": embedding.get("model"),
                 "dimension": embedding.get("dimensions", 1024),
                 "matches": len(results),
+                "candidates": len(candidates),
                 "evidence_id": evidence["id"],
                 "evidence_kind": evidence["kind"],
             },
@@ -1217,6 +1448,22 @@ def task_events(task_id: int):
         )
 
 
+@tasks.command("knowledge-search")
+def task_knowledge_search(
+    task_id: int,
+    query: str,
+    limit: Annotated[int, typer.Option("--limit", min=1, max=20)] = 5,
+):
+    """Search Vault knowledge for a task without changing the Vault."""
+    _, _, orchestrator = build()
+    try:
+        result = orchestrator.service.knowledge_search(task_id, query, limit=limit)
+    except ValueError as error:
+        typer.echo(f"Task knowledge search failed: {error}")
+        raise typer.Exit(1) from None
+    typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
+
+
 @tasks.command("watch")
 def task_watch(task_id: int):
     conf, store, _ = build()
@@ -1352,17 +1599,10 @@ def model_usage(
 def model_test(model_name: str):
     """Send a minimal completion request through a configured model/provider."""
     _, _, orchestrator = build()
-    try:
-        provider, model_id = orchestrator.models.resolve(model_name)
-        response = provider.complete(
-            "Reply with exactly: OK", **({"model": model_id} if model_id else {})
-        )
-        text = response[0] if isinstance(response, tuple) else response
-        if not isinstance(text, str) or not text.strip():
-            raise ValueError("empty model response")
-    except Exception as exc:
-        typer.echo(f"Model test failed ({type(exc).__name__})")
-        raise typer.Exit(1) from exc
+    result = orchestrator.model_operations.test_model(model_name)
+    if result["status"] != "successful":
+        typer.echo(f"Model test failed ({result['error_type']})")
+        raise typer.Exit(1)
     typer.echo(f"Model test successful: {model_name}")
 
 
