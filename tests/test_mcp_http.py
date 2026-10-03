@@ -334,6 +334,7 @@ def test_tool_registry_pins_remote_server_and_retains_approval_permissions(
     }
 
     registry = ToolRegistry(Permissions(config), workspace=tmp_path)
+    registry.schemas(["mcp.remote.read"])
 
     assert instances == [(URL, HOSTS, 10, "resolved-secret")]
     assert registry.list().count("mcp.remote.read") == 1
@@ -368,8 +369,10 @@ def test_tool_registry_fails_when_remote_auth_reference_is_unavailable(
             }
         }
     }
-    with pytest.raises(ValueError, match="auth secret is unavailable"):
-        ToolRegistry(Permissions(config), workspace=tmp_path)
+    registry = ToolRegistry(Permissions(config), workspace=tmp_path)
+    status = registry.mcp_status(probe=True)
+    assert status[0]["state"] == "unavailable"
+    assert status[0]["error"] == "ValueError"
 
 
 def test_tool_registry_builds_remote_without_optional_auth(tmp_path, monkeypatch):
@@ -402,6 +405,7 @@ def test_tool_registry_builds_remote_without_optional_auth(tmp_path, monkeypatch
     }
 
     registry = ToolRegistry(Permissions(config), workspace=tmp_path)
+    registry.mcp_status(probe=True)
 
     assert instances == [(URL, HOSTS, 10, None)]
     assert not any(name.startswith("mcp.remote.") for name in registry.list())

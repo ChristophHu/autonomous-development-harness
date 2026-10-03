@@ -60,6 +60,7 @@ def git_runtime(tmp_path, monkeypatch):
             success=True,
             output="implemented",
             changed_files=["addition.py"],
+            tool_evidence=[{"tool": "filesystem.write", "changed_path": "addition.py"}],
         )
 
     harness.executor.execute = execute
@@ -282,6 +283,7 @@ def test_failing_merged_target_is_revalidated_before_task_completion(
             success=True,
             output="implemented",
             changed_files=["addition.py"],
+            tool_evidence=[{"tool": "filesystem.write", "changed_path": "addition.py"}],
         )
 
     harness.executor.execute = execute
@@ -333,6 +335,9 @@ def test_approved_target_repair_is_scoped_and_revalidated(tmp_path, monkeypatch)
                 success=True,
                 output="repaired",
                 changed_files=["check.py"],
+                tool_evidence=[
+                    {"tool": "filesystem.write", "changed_path": "check.py"}
+                ],
             )
         harness.tools.execute(
             "filesystem.write",
@@ -366,6 +371,7 @@ def test_approved_target_repair_is_scoped_and_revalidated(tmp_path, monkeypatch)
             success=True,
             output="implemented",
             changed_files=["addition.py"],
+            tool_evidence=[{"tool": "filesystem.write", "changed_path": "addition.py"}],
         )
 
     harness.executor.execute = execute
@@ -429,6 +435,7 @@ def test_denied_target_repair_stays_blocked_without_creating_branch(
             success=True,
             output="implemented",
             changed_files=["addition.py"],
+            tool_evidence=[{"tool": "filesystem.write", "changed_path": "addition.py"}],
         )
 
     harness.executor.execute = execute

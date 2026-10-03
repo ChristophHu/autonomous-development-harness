@@ -20,10 +20,10 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from jsonschema import Draft202012Validator, ValidationError
-from pydantic import ValidationError as PydanticValidationError
 
 from .isolation import ProcessAccessProfile, git_metadata, isolated_command
 from .process_control import current_run_control, run_cancellable
+from .process_failures import process_failure_category
 
 
 @dataclass
@@ -50,7 +50,7 @@ def resolve_http_addresses(host, port):
             records = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
         except OSError as exc:
             raise PermissionError("HTTP destination could not be resolved") from exc
-        return list({ipaddress.ip_address(record[4][0]) for record in records})
+    return list({ipaddress.ip_address(record[4][0]) for record in records})
 
 
 class ToolExecutor:
@@ -196,9 +196,14 @@ class ToolExecutor:
                     timeout=15,
                     check=False,
                 )
-                if resolved.returncode or not re.fullmatch(
-                    r"[0-9a-fA-F]{40,64}", resolved.stdout.strip()
-                ):
+                if resolved.returncode:
+                    category = process_failure_category(resolved)
+                    if category == "host_sandbox_blocked":
+                        raise PermissionError(
+                            "host sandbox blocked Git source verification"
+                        )
+                    raise PermissionError("Git source verification failed")
+                if not re.fullmatch(r"[0-9a-fA-F]{40,64}", resolved.stdout.strip()):
                     raise PermissionError(
                         f"push source branch is unavailable: {source}"
                     )
@@ -738,13 +743,17 @@ class ToolRegistry:
                 self.executor.http,
             )
         )
-        self._register_mcp()
+        self._configure_mcp()
 
-    def _register_mcp(self):
-        from .configuration import MCPSettings
+    def _configure_mcp(self):
+        from .mcp_manager import MCPServerManager
+
+        raw = self.permissions.config.data.get("tools", {}).get("mcp", {})
+        self.mcp_manager = MCPServerManager(raw, loader=self._discover_mcp_server)
+
+    def _discover_mcp_server(self, server_name):
         from .mcp import (
             MCPClient,
-            MCPError,
             MCPHTTPClient,
             builtin_apple_shell_command,
             builtin_filesystem_command,
@@ -755,40 +764,30 @@ class ToolRegistry:
         from .mcp_servers.filesystem import _DELETE, _READ, _WRITE
         from .mcp_servers.obsidian import READ_TOOLS as OBSIDIAN_READ
 
-        mcp_config = self.permissions.config.data.get("tools", {}).get("mcp")
-        if not mcp_config:
+        settings = self.mcp_manager.settings(server_name)
+        if settings is None or not settings.enabled:
             return
-        try:
-            servers = MCPSettings.model_validate(mcp_config).servers
-        except PydanticValidationError:
-            raise ValueError("tools.mcp has invalid configuration") from None
-        for server_name, settings in servers.items():
-            if not settings.enabled:
-                continue
-            if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", server_name):
-                raise ValueError("invalid MCP server name")
-            vault = (
-                self.permissions.config.path("obsidian_vault")
-                if settings.builtin == "obsidian"
-                else None
-            )
-            if settings.transport == "streamable_http":
-                token = None
-                if settings.auth_secret:
-                    from .security import SecretResolver
+        vault = (
+            self.permissions.config.path("obsidian_vault")
+            if settings.builtin == "obsidian"
+            else None
+        )
+        if settings.transport == "streamable_http":
+            token = None
+            if settings.auth_secret:
+                from .security import SecretResolver
 
-                    token = SecretResolver().get(settings.auth_secret)
-                    if not token:
-                        raise ValueError(
-                            f"MCP server {server_name} auth secret is unavailable"
-                        )
-                client = MCPHTTPClient(
-                    settings.url,
-                    settings.allowed_hosts,
-                    timeout=settings.timeout,
-                    bearer_token=token,
-                )
-            elif settings.builtin == "filesystem":
+                token = SecretResolver().get(settings.auth_secret)
+                if not token:
+                    raise ValueError("MCP server authentication is unavailable")
+            client = MCPHTTPClient(
+                settings.url,
+                settings.allowed_hosts,
+                timeout=settings.timeout,
+                bearer_token=token,
+            )
+        else:
+            if settings.builtin == "filesystem":
                 command = builtin_filesystem_command(
                     self.workspace,
                     read_only=settings.read_only,
@@ -803,8 +802,12 @@ class ToolRegistry:
             else:
                 command = settings.command
             read_roots = (
-                (self.workspace, Path(__file__).resolve().parents[1], Path(sys.prefix))
-                + (Path(sys.base_prefix),)
+                (
+                    self.workspace,
+                    Path(__file__).resolve().parents[1],
+                    Path(sys.prefix),
+                    Path(sys.base_prefix),
+                )
                 + ((vault,) if vault is not None else ())
                 if settings.builtin
                 else tuple(
@@ -814,66 +817,65 @@ class ToolRegistry:
                     for path in settings.read_roots
                 )
             )
-            if settings.transport == "stdio":
-                client = MCPClient(
-                    command,
-                    self.workspace,
-                    timeout=settings.timeout,
-                    read_roots=read_roots,
-                    python_import_roots=(
-                        Path(__file__).resolve().parents[1],
-                        Path(sysconfig.get_paths()["purelib"]),
-                    )
-                    if settings.builtin
-                    else (),
-                    executable_paths=(
-                        tuple(APPLE_SHELL_EXECUTABLES.values())
-                        if settings.builtin == "apple_shell"
-                        else ()
-                    ),
+            client = MCPClient(
+                command,
+                self.workspace,
+                timeout=settings.timeout,
+                read_roots=read_roots,
+                python_import_roots=(
+                    Path(__file__).resolve().parents[1],
+                    Path(sysconfig.get_paths()["purelib"]),
                 )
-            try:
-                discovered = client.discover()
-            except MCPError as exc:
-                raise ValueError(f"MCP server {server_name} is unavailable") from exc
-            for remote in discovered:
-                name = remote["name"]
-                if settings.builtin == "filesystem":
-                    if name in _READ:
-                        permission, risk = "filesystem", "READ"
-                    elif name in _WRITE:
-                        permission, risk = "filesystem", "WRITE"
-                    elif name in _DELETE:
-                        permission, risk = "filesystem.delete", "DESTRUCTIVE"
-                    else:
-                        raise ValueError("builtin MCP server advertised unknown tool")
-                elif settings.builtin == "obsidian":
-                    if name not in OBSIDIAN_READ:
-                        raise ValueError("builtin MCP server advertised unknown tool")
-                    permission, risk = "obsidian", "READ"
-                elif settings.builtin == "apple_shell":
-                    if name not in APPLE_SHELL_TOOLS:
-                        raise ValueError("Apple Shell MCP advertised unknown tool")
-                    permission, risk = "apple_shell", "READ"
-                elif name in settings.allow_tools:
-                    permission, risk = f"mcp.{server_name}", "DESTRUCTIVE"
+                if settings.builtin
+                else (),
+                executable_paths=(
+                    tuple(APPLE_SHELL_EXECUTABLES.values())
+                    if settings.builtin == "apple_shell"
+                    else ()
+                ),
+            )
+        discovered = client.discover()
+        server_specs = []
+        for remote in discovered:
+            name = remote["name"]
+            if settings.builtin == "filesystem":
+                if name in _READ:
+                    permission, risk = "filesystem", "READ"
+                elif name in _WRITE:
+                    permission, risk = "filesystem", "WRITE"
+                elif name in _DELETE:
+                    permission, risk = "filesystem.delete", "DESTRUCTIVE"
                 else:
-                    continue
-                schema = remote["inputSchema"]
-                spec_name = f"mcp.{server_name}.{name}"
-                self.register(
-                    ToolSpec(
-                        spec_name,
-                        str(remote.get("description", "MCP tool"))[:500],
-                        schema,
-                        permission,
-                        risk,
-                        lambda _client=client, _name=name, _schema=schema, **kwargs: (
-                            _client.call(_name, kwargs, _schema)
-                        ),
-                        output_schema=remote.get("outputSchema"),
-                    )
+                    raise ValueError("builtin MCP server advertised unknown tool")
+            elif settings.builtin == "obsidian":
+                if name not in OBSIDIAN_READ:
+                    raise ValueError("builtin MCP server advertised unknown tool")
+                permission, risk = "obsidian", "READ"
+            elif settings.builtin == "apple_shell":
+                if name not in APPLE_SHELL_TOOLS:
+                    raise ValueError("Apple Shell MCP advertised unknown tool")
+                permission, risk = "apple_shell", "READ"
+            elif name in settings.allow_tools:
+                permission, risk = f"mcp.{server_name}", "DESTRUCTIVE"
+            else:
+                continue
+            schema = remote["inputSchema"]
+            spec_name = f"mcp.{server_name}.{name}"
+            server_specs.append(
+                ToolSpec(
+                    spec_name,
+                    str(remote.get("description", "MCP tool"))[:500],
+                    schema,
+                    permission,
+                    risk,
+                    lambda _client=client, _name=name, _schema=schema, **kwargs: (
+                        _client.call(_name, kwargs, _schema)
+                    ),
+                    output_schema=remote.get("outputSchema"),
                 )
+            )
+        for spec in server_specs:
+            self.register(spec)
 
     def register(self, spec: ToolSpec):
         Draft202012Validator.check_schema(spec.input_schema)
@@ -883,6 +885,23 @@ class ToolRegistry:
         return list(self.specs)
 
     def schemas(self, allowed_names):
+        requested = set(allowed_names)
+        for server_name in self.mcp_manager.names():
+            prefix = f"mcp.{server_name}."
+            if any(name.startswith(prefix) for name in requested):
+                self.mcp_manager.start(server_name)
+        unavailable = {
+            item["name"]
+            for item in self.mcp_manager.report()
+            if item["state"] in {"disabled", "unavailable", "invalid_config"}
+        }
+        allowed_names = [
+            name
+            for name in allowed_names
+            if not any(
+                name.startswith(f"mcp.{server_name}.") for server_name in unavailable
+            )
+        ]
         if not set(allowed_names) <= set(self.specs):
             raise ValueError("profile references unknown tools")
         return [
@@ -893,6 +912,14 @@ class ToolRegistry:
             }
             for name in allowed_names
         ]
+
+    def mcp_status(self, *, probe=False):
+        if not probe:
+            return self.mcp_manager.report()
+        if probe:
+            for server_name in self.mcp_manager.names():
+                self.mcp_manager.start(server_name, force=True)
+        return self.mcp_manager.report()
 
     def execute(
         self,
@@ -908,7 +935,25 @@ class ToolRegistry:
         if control is not None:
             control.check()
         spec = self.specs.get(name)
+        if spec is None and name.startswith("mcp."):
+            parts = name.split(".", 2)
+            if len(parts) == 3:
+                self.mcp_manager.start(parts[1])
+                spec = self.specs.get(name)
         if not spec:
+            if name.startswith("mcp."):
+                parts = name.split(".", 2)
+                if len(parts) == 3:
+                    status = next(
+                        (
+                            item
+                            for item in self.mcp_status()
+                            if item["name"] == parts[1]
+                        ),
+                        None,
+                    )
+                    if status and status["state"] in {"unavailable", "invalid_config"}:
+                        raise RuntimeError("MCP server is unavailable")
             raise KeyError(f"unknown tool: {name}")
         mcp_tool = name.startswith("mcp.")
         try:

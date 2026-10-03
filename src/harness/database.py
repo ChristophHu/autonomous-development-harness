@@ -14,7 +14,7 @@ from typing import ClassVar
 
 
 class Database:
-    CURRENT_SCHEMA_VERSION: ClassVar[int] = 15
+    CURRENT_SCHEMA_VERSION: ClassVar[int] = 17
 
     def __init__(self, path: Path, *, timeout: float = 5.0):
         if (
@@ -294,6 +294,30 @@ class Database:
                     "'provider','timeout','transport','validation'))"
                 )
                 c.execute("INSERT INTO schema_versions VALUES(15,?)", (self.now(),))
+            if not c.execute(
+                "SELECT 1 FROM schema_versions WHERE version=16"
+            ).fetchone():
+                c.execute("""CREATE TABLE mcp_status_snapshots(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    server TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK(state IN ('available','unavailable','invalid_config','disabled','not_started')),
+                    error_type TEXT,
+                    CHECK(error_type IS NULL OR error_type GLOB '[A-Za-z]*'))""")
+                c.execute(
+                    "CREATE INDEX mcp_status_latest ON mcp_status_snapshots(server,id DESC)"
+                )
+                c.execute("INSERT INTO schema_versions VALUES(16,?)", (self.now(),))
+            if not c.execute(
+                "SELECT 1 FROM schema_versions WHERE version=17"
+            ).fetchone():
+                c.execute("""CREATE TRIGGER mcp_status_no_update
+                    BEFORE UPDATE ON mcp_status_snapshots
+                    BEGIN SELECT RAISE(ABORT,'MCP status snapshots are append-only'); END""")
+                c.execute("""CREATE TRIGGER mcp_status_no_delete
+                    BEFORE DELETE ON mcp_status_snapshots
+                    BEGIN SELECT RAISE(ABORT,'MCP status snapshots are append-only'); END""")
+                c.execute("INSERT INTO schema_versions VALUES(17,?)", (self.now(),))
 
     @classmethod
     def _validate_migration_history(cls, connection):
@@ -321,6 +345,77 @@ class OperationalSnapshotRepository:
 
     def __init__(self, database):
         self.database = database
+
+    def record_mcp_status(self, reports):
+        """Append per-server status without retaining exception messages or secrets."""
+        allowed = {
+            "available",
+            "unavailable",
+            "invalid_config",
+            "disabled",
+            "not_started",
+        }
+        if not isinstance(reports, list):
+            raise TypeError("MCP status reports must be a list")
+        rows = []
+        for report in reports:
+            if not isinstance(report, dict):
+                raise TypeError("MCP status report is invalid")
+            name, state = report.get("name"), report.get("state")
+            error_type = report.get("error")
+            if state == "invalid_config":
+                error_type = None
+            if (
+                not isinstance(name, str)
+                or not name
+                or len(name) > 128
+                or state not in allowed
+                or (
+                    error_type is not None
+                    and (
+                        not isinstance(error_type, str)
+                        or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", error_type)
+                    )
+                )
+            ):
+                raise ValueError("MCP status report is invalid")
+            rows.append((name, Database.now(), state, error_type))
+        with self.database.connect() as connection:
+            connection.executemany(
+                "INSERT INTO mcp_status_snapshots(server,observed_at,state,error_type) VALUES(?,?,?,?)",
+                rows,
+            )
+
+    def latest_mcp_statuses(self):
+        with self.database.connect() as connection:
+            rows = connection.execute("""SELECT snapshot.server,snapshot.observed_at,
+                snapshot.state,snapshot.error_type FROM mcp_status_snapshots AS snapshot
+                JOIN (SELECT server,MAX(id) AS id FROM mcp_status_snapshots GROUP BY server) AS latest
+                ON snapshot.id=latest.id ORDER BY snapshot.server""").fetchall()
+        return [dict(row) for row in rows]
+
+    @staticmethod
+    def read_latest_mcp_statuses(path):
+        """Read snapshots without creating a database or applying migrations."""
+        from urllib.parse import quote
+
+        database_path = Path(path)
+        if not database_path.is_file():
+            return []
+        uri = f"file:{quote(str(database_path), safe='/')}?mode=ro"
+        try:
+            connection = sqlite3.connect(uri, uri=True, timeout=1)
+            connection.row_factory = sqlite3.Row
+            try:
+                rows = connection.execute("""SELECT snapshot.server,snapshot.observed_at,
+                    snapshot.state,snapshot.error_type FROM mcp_status_snapshots AS snapshot
+                    JOIN (SELECT server,MAX(id) AS id FROM mcp_status_snapshots GROUP BY server) AS latest
+                    ON snapshot.id=latest.id ORDER BY snapshot.server""").fetchall()
+                return [dict(row) for row in rows]
+            finally:
+                connection.close()
+        except sqlite3.OperationalError:
+            return []
 
     def record_model_discovery(self, provider, status, discovery_failed, models):
         with self.database.connect() as connection:

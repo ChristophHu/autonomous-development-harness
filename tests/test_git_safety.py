@@ -151,7 +151,7 @@ def test_push_target_rejects_unavailable_approved_source(tmp_path, monkeypatch):
         "harness.tools.subprocess.run",
         lambda args, **kwargs: subprocess.CompletedProcess(args, 1, "", "missing"),
     )
-    with pytest.raises(PermissionError, match="source branch is unavailable"):
+    with pytest.raises(PermissionError, match="Git source verification failed"):
         ToolExecutor(Permissions(config)).git_target(
             1, ["push", "origin", "main:refs/heads/topic"], tmp_path
         )

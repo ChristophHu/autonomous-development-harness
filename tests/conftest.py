@@ -1,10 +1,14 @@
 """Keep test collection independent from operator-owned runtime configuration."""
 
+import json
 import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+import pytest
 import yaml
+
+from harness.failure_trace import read_git_workflow_trace
 
 _temporary_config = None
 _previous_config_path = None
@@ -40,3 +44,24 @@ def pytest_unconfigure():
     if _temporary_config is not None:
         _temporary_config.cleanup()
         _temporary_config = None
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    outcome = yield
+    report = outcome.get_result()
+    if not report.failed or call.when != "call" or "git_" not in item.nodeid:
+        return
+    workspace = item.funcargs.get("tmp_path")
+    if workspace is None:
+        return
+    for database in sorted((*workspace.glob("*.sqlite"), *workspace.glob("*.db"))):
+        trace = read_git_workflow_trace(database)
+        if trace:
+            item.user_properties.append(
+                (
+                    "HARNESS_GIT_WORKFLOW_TRACE",
+                    json.dumps(trace, ensure_ascii=True, separators=(",", ":")),
+                )
+            )
+            return

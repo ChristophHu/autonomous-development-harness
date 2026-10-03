@@ -24,7 +24,92 @@ def test_profile_confines_descendants_and_metadata(tmp_path):
     assert "deny file-write*" in command[2]
     assert "deny process-exec" in command[2]
     assert '(allow file-read-data (literal "/dev/null"))' in command[2]
-    assert command[3:] == [str(Path(sys.executable).resolve()), "-c", "pass"]
+    assert command[3:] == [sys.executable, "-c", "pass"]
+
+
+def test_profile_preserves_virtualenv_executable_symlink(tmp_path, monkeypatch):
+    monkeypatch.setattr(isolation.sys, "platform", "darwin")
+    venv_python = tmp_path / "venv-python"
+    venv_python.symlink_to(sys.executable)
+
+    command = isolated_command([str(venv_python), "-m", "coverage"], tmp_path)
+
+    assert command[3:] == [str(venv_python), "-m", "coverage"]
+    assert f'(allow file-map-executable (literal "{venv_python}"))' not in command[2]
+    assert (
+        f'(allow file-map-executable (literal "{venv_python.resolve()}"))' in command[2]
+    )
+    assert f'(allow file-read-metadata (literal "{venv_python.parent}"))' in command[2]
+    assert f'(allow file-read-metadata (literal "{venv_python}"))' in command[2]
+    assert (
+        f'(allow file-read-metadata (literal "{venv_python.resolve()}"))' in command[2]
+    )
+
+
+def test_metadata_path_entries_follow_nested_symlink_targets(tmp_path):
+    actual_dir = tmp_path / "actual"
+    actual_dir.mkdir()
+    executable = actual_dir / "python"
+    executable.write_text("runtime")
+    alias_dir = tmp_path / "alias-dir"
+    alias_dir.symlink_to(actual_dir, target_is_directory=True)
+    alias_executable = alias_dir / "python"
+
+    entries = set(isolation._metadata_path_entries(alias_executable))
+
+    assert alias_dir in entries
+    assert alias_executable in entries
+    assert actual_dir in entries
+    assert executable in entries
+
+
+def test_python_profile_inspects_sqlite_extension_runtime_dependencies(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(isolation.sys, "platform", "darwin")
+    inspected = []
+    sqlite_extension = tmp_path / "_sqlite3.cpython-test.so"
+    sqlite_extension.write_bytes(b"extension")
+    monkeypatch.setattr(
+        isolation.sysconfig, "get_config_var", lambda _key: str(tmp_path)
+    )
+
+    def inspect(executables):
+        inspected.extend(executables)
+        return (tmp_path / "libsqlite3.dylib",)
+
+    monkeypatch.setattr(isolation, "_runtime_dylibs", inspect)
+    dependency = tmp_path / "libsqlite3.dylib"
+    dependency.write_bytes(b"sqlite")
+
+    profile = isolated_command([sys.executable, "-m", "coverage"], tmp_path)[2]
+
+    assert sqlite_extension in inspected
+    assert f'(allow file-read* (literal "{dependency}"))' in profile
+    assert f'(allow file-map-executable (literal "{dependency}"))' in profile
+
+
+def test_homebrew_python_metadata_grants_match_loaded_runtime(tmp_path):
+    python_version = isolation._homebrew_cellar_version(sys.base_prefix)
+    sqlite_extension = isolation._sqlite_extension_for_interpreter(sys.executable)
+    if python_version is None or sqlite_extension is None:
+        pytest.skip("Homebrew CPython with SQLite is not installed")
+    sqlite_libraries = isolation._runtime_dylibs((sqlite_extension,))
+    sqlite_libs = {
+        path.resolve(strict=True).parent
+        for path in sqlite_libraries
+        if path.name.startswith("libsqlite")
+    }
+    if not sqlite_libs:
+        pytest.skip("Homebrew SQLite dylib is not installed")
+
+    profile = isolated_command([sys.executable, "-m", "coverage"], tmp_path)[2]
+
+    assert f'(allow file-read-metadata (subpath "{python_version}"))' in profile
+    for directory in sqlite_libs:
+        assert f'(allow file-read-metadata (subpath "{directory}"))' in profile
+    assert '(allow file-read-metadata (subpath "/opt/homebrew"))' not in profile
+    assert '(allow file-read-metadata (subpath "/opt/homebrew/Cellar"))' not in profile
 
 
 def test_profile_allows_executable_mapping_only_for_runtime_paths(tmp_path):
@@ -52,7 +137,35 @@ def test_git_profile_grants_only_transitive_runtime_dylibs(tmp_path, monkeypatch
     for dylib in (pcre, gettext):
         assert f'(allow file-read* (literal "{dylib}"))' in profile
         assert f'(allow file-map-executable (literal "{dylib}"))' in profile
+    assert '(allow file-read-metadata (literal "/opt/homebrew/bin/git"))' in profile
+    assert '(allow file-read-metadata (subpath "/opt/homebrew/bin"))' not in profile
     assert '(allow file-read* (subpath "/opt/homebrew"))' not in profile
+    assert '(allow file-map-executable (subpath "/opt/homebrew"))' not in profile
+
+
+def test_explicit_macho_command_gets_only_its_runtime_dylib_grants(
+    tmp_path, monkeypatch
+):
+    executable = tmp_path / "copied-git"
+    dependency = tmp_path / "libpcre2.dylib"
+    executable.write_bytes(b"\xcf\xfa\xed\xfe" + bytes(16))
+    dependency.write_bytes(b"not a Mach-O image")
+    output = (
+        f"{executable}:\n\t{dependency} "
+        "(compatibility version 1.0.0, current version 1.0.0)\n"
+    )
+    monkeypatch.setattr(isolation.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        isolation,
+        "_OTOOL_RUN",
+        lambda command, **_kwargs: subprocess.CompletedProcess(command, 0, output, ""),
+    )
+
+    profile = isolated_command([str(executable), "--version"], tmp_path)[2]
+
+    assert f'(allow file-read* (literal "{dependency}"))' in profile
+    assert f'(allow file-map-executable (literal "{dependency}"))' in profile
+    assert f'(allow file-read* (subpath "{tmp_path.parent}"))' not in profile
     assert '(allow file-map-executable (subpath "/opt/homebrew"))' not in profile
 
 
@@ -84,7 +197,7 @@ def test_git_runtime_dylibs_walks_transitive_dependencies_and_cycles(
 
     monkeypatch.setattr(isolation, "_OTOOL_RUN", run)
 
-    result = isolation._git_runtime_dylibs((binary,))
+    result = isolation._runtime_dylibs((binary,))
 
     assert set(result) == {alias, first.resolve(), second.resolve()}
 
@@ -93,7 +206,7 @@ def test_git_runtime_dylibs_skips_non_macho_helpers(tmp_path):
     helper = tmp_path / "git-helper"
     helper.write_text("#!/bin/sh\nexit 0\n")
 
-    assert isolation._git_runtime_dylibs((helper,)) == ()
+    assert isolation._runtime_dylibs((helper,)) == ()
 
 
 def test_git_runtime_dylibs_rejects_unreadable_executable(tmp_path, monkeypatch):
@@ -109,7 +222,7 @@ def test_git_runtime_dylibs_rejects_unreadable_executable(tmp_path, monkeypatch)
     monkeypatch.setattr(Path, "open", open_path)
 
     with pytest.raises(PermissionError, match="runtime executable is unavailable"):
-        isolation._git_runtime_dylibs((binary,))
+        isolation._runtime_dylibs((binary,))
 
 
 @pytest.mark.parametrize(
@@ -135,7 +248,7 @@ def test_git_runtime_dylibs_rejects_unresolved_dependencies(
     )
 
     with pytest.raises(PermissionError, match=message):
-        isolation._git_runtime_dylibs((binary,))
+        isolation._runtime_dylibs((binary,))
 
 
 def test_git_runtime_dylibs_rejects_dependency_that_is_not_a_file(
@@ -156,7 +269,7 @@ def test_git_runtime_dylibs_rejects_dependency_that_is_not_a_file(
     )
 
     with pytest.raises(PermissionError, match="dependency is unavailable"):
-        isolation._git_runtime_dylibs((binary,))
+        isolation._runtime_dylibs((binary,))
 
 
 @pytest.mark.parametrize(
@@ -176,7 +289,7 @@ def test_git_runtime_dylibs_fails_closed_if_otool_fails(tmp_path, monkeypatch, f
     )
 
     with pytest.raises(PermissionError, match="cannot be inspected"):
-        isolation._git_runtime_dylibs((binary,))
+        isolation._runtime_dylibs((binary,))
 
 
 def test_run_otool_raises_with_captured_output_on_nonzero_exit(monkeypatch):
@@ -288,6 +401,47 @@ def test_restricted_mcp_profile_lists_read_roots_without_global_read(tmp_path):
         )
     with pytest.raises(PermissionError):
         isolated_command([sys.executable], workspace, read_roots=("relative",))
+
+
+def test_git_profile_honors_explicit_file_and_directory_read_roots(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    certificate = tmp_path / "cert.pem"
+    certificate.write_text("test certificate")
+    ssh_directory = tmp_path / "ssh"
+    ssh_directory.mkdir()
+
+    profile = isolated_command(
+        ["git", "status"],
+        workspace,
+        git=True,
+        read_roots=(certificate, ssh_directory),
+    )[2]
+
+    assert f'(allow file-read* (literal "{certificate}"))' in profile
+    assert f'(allow file-read* (subpath "{ssh_directory}"))' in profile
+    assert f'(allow file-read* (subpath "{tmp_path}"))' not in profile
+
+
+def test_unix_socket_profile_allows_metadata_on_lexical_symlink(tmp_path, monkeypatch):
+    actual = tmp_path / "actual"
+    actual.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(actual, target_is_directory=True)
+    socket_path = actual / "agent.sock"
+    socket_path.touch()
+    monkeypatch.setattr(Path, "is_socket", lambda path: path == socket_path)
+    profile = isolated_command(
+        [sys.executable, "-c", "pass"],
+        actual,
+        unix_sockets=(alias / "agent.sock",),
+    )[2]
+    assert f'(allow file-read-metadata (literal "{alias}"))' in profile
+    assert (
+        f'(allow network-outbound (remote unix-socket (literal "{socket_path}")))'
+        in profile
+    )
+    assert f'(allow file-read* (subpath "{tmp_path}"))' not in profile
 
 
 def test_process_profile_adds_validated_explicit_write_roots(tmp_path):
@@ -483,6 +637,15 @@ def test_git_access_profile_contains_fixed_helper_and_network_grants(
         2
     ]
     assert '(allow process-exec (literal "/usr/bin/git"))' in read_only
+
+
+def test_loopback_proxy_grant_applies_to_non_git_processes(tmp_path):
+    profile = isolated_command(
+        [sys.executable, "-c", "pass"], tmp_path, network_proxy=3128
+    )[2]
+    assert "(allow system-socket (socket-domain AF_INET))" in profile
+    assert '(allow network-outbound (remote ip "localhost:3128"))' in profile
+    assert "(deny network*)" not in profile
 
 
 def test_git_profile_rejects_relative_helper(tmp_path):

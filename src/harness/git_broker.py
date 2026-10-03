@@ -34,6 +34,7 @@ from .git_ssh import (
 )
 from .isolation import isolated_command
 from .process_control import run_cancellable, supervised_popen
+from .process_failures import process_failure_category
 from .workflows import GitWorkflow
 
 _LOCAL_GIT_HELPER_NAMES = (
@@ -559,7 +560,15 @@ class _LocalTransportCore:
             timeout=15,
             check=False,
         )
-        if result.returncode or (writing and result.stdout.strip() != "true"):
+        if result.returncode:
+            category = process_failure_category(result)
+            if category == "host_sandbox_blocked":
+                detail = "bare remote status" if writing else "remote Git status"
+                raise PermissionError(
+                    f"host sandbox blocked local Git verification; {detail} could not be verified"
+                )
+            raise PermissionError("local Git repository could not be verified")
+        if writing and result.stdout.strip() != "true":
             raise PermissionError("push requires a verified bare local remote")
         helper_dir = Path(server[3]).parent.parent / "libexec/git-core"
         helper = helper_dir / "git-remote-fd"
@@ -1108,6 +1117,8 @@ class HttpsTransport:
             check=False,
         )
         if result.returncode:
+            if process_failure_category(result) == "host_sandbox_blocked":
+                raise PermissionError("host sandbox blocked HTTPS Git helper lookup")
             raise PermissionError("trusted HTTPS Git helper lookup failed")
         helper_dir = Path(result.stdout.strip()).resolve(strict=True)
         helper = helper_dir / "git-remote-https"
@@ -1140,6 +1151,10 @@ class HttpsTransport:
                     "local Git HTTPS credential or URL override is prohibited"
                 )
             if check.returncode not in {1}:
+                if process_failure_category(check) == "host_sandbox_blocked":
+                    raise PermissionError(
+                        "host sandbox blocked HTTPS Git configuration verification"
+                    )
                 raise PermissionError(
                     "local Git HTTPS configuration could not be verified"
                 )

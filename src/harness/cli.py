@@ -13,6 +13,7 @@ import subprocess
 import threading
 import time
 import uuid
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import closing
 from datetime import UTC, datetime
@@ -28,12 +29,15 @@ from pydantic import ValidationError as PydanticValidationError
 
 from .completion import audit_gap_matrix, audit_harness_completion
 from .core import ROOT, Config, Task, build
+from .database import Database, OperationalSnapshotRepository
 from .docker_broker import DockerComposeBroker
+from .isolation_diagnostics import probe_sandbox_capability
 from .security import SecretResolver
 from .service_lifecycle import ServiceLifecycle
-from .services import ModelOperationsService
+from .services import ModelOperationsService, OperationalDiagnosticsService
 from .sqlite_operations import inspect_sqlite
 from .verification import source_tree_sha256
+from .verify_clusters import write_failure_clusters
 
 app = typer.Typer(no_args_is_help=True)
 tasks = typer.Typer(no_args_is_help=True)
@@ -44,6 +48,8 @@ artifacts = typer.Typer(no_args_is_help=True)
 memory = typer.Typer(no_args_is_help=True)
 memory_service = typer.Typer(no_args_is_help=True)
 evidence = typer.Typer(no_args_is_help=True)
+mcp = typer.Typer(no_args_is_help=True)
+isolation = typer.Typer(no_args_is_help=True)
 app.add_typer(tasks, name="tasks")
 app.add_typer(models, name="models")
 app.add_typer(config, name="config")
@@ -52,6 +58,104 @@ app.add_typer(artifacts, name="artifacts")
 app.add_typer(memory, name="memory")
 memory.add_typer(memory_service, name="service")
 app.add_typer(evidence, name="evidence")
+app.add_typer(mcp, name="mcp")
+app.add_typer(isolation, name="isolation")
+
+
+@isolation.command("doctor")
+def isolation_doctor(
+    output: Annotated[Path | None, typer.Option("--output")] = None,
+):
+    """Probe nested sandbox support in a disposable directory without skipping tests."""
+    try:
+        report = probe_sandbox_capability()
+        if output is not None:
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    except OSError as error:
+        typer.echo(f"Isolation capability probe failed: {type(error).__name__}")
+        raise typer.Exit(2) from None
+    typer.echo(json.dumps(report, ensure_ascii=False, sort_keys=True))
+    if not report["supported"]:
+        raise typer.Exit(1)
+
+
+@app.command("verify-clusters")
+def verify_clusters(
+    junit: Annotated[Path, typer.Option("--junit")] = Path(
+        "data/verification-junit.xml"
+    ),
+    output: Annotated[Path, typer.Option("--output")] = Path(
+        "data/verification-failure-clusters.json"
+    ),
+):
+    """Summarize failed tests from a JUnit report; never changes their result."""
+    try:
+        report = write_failure_clusters(junit, output)
+    except (OSError, ET.ParseError, ValueError) as error:
+        typer.echo(f"Could not cluster verification failures: {type(error).__name__}")
+        raise typer.Exit(2) from None
+    typer.echo(f"JUnit failures: {report['failed']}")
+    for cluster in report["clusters"]:
+        typer.echo(f"{cluster['category']}: {cluster['count']}")
+    typer.echo(f"Detailed report: {output}")
+
+
+@mcp.command("status")
+def mcp_status():
+    """Show configured MCP servers without starting them."""
+    from .mcp_manager import MCPServerManager
+
+    conf = Config()
+    manager = MCPServerManager(conf.data.get("tools", {}).get("mcp", {}))
+    reports = manager.report()
+    snapshots = {
+        row["server"]: row
+        for row in OperationalSnapshotRepository.read_latest_mcp_statuses(
+            conf.path("database")
+        )
+    }
+    now = datetime.now(UTC)
+    for item in reports:
+        previous = snapshots.get(item["name"])
+        item["last_probe"] = None
+        if previous:
+            item["last_probe"] = {
+                "observed_at": previous["observed_at"],
+                "state": previous["state"],
+                "error_type": previous["error_type"],
+            }
+            try:
+                observed = datetime.fromisoformat(previous["observed_at"])
+                if observed.tzinfo is None:
+                    observed = observed.replace(tzinfo=UTC)
+                item["last_probe"]["age_seconds"] = max(
+                    0, int((now - observed).total_seconds())
+                )
+            except (TypeError, ValueError):
+                item["last_probe"]["age_seconds"] = None
+    typer.echo(json.dumps(reports, ensure_ascii=False, indent=2))
+
+
+@mcp.command("doctor")
+def mcp_doctor():
+    """Probe each enabled MCP server independently."""
+    from .core import Permissions
+    from .tools import ToolRegistry
+
+    try:
+        conf = Config()
+        registry = ToolRegistry(Permissions(conf))
+        reports = registry.mcp_status(probe=True)
+        OperationalSnapshotRepository(
+            Database(conf.path("database"))
+        ).record_mcp_status(reports)
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        typer.echo(f"MCP doctor could not initialize: {type(error).__name__}")
+        raise typer.Exit(2) from None
+    typer.echo(json.dumps(reports, ensure_ascii=False, indent=2))
+    if any(item["state"] in {"unavailable", "invalid_config"} for item in reports):
+        raise typer.Exit(1)
 
 
 @app.command("decisions")
@@ -354,68 +458,37 @@ def _provider_roles(conf):
     return roles
 
 
+def _diagnostics_service(conf, store, orchestrator):
+    return OperationalDiagnosticsService(
+        conf,
+        store,
+        orchestrator,
+        lifecycle_factory=_lifecycle,
+        config_health=_config_health,
+        sqlite_health=_sqlite_health,
+        qdrant_reporter=_qdrant_report,
+        docker_broker_factory=DockerComposeBroker,
+        sqlite_inspector=inspect_sqlite,
+        which=shutil.which,
+        run=subprocess.run,
+        system=platform.system,
+        machine=platform.machine,
+        access=os.access,
+        connect=socket.create_connection,
+        provider_roles=_provider_roles,
+        provider_probe=_provider_probe,
+        provider_status=_provider_status,
+        component_health=_component_health,
+        executor_factory=ThreadPoolExecutor,
+        wait_for=wait,
+    )
+
+
 def _start_preflight(conf, store, orchestrator, *, provider_timeout=5.0):
-    """Check mandatory local startup dependencies and report optional services."""
-    checks = [
-        {
-            "name": "Configuration",
-            "status": "available" if _config_health(conf) else "unavailable",
-            "critical": True,
-        },
-        {
-            "name": "SQLite",
-            "status": "available"
-            if _sqlite_health(store) == "available"
-            else "unavailable",
-            "critical": True,
-        },
-    ]
-    provider_config = conf.data.get("models", {}).get("providers", {})
-    providers = orchestrator.models.providers
-    roles = _provider_roles(conf)
-    enabled = {name for name, value in provider_config.items() if value.get("enabled")}
-    probes = {name: providers[name] for name in roles.keys() & providers.keys()}
-    results = {}
-    executor = ThreadPoolExecutor(max_workers=max(1, min(len(probes), 8)))
-    futures = {
-        executor.submit(_provider_probe, item): name for name, item in probes.items()
-    }
-    try:
-        completed, pending = wait(futures, timeout=provider_timeout)
-        for future in completed:
-            result = future.result()
-            results[futures[future]] = _provider_status(result)
-        for future in pending:
-            future.cancel()
-            results[futures[future]] = "unavailable"
-    finally:
-        executor.shutdown(wait=False, cancel_futures=True)
-
-    for name in sorted(provider_config.keys() | roles.keys()):
-        role = roles.get(name, "unused")
-        if name in provider_config and name not in enabled:
-            state = "disabled"
-        elif name not in provider_config:
-            state = "not_configured"
-        elif name not in roles:
-            state = "unused"
-        elif name not in providers:
-            state = "unavailable"
-        else:
-            state = results.get(name, "unavailable")
-        checks.append(
-            {
-                "name": f"Provider {name}",
-                "status": state,
-                "critical": False,
-                "role": role,
-            }
-        )
-
-    qdrant_enabled = conf.data.get("memory", {}).get("qdrant", {}).get("enabled", False)
-    qdrant_state = _component_health(orchestrator.qdrant.health, enabled=qdrant_enabled)
-    checks.append({"name": "Qdrant", "status": qdrant_state, "critical": False})
-    return checks
+    """Compatibility wrapper; start-check ownership lives in the application service."""
+    return _diagnostics_service(conf, store, orchestrator).start_preflight(
+        provider_timeout=provider_timeout
+    )
 
 
 def _print_preflight(checks):
@@ -476,40 +549,24 @@ def stop():
 @app.command()
 def status():
     conf, store, orchestrator = build()
-    try:
-        service = _lifecycle().inspect()
-    except (OSError, RuntimeError, ValueError):
-        service = {"state": "unknown", "record": None, "ready": False}
-    running = service["state"] == "running"
-    counts = orchestrator.service.status_counts()
-    service_description = service["state"]
-    if running:
-        record = service.get("record") or {}
-        readiness = "ready" if service.get("ready") else "not ready"
-        service_description = (
-            f"running ({readiness}) pid={record.get('pid', 'unknown')}"
-        )
-    typer.echo(f"Harness: {service_description}")
-    typer.echo(f"SQLite: {_sqlite_health(store)}")
-    sqlite_report = inspect_sqlite(store.db)
+    report = _diagnostics_service(conf, store, orchestrator).status_report()
+    details = report.details
+    typer.echo(f"Harness: {details['service']}")
+    typer.echo(f"SQLite: {details['sqlite']}")
+    schema = details["sqlite_schema"]
     typer.echo(
-        f"SQLite schema: {sqlite_report['schema_version']}/"
-        f"{sqlite_report['expected_schema_version']} ({sqlite_report['status']})"
+        f"SQLite schema: {schema['schema_version']}/"
+        f"{schema['expected_schema_version']} ({schema['status']})"
     )
-    vault = conf.path("obsidian_vault")
-    typer.echo(
-        f"Obsidian: {_component_health(lambda: vault.is_dir() and os.access(vault, os.R_OK | os.W_OK))}"
-    )
-    qdrant_enabled = conf.data.get("memory", {}).get("qdrant", {}).get("enabled", False)
-    qdrant_report = _qdrant_report(orchestrator, enabled=qdrant_enabled)
+    typer.echo(f"Obsidian: {_component_health(lambda: details['vault'])}")
+    qdrant_report = details["qdrant"]
     typer.echo(f"Qdrant: {qdrant_report['service']}")
-    if qdrant_enabled:
+    if conf.data.get("memory", {}).get("qdrant", {}).get("enabled", False):
         typer.echo("Qdrant evidence: " + json.dumps(qdrant_report, sort_keys=True))
-    for name, count in counts.items():
+    for name, count in details["counts"].items():
         typer.echo(f"{name}: {count}")
-    for name, provider in orchestrator.models.providers.items():
-        report = _provider_probe(provider)
-        typer.echo(f"Provider {name}: {_provider_status(report)}")
+    for name, state in details["providers"].items():
+        typer.echo(f"Provider {name}: {state}")
 
 
 @app.command("metrics")
@@ -530,86 +587,16 @@ def runtime_metrics(
 @app.command()
 def doctor():
     conf, store, orchestrator = build()
-    sqlite_report = inspect_sqlite(store.db)
-    qdrant_enabled = conf.data.get("memory", {}).get("qdrant", {}).get("enabled", False)
-    docker_available = shutil.which("docker") is not None
-    compose_available = False
-    if docker_available and qdrant_enabled:
-        try:
-            compose_available = (
-                subprocess.run(
-                    ["docker", "compose", "version"],
-                    capture_output=True,
-                    timeout=3,
-                    check=False,
-                ).returncode
-                == 0
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            compose_available = False
-    docker_daemon_available = True
-    if qdrant_enabled and docker_available and compose_available:
-        try:
-            docker_daemon_available = (
-                DockerComposeBroker().run("status").returncode == 0
-            )
-        except (OSError, RuntimeError, ValueError):
-            docker_daemon_available = False
-    elif qdrant_enabled:
-        docker_daemon_available = False
-    try:
-        service = _lifecycle().inspect()
-    except (OSError, RuntimeError, ValueError):
-        service = {"state": "unknown", "record": None, "ready": False}
-    workspace = conf.path("workspace")
-    vault = conf.path("obsidian_vault")
-    log_dir = conf.path("logs")
-    providers = _provider_health(orchestrator.models.providers)
-    qdrant_report = _qdrant_report(orchestrator, enabled=qdrant_enabled)
-    checks = {
-        "macOS": platform.system() == "Darwin",
-        "Apple Silicon": platform.machine() == "arm64",
-        "Configuration": _config_health(conf),
-        "SQLite": _sqlite_health(store) == "available",
-        "SQLite Schema": sqlite_report["version_history_complete"],
-        "Git": shutil.which("git") is not None,
-        "Docker": docker_available or not qdrant_enabled,
-        "Docker Compose": compose_available or not qdrant_enabled,
-        "Docker Daemon / Qdrant Compose": docker_daemon_available,
-        "Obsidian Vault": vault.is_dir() and os.access(vault, os.R_OK | os.W_OK),
-        "Workspace": workspace.is_dir() and os.access(workspace, os.R_OK | os.W_OK),
-        "Logs Directory": log_dir.is_dir() and os.access(log_dir, os.W_OK),
-        "Qdrant": qdrant_report["healthy"],
-        "Qdrant Collection": not qdrant_enabled
-        or qdrant_report.get("collection_exists", False),
-        "API Service": service["state"] == "running" and service["ready"],
-    }
-    checks.update(
-        {f"Provider {name}": state == "available" for name, state in providers.items()}
-    )
-    if service["state"] == "running" and service["ready"]:
-        port_available = True
-    else:
-        try:
-            with socket.create_connection(
-                (
-                    conf.data.get("api", {}).get("host", "127.0.0.1"),
-                    conf.data.get("api", {}).get("port", 8080),
-                ),
-                timeout=0.2,
-            ):
-                port_available = False
-        except OSError:
-            port_available = True
-    checks["API Port Available"] = port_available
-    checks["API Service"] = service["state"] in {"stopped", "stale"} or (
-        service["state"] == "running" and service["ready"]
-    )
-    for label, ok in checks.items():
+    report = _diagnostics_service(conf, store, orchestrator).doctor_report()
+    providers = report.details["providers"]
+    mcp_servers = report.details["mcp"]
+    for label, ok in report.checks.items():
         typer.echo(f"{'✓' if ok else '✗'} {label}")
     for name, state in providers.items():
         typer.echo(f"Provider {name} status: {state}")
-    if not all(checks.values()):
+    for item in mcp_servers:
+        typer.echo(f"MCP {item['name']} status: {item['state']}")
+    if not report.healthy:
         raise typer.Exit(1)
 
 

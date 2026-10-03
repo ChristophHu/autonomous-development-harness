@@ -9,6 +9,7 @@ import json
 import shutil
 import subprocess
 import sys
+import sysconfig
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -42,8 +43,50 @@ def _run_otool(command, **_kwargs):
 _OTOOL_RUN = _run_otool
 
 
-def _git_runtime_dylibs(executables):
-    """Resolve non-system dylibs loaded by trusted Git executables/helpers."""
+def _homebrew_cellar_version(path):
+    """Locate the installed formula version containing a trusted runtime path."""
+    resolved = Path(path).resolve(strict=True)
+    for cellar in (Path("/opt/homebrew/Cellar"), Path("/usr/local/Cellar")):
+        if resolved.is_relative_to(cellar):
+            parts = resolved.relative_to(cellar).parts
+            if len(parts) >= 2:
+                return cellar / parts[0] / parts[1]
+    return None
+
+
+def _metadata_path_entries(path):
+    """Return exact path entries traversed, following symlink targets."""
+    path = Path(path)
+    if not path.is_absolute():
+        raise PermissionError("process read root must be absolute")
+    pending = [path]
+    visited = set()
+    entries = set()
+    while pending:
+        current = pending.pop()
+        prefix = Path(current.anchor)
+        entries.add(prefix)
+        for index, part in enumerate(current.parts[1:], start=1):
+            prefix = prefix / part
+            if prefix in visited:
+                continue
+            visited.add(prefix)
+            entries.add(prefix)
+            try:
+                if not prefix.is_symlink():
+                    continue
+                target = prefix.readlink()
+            except OSError as error:
+                raise PermissionError(
+                    "process read path cannot be inspected"
+                ) from error
+            resolved_target = target if target.is_absolute() else prefix.parent / target
+            pending.append(resolved_target.joinpath(*current.parts[index + 1 :]))
+    return tuple(sorted(entries, key=str))
+
+
+def _runtime_dylibs(executables):
+    """Resolve non-system dylibs loaded by explicitly launched executables."""
     pending = [Path(path).resolve(strict=True) for path in executables]
     inspected = set()
     allowed = set()
@@ -56,7 +99,7 @@ def _git_runtime_dylibs(executables):
             with executable.open("rb") as stream:
                 magic = stream.read(4)
         except OSError as error:
-            raise PermissionError("Git runtime executable is unavailable") from error
+            raise PermissionError("runtime executable is unavailable") from error
         if magic not in _MACHO_MAGICS:
             continue
         try:
@@ -67,9 +110,7 @@ def _git_runtime_dylibs(executables):
                 check=True,
             )
         except (OSError, subprocess.CalledProcessError) as error:
-            raise PermissionError(
-                "Git runtime dependencies cannot be inspected"
-            ) from error
+            raise PermissionError("runtime dependencies cannot be inspected") from error
         for line in result.stdout.splitlines()[1:]:
             entry = line.strip()
             if not entry:
@@ -79,15 +120,13 @@ def _git_runtime_dylibs(executables):
                 continue
             dependency = Path(install_name)
             if not dependency.is_absolute():
-                raise PermissionError("Git runtime dependency path is unresolved")
+                raise PermissionError("runtime dependency path is unresolved")
             try:
                 resolved = dependency.resolve(strict=True)
             except OSError as error:
-                raise PermissionError(
-                    "Git runtime dependency is unavailable"
-                ) from error
+                raise PermissionError("runtime dependency is unavailable") from error
             if not resolved.is_file():
-                raise PermissionError("Git runtime dependency is unavailable")
+                raise PermissionError("runtime dependency is unavailable")
             allowed.update((dependency, resolved))
             pending.append(resolved)
     return tuple(sorted(allowed, key=str))
@@ -100,6 +139,23 @@ def _stat_if_present(path):
         # SQLite journals and other transient workspace files may disappear
         # between rglob/is_file and stat while independent tasks run in parallel.
         return None
+
+
+def _sqlite_extension_for_interpreter(executable):
+    """Return CPython's SQLite extension when sandboxing this interpreter."""
+    try:
+        same_interpreter = Path(executable).resolve(strict=True) == Path(
+            sys.executable
+        ).resolve(strict=True)
+    except OSError:
+        return None
+    if not same_interpreter:
+        return None
+    extension_dir = sysconfig.get_config_var("DESTSHARED")
+    if not extension_dir:
+        return None
+    matches = sorted(Path(extension_dir).glob("_sqlite3*.so"))
+    return matches[0] if matches else None
 
 
 def git_metadata(root):
@@ -253,18 +309,26 @@ def isolated_command(
                 read_roots=read_roots or (), write_roots=write_roots or ()
             )
             if not git
-            else ProcessAccessProfile.broker("git")
+            else ProcessAccessProfile.broker(
+                "git", read_roots=read_roots or (), write_roots=write_roots or ()
+            )
         )
     if not isinstance(access_profile, ProcessAccessProfile):
         raise TypeError("access_profile must be a ProcessAccessProfile")
     command = list(command)
     if command and Path(command[0]).is_absolute():
         try:
-            command[0] = str(Path(command[0]).resolve(strict=True))
+            Path(command[0]).resolve(strict=True)
         except OSError as error:
             raise PermissionError("process executable is unavailable") from error
     git_executable = None
-    git_runtime_dylibs = ()
+    runtime_executables = []
+    sqlite_extension = None
+    if command and Path(command[0]).is_absolute():
+        runtime_executables.append(Path(command[0]).resolve(strict=True))
+        sqlite_extension = _sqlite_extension_for_interpreter(command[0])
+        if sqlite_extension is not None:
+            runtime_executables.append(sqlite_extension)
     if git:
         selected_git = shutil.which("git", path="/opt/homebrew/bin:/usr/bin:/bin")
         if not selected_git:
@@ -277,11 +341,11 @@ def isolated_command(
         command = [str(git_executable), *command[1:]]
         if any(not Path(helper).is_absolute() for helper in git_helpers):
             raise PermissionError("Git helper path must be absolute")
-        runtime_executables = [git_executable]
+        runtime_executables.append(git_executable)
         runtime_executables.extend(Path(path) for path in git_helpers)
         if git_shell:
             runtime_executables.extend((Path("/bin/sh"), Path("/bin/bash")))
-        git_runtime_dylibs = _git_runtime_dylibs(runtime_executables)
+    runtime_dylibs = _runtime_dylibs(runtime_executables)
     rules = [
         "(version 1)",
         "(deny default)",
@@ -291,6 +355,26 @@ def isolated_command(
         '(allow file-read-data (literal "/dev/null"))',
         '(allow file-write* (literal "/dev/null"))',
     ]
+    if git:
+        # Git may invoke itself through the fixed PATH entry. Permit stat() on
+        # that symlink so its child lookup does not fall back to /usr/bin/git.
+        rules.append(f"(allow file-read-metadata (literal {json.dumps(selected_git)}))")
+    if sqlite_extension is not None:
+        python_version = _homebrew_cellar_version(sys.base_prefix)
+        if python_version is not None:
+            rules.append(
+                f"(allow file-read-metadata (subpath {json.dumps(str(python_version))}))"
+            )
+        sqlite_libs = {
+            dependency.resolve(strict=True).parent
+            for dependency in runtime_dylibs
+            if dependency.name.startswith("libsqlite")
+            and _homebrew_cellar_version(dependency) is not None
+        }
+        for directory in sorted(sqlite_libs, key=str):
+            rules.append(
+                f"(allow file-read-metadata (subpath {json.dumps(str(directory))}))"
+            )
     system_roots = (
         Path("/System"),
         Path("/usr/lib"),
@@ -317,16 +401,36 @@ def isolated_command(
         candidate = Path(path)
         if not candidate.is_absolute():
             raise PermissionError("process read root must be absolute")
-        try:
-            candidate = candidate.resolve(strict=True)
-        except OSError as error:
-            raise PermissionError("process read root is unavailable") from error
-        rules.append(f"(allow file-read* (subpath {json.dumps(str(candidate))}))")
+        for entry in _metadata_path_entries(candidate):
+            rules.append(
+                f"(allow file-read-metadata (literal {json.dumps(str(entry))}))"
+            )
+        # A sandboxed execvp()/dyld traversal can inspect the entry itself,
+        # including a venv symlink, in addition to its parent directories.
+        rules.append(
+            f"(allow file-read-metadata (literal {json.dumps(str(candidate))}))"
+        )
+        # sandbox-exec must be able to traverse every lexical component (in
+        # particular venv/Homebrew symlink paths), not only the resolved root.
         for parent in candidate.parents:
             rules.append(
                 f"(allow file-read-metadata (literal {json.dumps(str(parent))}))"
             )
-    for dependency in git_runtime_dylibs:
+        try:
+            candidate = candidate.resolve(strict=True)
+        except OSError as error:
+            raise PermissionError("process read root is unavailable") from error
+        for entry in _metadata_path_entries(candidate):
+            rules.append(
+                f"(allow file-read-metadata (literal {json.dumps(str(entry))}))"
+            )
+        scope = "literal" if candidate.is_file() else "subpath"
+        rules.append(f"(allow file-read* ({scope} {json.dumps(str(candidate))}))")
+        for parent in candidate.parents:
+            rules.append(
+                f"(allow file-read-metadata (literal {json.dumps(str(parent))}))"
+            )
+    for dependency in runtime_dylibs:
         rules.append(f"(allow file-read* (literal {json.dumps(str(dependency))}))")
         for parent in dependency.parents:
             rules.append(
@@ -351,7 +455,7 @@ def isolated_command(
         rules.append(
             f"(allow file-map-executable (subpath {json.dumps(str(candidate))}))"
         )
-    for dependency in git_runtime_dylibs:
+    for dependency in runtime_dylibs:
         rules.append(
             f"(allow file-map-executable (literal {json.dumps(str(dependency))}))"
         )
@@ -393,17 +497,6 @@ def isolated_command(
                     '(allow mach-lookup (global-name "com.apple.system.opendirectoryd.libinfo"))',
                 ]
             )
-        if network_proxy is not None:
-            if (
-                isinstance(network_proxy, bool)
-                or not isinstance(network_proxy, int)
-                or not 1 <= network_proxy <= 65535
-            ):
-                raise ValueError("network proxy port is invalid")
-            rules.append("(allow system-socket (socket-domain AF_INET))")
-            rules.append(
-                f'(allow network-outbound (remote ip "localhost:{network_proxy}"))'
-            )
         for host, port in network_remotes:
             if (
                 not isinstance(host, str)
@@ -427,14 +520,30 @@ def isolated_command(
         )
         for path in sorted(git_metadata(root)):
             rules.append(f"(deny file-write* (subpath {json.dumps(str(path))}))")
+    if network_proxy is not None:
+        if (
+            isinstance(network_proxy, bool)
+            or not isinstance(network_proxy, int)
+            or not 1 <= network_proxy <= 65535
+        ):
+            raise ValueError("network proxy port is invalid")
+        rules.append("(allow system-socket (socket-domain AF_INET))")
+        rules.append(
+            f'(allow network-outbound (remote ip "localhost:{network_proxy}"))'
+        )
     executable_files = set(access_profile.executable_paths)
     executable_files.update(git_helpers)
     if command and Path(command[0]).is_absolute():
         executable_files.add(Path(command[0]))
-    for path in sorted(
-        (Path(item).resolve(strict=True) for item in executable_files), key=str
-    ):
-        rules.append(f"(allow file-map-executable (literal {json.dumps(str(path))}))")
+    for item in sorted(executable_files, key=str):
+        executable_path = Path(item)
+        try:
+            resolved_path = executable_path.resolve(strict=True)
+        except OSError as error:
+            raise PermissionError("process executable is unavailable") from error
+        rules.append(
+            f"(allow file-map-executable (literal {json.dumps(str(resolved_path))}))"
+        )
     if access_profile.executable_paths:
         rules.append("(deny process-exec)")
         allowed_executables = {
@@ -452,12 +561,17 @@ def isolated_command(
     if socket_paths:
         rules.append("(allow system-socket (socket-domain AF_UNIX))")
         for socket_path in socket_paths:
+            lexical_socket = Path(socket_path)
             try:
-                socket_path = Path(socket_path).resolve(strict=True)
+                socket_path = lexical_socket.resolve(strict=True)
             except OSError as error:
                 raise PermissionError("allowed Unix socket is unavailable") from error
             if not socket_path.is_socket():
                 raise PermissionError("allowed Unix socket is unavailable")
+            for entry in _metadata_path_entries(lexical_socket):
+                rules.append(
+                    f"(allow file-read-metadata (literal {json.dumps(str(entry))}))"
+                )
             rules.append(
                 "(allow network-outbound (remote unix-socket "
                 f"(literal {json.dumps(str(socket_path))})))"

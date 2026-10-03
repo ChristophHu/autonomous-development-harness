@@ -1,8 +1,15 @@
 """Shared application boundary for API and command-line operations."""
 
 import asyncio
+import os
+import platform
+import shutil
+import socket
+import subprocess
 import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor, wait
+from dataclasses import dataclass
 
 import httpx
 
@@ -10,6 +17,306 @@ from .domain import EventKind, Status, Task
 from .evidence import EvidenceRepository, audit_evidence
 from .process_control import RunControl, TaskCancelled, use_run_control
 from .providers import ProviderHealth
+from .sqlite_operations import inspect_sqlite
+
+
+@dataclass(frozen=True)
+class OperationalDiagnosticReport:
+    """Typed, stable result shared by command and API diagnostics callers."""
+
+    checks: dict[str, bool]
+    details: dict
+
+    @property
+    def healthy(self):
+        return all(self.checks.values())
+
+
+class OperationalDiagnosticsService:
+    """Collect health checks once and return render-neutral typed diagnostics."""
+
+    def __init__(
+        self,
+        configuration,
+        store,
+        orchestrator,
+        *,
+        lifecycle_factory,
+        config_health,
+        sqlite_health,
+        qdrant_reporter,
+        docker_broker_factory,
+        sqlite_inspector=inspect_sqlite,
+        which=shutil.which,
+        run=subprocess.run,
+        system=platform.system,
+        machine=platform.machine,
+        access=os.access,
+        connect=socket.create_connection,
+        provider_roles=None,
+        provider_probe=None,
+        provider_status=None,
+        component_health=None,
+        executor_factory=ThreadPoolExecutor,
+        wait_for=wait,
+    ):
+        self.configuration = configuration
+        self.store = store
+        self.orchestrator = orchestrator
+        self.lifecycle_factory = lifecycle_factory
+        self.config_health = config_health
+        self.sqlite_health = sqlite_health
+        self.qdrant_reporter = qdrant_reporter
+        self.docker_broker_factory = docker_broker_factory
+        self.sqlite_inspector = sqlite_inspector
+        self.which = which
+        self.run = run
+        self.system = system
+        self.machine = machine
+        self.access = access
+        self.connect = connect
+        self.provider_roles = provider_roles or (lambda _conf: {})
+        self.provider_probe = provider_probe
+        self.provider_status = provider_status
+        self.component_health = component_health or (
+            lambda call, *, enabled=True: (
+                "disabled" if not enabled else "available" if call() else "unavailable"
+            )
+        )
+        self.executor_factory = executor_factory
+        self.wait_for = wait_for
+
+    def start_preflight(self, *, provider_timeout=5.0):
+        """Collect start gates in the same service boundary as status and doctor."""
+        provider_probe = self.provider_probe or ModelOperationsService.probe_provider
+        provider_status = self.provider_status or ModelOperationsService.provider_status
+        conf, store, orchestrator = self.configuration, self.store, self.orchestrator
+        checks = [
+            {
+                "name": "Configuration",
+                "status": "available" if self.config_health(conf) else "unavailable",
+                "critical": True,
+            },
+            {
+                "name": "SQLite",
+                "status": "available"
+                if self.sqlite_health(store) == "available"
+                else "unavailable",
+                "critical": True,
+            },
+        ]
+        provider_config = conf.data.get("models", {}).get("providers", {})
+        providers = orchestrator.models.providers
+        roles = self.provider_roles(conf)
+        enabled = {
+            name for name, value in provider_config.items() if value.get("enabled")
+        }
+        probes = {name: providers[name] for name in roles.keys() & providers.keys()}
+        results = {}
+        executor = self.executor_factory(max_workers=max(1, min(len(probes), 8)))
+        futures = {
+            executor.submit(provider_probe, item): name for name, item in probes.items()
+        }
+        try:
+            completed, pending = self.wait_for(futures, timeout=provider_timeout)
+            for future in completed:
+                results[futures[future]] = provider_status(future.result())
+            for future in pending:
+                future.cancel()
+                results[futures[future]] = "unavailable"
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+        for name in sorted(provider_config.keys() | roles.keys()):
+            role = roles.get(name, "unused")
+            if name in provider_config and name not in enabled:
+                state = "disabled"
+            elif name not in provider_config:
+                state = "not_configured"
+            elif name not in roles:
+                state = "unused"
+            elif name not in providers:
+                state = "unavailable"
+            else:
+                state = results.get(name, "unavailable")
+            checks.append(
+                {
+                    "name": f"Provider {name}",
+                    "status": state,
+                    "critical": False,
+                    "role": role,
+                }
+            )
+        qdrant_enabled = (
+            conf.data.get("memory", {}).get("qdrant", {}).get("enabled", False)
+        )
+        qdrant_state = self.component_health(
+            orchestrator.qdrant.health, enabled=qdrant_enabled
+        )
+        checks.append({"name": "Qdrant", "status": qdrant_state, "critical": False})
+        return checks
+
+    def status_report(self):
+        try:
+            service = self.lifecycle_factory().inspect()
+        except (OSError, RuntimeError, ValueError):
+            service = {"state": "unknown", "record": None, "ready": False}
+        state = service["state"]
+        description = state
+        if state == "running":
+            record = service.get("record") or {}
+            readiness = "ready" if service.get("ready") else "not ready"
+            description = f"running ({readiness}) pid={record.get('pid', 'unknown')}"
+        vault = self.configuration.path("obsidian_vault")
+        vault_available = vault.is_dir() and self.access(vault, os.R_OK | os.W_OK)
+        qdrant_enabled = (
+            self.configuration.data.get("memory", {})
+            .get("qdrant", {})
+            .get("enabled", False)
+        )
+        qdrant = self.qdrant_reporter(self.orchestrator, enabled=qdrant_enabled)
+        provider_states = {
+            name: ModelOperationsService.provider_status(
+                ModelOperationsService.probe_provider(provider)
+            )
+            for name, provider in self.orchestrator.models.providers.items()
+        }
+        checks = {
+            "API Service": state == "running" and service.get("ready", False),
+            "SQLite": self.sqlite_health(self.store) == "available",
+            "Obsidian Vault": vault_available,
+            "Qdrant": qdrant["healthy"],
+            **{
+                f"Provider {name}": value == "available"
+                for name, value in provider_states.items()
+            },
+        }
+        return self.status(
+            checks,
+            details={
+                "service": description,
+                "sqlite": self.sqlite_health(self.store),
+                "sqlite_schema": self.sqlite_inspector(self.store.db),
+                "vault": vault_available,
+                "qdrant": qdrant,
+                "counts": self.orchestrator.service.status_counts(),
+                "providers": provider_states,
+            },
+        )
+
+    def doctor_report(self):
+        conf, store, orchestrator = self.configuration, self.store, self.orchestrator
+        qdrant_enabled = (
+            conf.data.get("memory", {}).get("qdrant", {}).get("enabled", False)
+        )
+        docker_available = self.which("docker") is not None
+        compose_available = False
+        if docker_available and qdrant_enabled:
+            try:
+                compose_available = (
+                    self.run(
+                        ["docker", "compose", "version"],
+                        capture_output=True,
+                        timeout=3,
+                        check=False,
+                    ).returncode
+                    == 0
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                compose_available = False
+        daemon_available = True
+        if qdrant_enabled and docker_available and compose_available:
+            try:
+                daemon_available = (
+                    self.docker_broker_factory().run("status").returncode == 0
+                )
+            except (OSError, RuntimeError, ValueError):
+                daemon_available = False
+        elif qdrant_enabled:
+            daemon_available = False
+        try:
+            service = self.lifecycle_factory().inspect()
+        except (OSError, RuntimeError, ValueError):
+            service = {"state": "unknown", "record": None, "ready": False}
+        providers = ModelOperationsService.providers_health(
+            orchestrator.models.providers
+        )
+        qdrant = self.qdrant_reporter(orchestrator, enabled=qdrant_enabled)
+        vault, workspace, logs = (
+            conf.path(key) for key in ("obsidian_vault", "workspace", "logs")
+        )
+        checks = {
+            "macOS": self.system() == "Darwin",
+            "Apple Silicon": self.machine() == "arm64",
+            "Configuration": self.config_health(conf),
+            "SQLite": self.sqlite_health(store) == "available",
+            "SQLite Schema": self.sqlite_inspector(store.db)[
+                "version_history_complete"
+            ],
+            "Git": self.which("git") is not None,
+            "Docker": docker_available or not qdrant_enabled,
+            "Docker Compose": compose_available or not qdrant_enabled,
+            "Docker Daemon / Qdrant Compose": daemon_available,
+            "Obsidian Vault": vault.is_dir() and self.access(vault, os.R_OK | os.W_OK),
+            "Workspace": workspace.is_dir()
+            and self.access(workspace, os.R_OK | os.W_OK),
+            "Logs Directory": logs.is_dir() and self.access(logs, os.W_OK),
+            "Qdrant": qdrant["healthy"],
+            "Qdrant Collection": not qdrant_enabled
+            or qdrant.get("collection_exists", False),
+            "API Service": service["state"] == "running" and service["ready"],
+        }
+        checks.update(
+            {
+                f"Provider {name}": state == "available"
+                for name, state in providers.items()
+            }
+        )
+        mcp = orchestrator.tools.mcp_status()
+        checks.update(
+            {
+                f"MCP {item['name']}": item["state"]
+                not in {"unavailable", "invalid_config"}
+                for item in mcp
+                if item["enabled"]
+            }
+        )
+        if service["state"] == "running" and service["ready"]:
+            port_available = True
+        else:
+            try:
+                with self.connect(
+                    (
+                        conf.data.get("api", {}).get("host", "127.0.0.1"),
+                        conf.data.get("api", {}).get("port", 8080),
+                    ),
+                    timeout=0.2,
+                ):
+                    port_available = False
+            except OSError:
+                port_available = True
+        checks["API Port Available"] = port_available
+        checks["API Service"] = service["state"] in {"stopped", "stale"} or (
+            service["state"] == "running" and service["ready"]
+        )
+        return self.doctor(
+            checks, details={"providers": providers, "mcp": mcp, "qdrant": qdrant}
+        )
+
+    @staticmethod
+    def status(checks, *, details=None):
+        if not isinstance(checks, dict) or any(
+            not isinstance(name, str) or type(ok) is not bool
+            for name, ok in checks.items()
+        ):
+            raise ValueError("diagnostic checks must map names to booleans")
+        if details is not None and not isinstance(details, dict):
+            raise ValueError("diagnostic details must be a mapping")
+        return OperationalDiagnosticReport(dict(checks), dict(details or {}))
+
+    @classmethod
+    def doctor(cls, checks, *, details=None):
+        return cls.status(checks, details=details)
 
 
 class VerificationEvidenceService:

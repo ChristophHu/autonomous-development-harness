@@ -7,6 +7,7 @@ import pytest
 
 from harness import cli
 from harness.core import Config, Orchestrator, Store, Task
+from harness.database import Database
 from harness.providers import ProviderHealth
 from harness.service_lifecycle import ServiceLifecycle
 
@@ -25,6 +26,51 @@ def _write_pid_record(path, pid, fingerprint):
             }
         )
     )
+
+
+def test_isolation_doctor_writes_report_and_returns_supported_status(
+    tmp_path, monkeypatch
+):
+    from typer.testing import CliRunner
+
+    monkeypatch.setattr(
+        cli,
+        "probe_sandbox_capability",
+        lambda: {
+            "status": "supported",
+            "supported": True,
+            "reason": None,
+            "checks": {"tcp_loopback": {"status": "supported"}},
+        },
+    )
+    output = tmp_path / "nested" / "isolation.json"
+    result = CliRunner().invoke(
+        cli.app, ["isolation", "doctor", "--output", str(output)]
+    )
+    assert result.exit_code == 0
+    assert json.loads(output.read_text()) == {
+        "status": "supported",
+        "supported": True,
+        "reason": None,
+        "checks": {"tcp_loopback": {"status": "supported"}},
+    }
+
+
+def test_isolation_doctor_returns_failure_for_host_blocked_probe(monkeypatch):
+    from typer.testing import CliRunner
+
+    monkeypatch.setattr(
+        cli,
+        "probe_sandbox_capability",
+        lambda: {
+            "status": "blocked_by_host",
+            "supported": False,
+            "reason": "sandbox_apply_denied",
+        },
+    )
+    result = CliRunner().invoke(cli.app, ["isolation", "doctor"])
+    assert result.exit_code == 1
+    assert "blocked_by_host" in result.stdout
 
 
 @pytest.fixture
@@ -538,7 +584,10 @@ def test_status_and_doctor(harness_context, monkeypatch, capsys):
     cli.status()
     initial_status = capsys.readouterr().out
     assert "stopped" in initial_status
-    assert "SQLite schema: 15/15 (available)" in initial_status
+    assert (
+        f"SQLite schema: {Database.CURRENT_SCHEMA_VERSION}/{Database.CURRENT_SCHEMA_VERSION} (available)"
+        in initial_status
+    )
 
     class LifecycleFixture:
         def __init__(self):
@@ -598,6 +647,80 @@ def test_status_and_doctor(harness_context, monkeypatch, capsys):
     with pytest.raises(cli.typer.Exit):
         cli.doctor()
     assert "✗ SQLite Schema" in capsys.readouterr().out
+
+
+def test_mcp_status_is_read_only_and_doctor_reports_server_failures(
+    harness_context, monkeypatch
+):
+    from typer.testing import CliRunner
+
+    cfg, _, _, _ = harness_context
+    cfg.data["tools"]["mcp"] = {
+        "servers": {
+            "offline": {"builtin": "filesystem"},
+            "disabled": {"builtin": "obsidian", "enabled": False},
+        }
+    }
+    monkeypatch.setattr(cli, "Config", lambda: cfg)
+    runner = CliRunner()
+    status = runner.invoke(cli.app, ["mcp", "status"])
+    assert status.exit_code == 0
+    assert '"state": "not_started"' in status.stdout
+    assert '"state": "disabled"' in status.stdout
+
+    class Registry:
+        def __init__(self, _permissions):
+            pass
+
+        def mcp_status(self, *, probe):
+            assert probe is True
+            return [
+                {"name": "offline", "state": "unavailable", "error": "OSError"},
+                {"name": "disabled", "state": "disabled", "error": None},
+            ]
+
+    monkeypatch.setattr("harness.tools.ToolRegistry", Registry)
+    doctor = runner.invoke(cli.app, ["mcp", "doctor"])
+    assert doctor.exit_code == 1
+    assert '"name": "disabled"' in doctor.stdout
+    assert '"name": "offline"' in doctor.stdout
+    status_after_probe = runner.invoke(cli.app, ["mcp", "status"])
+    assert status_after_probe.exit_code == 0
+    assert '"last_probe"' in status_after_probe.stdout
+    assert '"error_type": "OSError"' in status_after_probe.stdout
+
+
+def test_verify_clusters_command_emits_failure_groups(tmp_path):
+    from typer.testing import CliRunner
+
+    junit = tmp_path / "junit.xml"
+    junit.write_text(
+        '<testsuite><testcase nodeid="tests/test_x.py::test_a">'
+        '<failure message="Connection refused"/></testcase></testsuite>',
+        encoding="utf-8",
+    )
+    output = tmp_path / "clusters.json"
+    result = CliRunner().invoke(
+        cli.app,
+        ["verify-clusters", "--junit", str(junit), "--output", str(output)],
+    )
+    assert result.exit_code == 0
+    assert "network: 1" in result.stdout
+    assert "nodeid" not in result.stdout
+    assert json.loads(output.read_text())["failed"] == 1
+
+
+def test_verify_clusters_command_rejects_malformed_junit(tmp_path):
+    from typer.testing import CliRunner
+
+    junit = tmp_path / "broken.xml"
+    junit.write_text("not xml", encoding="utf-8")
+    result = CliRunner().invoke(
+        cli.app,
+        ["verify-clusters", "--junit", str(junit), "--output", str(tmp_path / "out")],
+    )
+    assert result.exit_code == 2
+    assert "ParseError" in result.stdout
 
 
 def test_status_and_doctor_fail_safe_diagnostics(harness_context, monkeypatch, capsys):

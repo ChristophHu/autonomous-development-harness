@@ -49,6 +49,8 @@ def _crash_during_task_update(path, task_id):
 def _downgrade_schema(connection, target_version):
     """Build a historical fixture by reversing the checked-in migrations."""
     reverse_steps = {
+        17: ("DROP TRIGGER mcp_status_no_update", "DROP TRIGGER mcp_status_no_delete"),
+        16: ("DROP INDEX mcp_status_latest", "DROP TABLE mcp_status_snapshots"),
         15: ("ALTER TABLE model_runs DROP COLUMN error_category",),
         14: ("ALTER TABLE questions DROP COLUMN purpose",),
         13: ("ALTER TABLE memory_health_snapshots DROP COLUMN source_sha256",),
@@ -224,7 +226,7 @@ def test_database_rejects_future_schema_version_without_mutating_it(tmp_path):
     Database(path)
     with closing(sqlite3.connect(path)) as connection, connection:
         connection.execute(
-            "INSERT INTO schema_versions(version, applied_at) VALUES(16, 'future')"
+            "INSERT INTO schema_versions(version, applied_at) VALUES(18, 'future')"
         )
 
     with pytest.raises(RuntimeError, match="newer than this Harness"):
@@ -236,7 +238,7 @@ def test_database_rejects_future_schema_version_without_mutating_it(tmp_path):
             connection.execute(
                 "SELECT version FROM schema_versions ORDER BY version DESC LIMIT 1"
             ).fetchone()[0]
-            == 16
+            == 18
         )
 
 
@@ -270,10 +272,7 @@ def test_version_13_database_migrates_without_losing_question_data(tmp_path):
             "INSERT INTO questions(task_id,question,reason,created_at) VALUES(?,?,?,?)",
             (task_id, "Keep this question", "migration", "t1"),
         )
-        connection.execute("ALTER TABLE questions DROP COLUMN purpose")
-        connection.execute("ALTER TABLE model_runs DROP COLUMN error_category")
-        connection.execute("DELETE FROM schema_versions WHERE version=15")
-        connection.execute("DELETE FROM schema_versions WHERE version=14")
+        _downgrade_schema(connection, 13)
 
     Database(path)
     with closing(sqlite3.connect(path)) as connection:
@@ -285,7 +284,7 @@ def test_version_13_database_migrates_without_losing_question_data(tmp_path):
             connection.execute(
                 "SELECT version FROM schema_versions ORDER BY version DESC LIMIT 1"
             ).fetchone()[0]
-            == 15
+            == Database.CURRENT_SCHEMA_VERSION
         )
     Database(path)
 
@@ -298,8 +297,7 @@ def test_version_14_migration_preserves_model_error_and_adds_category(tmp_path):
             "INSERT INTO model_runs(provider,model,created_at,error_type) VALUES(?,?,?,?)",
             ("local", "fixture", "t0", "RuntimeError"),
         )
-        connection.execute("ALTER TABLE model_runs DROP COLUMN error_category")
-        connection.execute("DELETE FROM schema_versions WHERE version=15")
+        _downgrade_schema(connection, 14)
 
     Database(path)
 
@@ -421,7 +419,9 @@ def test_simultaneous_process_database_initialization_is_serialized(tmp_path):
     assert sorted(queue.get(timeout=2) for _ in processes) == ["ok", "ok"]
     with closing(sqlite3.connect(path)) as connection:
         versions = connection.execute("SELECT version FROM schema_versions").fetchall()
-        assert [row[0] for row in versions] == list(range(1, 16))
+        assert [row[0] for row in versions] == list(
+            range(1, Database.CURRENT_SCHEMA_VERSION + 1)
+        )
 
 
 def test_independent_processes_cannot_claim_the_same_task(tmp_path):
@@ -503,7 +503,7 @@ def test_legacy_migration(tmp_path):
             for row in connection.execute(
                 "SELECT version FROM schema_versions ORDER BY version"
             )
-        ] == list(range(1, 16))
+        ] == list(range(1, Database.CURRENT_SCHEMA_VERSION + 1))
     legacy_decision = DecisionRepository(db).get(3)
     assert legacy_decision["decision"] == "old decision"
     assert legacy_decision["category"] == legacy_decision["source"] == "legacy"

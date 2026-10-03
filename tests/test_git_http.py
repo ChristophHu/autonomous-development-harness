@@ -403,6 +403,24 @@ def test_https_transport_fails_closed_when_config_cannot_be_checked(
         )
 
 
+def test_https_transport_classifies_host_blocked_helper_lookup(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "harness.git_broker.run_cancellable",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            [], 71, "", "sandbox_apply: Operation not permitted"
+        ),
+    )
+    with pytest.raises(
+        PermissionError, match="host sandbox blocked HTTPS Git helper lookup"
+    ):
+        HttpsTransport.prepare(
+            ["clone", "https://git.example.com/repo.git", "copy"],
+            tmp_path,
+            {},
+            allowed_hosts=["git.example.com"],
+        )
+
+
 def test_https_push_requires_a_secret_credential(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "harness.git_broker.isolated_command", lambda cmd, *_a, **_k: cmd

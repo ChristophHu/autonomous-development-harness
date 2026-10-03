@@ -287,11 +287,15 @@ def test_obsidian_registry_rejects_unexpected_builtin_tool(tmp_path, monkeypatch
         mcp,
         "MCPClient",
         lambda *_args, **_kwargs: SimpleNamespace(
-            discover=lambda: [{"name": "rogue", "inputSchema": {}}]
+            discover=lambda: [
+                {"name": "read_note", "inputSchema": {"type": "object"}},
+                {"name": "rogue", "inputSchema": {}},
+            ]
         ),
     )
-    with pytest.raises(ValueError, match="unknown tool"):
-        ToolRegistry(Permissions(config), workspace=workspace)
+    registry = ToolRegistry(Permissions(config), workspace=workspace)
+    assert registry.mcp_status(probe=True)[0]["state"] == "unavailable"
+    assert "mcp.vault.read_note" not in registry.list()
 
 
 def test_builtin_mcp_isolation_includes_python_base_runtime(tmp_path, monkeypatch):
@@ -317,7 +321,7 @@ def test_builtin_mcp_isolation_includes_python_base_runtime(tmp_path, monkeypatc
             return []
 
     monkeypatch.setattr(mcp, "MCPClient", Client)
-    ToolRegistry(Permissions(config), workspace=workspace)
+    ToolRegistry(Permissions(config), workspace=workspace).mcp_status(probe=True)
     assert Path(sys.base_prefix) in captured["read_roots"]
     assert (
         Path(__file__).resolve().parents[1] / "src" in captured["python_import_roots"]
@@ -352,7 +356,7 @@ def test_builtin_python_import_roots_are_scoped_to_builtin_mcp(tmp_path, monkeyp
             return [{"name": "echo", "inputSchema": {"type": "object"}}]
 
     monkeypatch.setattr(mcp, "MCPClient", Client)
-    ToolRegistry(Permissions(config), workspace=workspace)
+    ToolRegistry(Permissions(config), workspace=workspace).mcp_status(probe=True)
     assert captured["python_import_roots"] == ()
 
 
@@ -370,6 +374,7 @@ def test_native_obsidian_builtin_uses_read_only_vault_profile(tmp_path):
         "mcp": {"servers": {"vault": {"builtin": "obsidian"}}},
     }
     registry = ToolRegistry(Permissions(config), workspace=workspace)
+    registry.schemas(["mcp.vault.read_note", "mcp.vault.search_notes"])
     assert registry.execute("mcp.vault.read_note", {"path": "note.md"}) == {
         "content": "hello vault"
     }
@@ -394,6 +399,7 @@ def test_obsidian_builtin_is_read_only_and_profile_gated(tmp_path, monkeypatch):
         "harness.mcp.isolated_command", lambda command, *_args, **_kwargs: command
     )
     registry = ToolRegistry(Permissions(config), workspace=workspace)
+    registry.mcp_status(probe=True)
     assert registry.execute("mcp.vault.read_note", {"path": "note.md"}) == {
         "content": "memory"
     }
@@ -457,6 +463,7 @@ def test_apple_shell_builtin_registers_only_fixed_read_tool(tmp_path, monkeypatc
         "mcp": {"servers": {"apple_diagnostics": {"builtin": "apple_shell"}}},
     }
     registry = ToolRegistry(Permissions(config), workspace=workspace)
+    registry.mcp_status(probe=True)
     assert captured["command"] == mcp.builtin_apple_shell_command(workspace)
     assert captured["executable_paths"] == tuple(EXECUTABLES.values())
     assert (
@@ -472,8 +479,12 @@ def test_apple_shell_builtin_rejects_non_macos(tmp_path, monkeypatch):
     config.data["tools"] = {
         "mcp": {"servers": {"apple_diagnostics": {"builtin": "apple_shell"}}}
     }
-    with pytest.raises(ValueError, match="requires macOS"):
-        ToolRegistry(Permissions(config), workspace=tmp_path)
+    assert (
+        ToolRegistry(Permissions(config), workspace=tmp_path).mcp_status(probe=True)[0][
+            "state"
+        ]
+        == "unavailable"
+    )
 
 
 def test_filesystem_server_confines_paths_and_separates_permissions(tmp_path):
@@ -654,6 +665,7 @@ def test_registry_discovers_builtin_and_enforces_permissions(tmp_path, monkeypat
         "harness.mcp.isolated_command", lambda command, *_args, **_kwargs: command
     )
     registry = ToolRegistry(Permissions(config), workspace=workspace)
+    registry.schemas(["mcp.files.read_file"])
     assert "mcp.files.read_file" in registry.list()
     (workspace / "sample.txt").write_text("hello")
     assert registry.execute("mcp.files.read_file", {"path": "sample.txt"}) == {
@@ -1188,8 +1200,10 @@ def test_mcp_registry_rejects_bad_server_names_and_unknown_builtin_tools(
     root.mkdir()
     config = Config()
     config.data["tools"] = {"mcp": {"servers": {"bad.name": {"builtin": "filesystem"}}}}
-    with pytest.raises(ValueError, match="server name"):
-        ToolRegistry(Permissions(config), workspace=root)
+    assert (
+        ToolRegistry(Permissions(config), workspace=root).mcp_status()[0]["state"]
+        == "invalid_config"
+    )
     config.data["tools"]["mcp"]["servers"] = {"files": {"builtin": "filesystem"}}
     with monkeypatch.context() as patch:
         patch.setattr(
@@ -1199,8 +1213,8 @@ def test_mcp_registry_rejects_bad_server_names_and_unknown_builtin_tools(
                 discover=lambda: [{"name": "rogue", "inputSchema": {}}]
             ),
         )
-        with pytest.raises(ValueError, match="unknown tool"):
-            ToolRegistry(Permissions(config), workspace=root)
+        registry = ToolRegistry(Permissions(config), workspace=root)
+        assert registry.mcp_status(probe=True)[0]["state"] == "unavailable"
     with monkeypatch.context() as patch:
 
         def unavailable(*_args, **_kwargs):
@@ -1211,9 +1225,10 @@ def test_mcp_registry_rejects_bad_server_names_and_unknown_builtin_tools(
             "MCPClient",
             lambda *_args, **_kwargs: SimpleNamespace(discover=unavailable),
         )
-        with pytest.raises(ValueError, match="unavailable") as error:
-            ToolRegistry(Permissions(config), workspace=root)
-        assert "private" not in str(error.value)
+        registry = ToolRegistry(Permissions(config), workspace=root)
+        report = registry.mcp_status(probe=True)
+        assert report[0]["state"] == "unavailable"
+        assert "private" not in str(report)
 
 
 def test_mcp_audit_never_persists_arguments_or_results(tmp_path, monkeypatch):
@@ -1372,6 +1387,71 @@ def test_disabled_mcp_server_does_not_start(tmp_path, monkeypatch):
     )
 
 
+def test_mcp_registry_construction_does_not_start_enabled_server(tmp_path, monkeypatch):
+    root = tmp_path / "workspace"
+    root.mkdir()
+    config = Config()
+    config.data["tools"] = {"mcp": {"servers": {"files": {"builtin": "filesystem"}}}}
+    monkeypatch.setattr(
+        "harness.mcp.MCPClient",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("started")),
+    )
+
+    registry = ToolRegistry(Permissions(config), workspace=root)
+
+    assert "files" in registry.mcp_manager.names()
+    assert registry.mcp_status() == [
+        {
+            "name": "files",
+            "enabled": True,
+            "transport": "stdio",
+            "state": "not_started",
+            "checked_at": None,
+            "error": None,
+        }
+    ]
+    assert registry.schemas(["mcp.files.read_file"]) == []
+
+
+def test_mcp_schema_filtering_preserves_unknown_tool_validation(tmp_path):
+    root = tmp_path / "workspace"
+    root.mkdir()
+    registry = ToolRegistry(Permissions(Config()), workspace=root)
+
+    with pytest.raises(ValueError, match="profile references unknown tools"):
+        registry.schemas(["not-a-real-tool"])
+
+
+def test_mcp_manager_keeps_server_probe_failures_isolated():
+    from harness.mcp_manager import MCPServerManager
+
+    def probe(name):
+        if name == "offline":
+            raise OSError("private endpoint detail")
+
+    manager = MCPServerManager(
+        {
+            "servers": {
+                "offline": {"builtin": "filesystem"},
+                "healthy": {"builtin": "obsidian"},
+                "disabled": {"builtin": "filesystem", "enabled": False},
+            }
+        },
+        loader=probe,
+    )
+    manager.start("offline", force=True)
+    manager.start("healthy", force=True)
+    reports = manager.report()
+
+    assert [item["state"] for item in reports] == [
+        "unavailable",
+        "available",
+        "disabled",
+    ]
+    assert reports[0]["error"] == "OSError"
+    assert "private endpoint detail" not in str(reports)
+
+
 def test_registry_rejects_invalid_mcp_section_without_leaking_values(tmp_path):
     root = tmp_path / "workspace"
     root.mkdir()
@@ -1381,8 +1461,6 @@ def test_registry_rejects_invalid_mcp_section_without_leaking_values(tmp_path):
             "servers": {"files": {"builtin": "filesystem", "timeout": "PRIVATE_VALUE"}}
         }
     }
-    with pytest.raises(
-        ValueError, match="tools.mcp has invalid configuration"
-    ) as error:
-        ToolRegistry(Permissions(config), workspace=root)
-    assert "PRIVATE_VALUE" not in str(error.value)
+    report = ToolRegistry(Permissions(config), workspace=root).mcp_status()
+    assert report[0]["state"] == "invalid_config"
+    assert "PRIVATE_VALUE" not in str(report)
