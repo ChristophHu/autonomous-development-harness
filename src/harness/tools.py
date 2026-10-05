@@ -101,7 +101,15 @@ class ToolExecutor:
         environment["GIT_CONFIG_GLOBAL"] = "/dev/null"
         return environment
 
-    def shell(self, command, cwd=None, *, read_roots=None, write_roots=None):
+    def shell(
+        self,
+        command,
+        cwd=None,
+        *,
+        read_roots=None,
+        write_roots=None,
+        access_profile=None,
+    ):
         self.permissions.require("shell", write=True)
         args = ["/bin/zsh", "-lc", command] if isinstance(command, str) else command
         if not args or not all(isinstance(arg, str) and arg for arg in args):
@@ -116,7 +124,8 @@ class ToolExecutor:
             isolated_command(
                 args,
                 cwd,
-                access_profile=ProcessAccessProfile.workspace(
+                access_profile=access_profile
+                or ProcessAccessProfile.workspace(
                     read_roots=read_roots or (), write_roots=write_roots or ()
                 ),
             ),
@@ -504,6 +513,7 @@ class ToolRegistry:
         self.workspace.mkdir(parents=True, exist_ok=True)
         self.specs = {}
         self.recovery_paths = ContextVar("recovery_paths", default=None)
+        self.step_paths = ContextVar("step_paths", default=None)
         self.register(
             ToolSpec(
                 "filesystem.read",
@@ -916,9 +926,8 @@ class ToolRegistry:
     def mcp_status(self, *, probe=False):
         if not probe:
             return self.mcp_manager.report()
-        if probe:
-            for server_name in self.mcp_manager.names():
-                self.mcp_manager.start(server_name, force=True)
+        for server_name in self.mcp_manager.names():
+            self.mcp_manager.start(server_name, force=True)
         return self.mcp_manager.report()
 
     def execute(
@@ -984,6 +993,24 @@ class ToolRegistry:
             target = (self.workspace / arguments["path"]).resolve()
             if target not in paths:
                 raise PermissionError("write is outside recovery step scope")
+        step_paths = self.step_paths.get()
+        if step_paths is not None and risk != "READ":
+            if name.startswith("filesystem."):
+                for key in ("path", "destination"):
+                    value = arguments.get(key)
+                    if not isinstance(value, str):
+                        continue
+                    target = (self.workspace / value).resolve()
+                    if not any(
+                        target == allowed
+                        or (allowed.is_dir() and target.is_relative_to(allowed))
+                        for allowed in step_paths
+                    ):
+                        raise PermissionError("write is outside executor step scope")
+            elif name not in {"shell.execute", "test.run_tests", "test.run_file"}:
+                raise PermissionError(
+                    "unscoped mutation prohibited during executor step"
+                )
         if name.startswith("filesystem.") and risk in {"WRITE", "DESTRUCTIVE"}:
             from .isolation import git_metadata
 
@@ -1089,6 +1116,20 @@ class ToolRegistry:
         finally:
             self.recovery_paths.reset(token)
 
+    @contextmanager
+    def step_writes(self, paths):
+        selected = set()
+        for name in paths:
+            path = (self.workspace / name).resolve()
+            if not path.is_relative_to(self.workspace):
+                raise PermissionError("executor step path escapes workspace")
+            selected.add(path)
+        token = self.step_paths.set(frozenset(selected))
+        try:
+            yield
+        finally:
+            self.step_paths.reset(token)
+
     def read_file(self, path):
         return self.executor.filesystem("read", path, workspace=self.workspace)
 
@@ -1118,11 +1159,23 @@ class ToolRegistry:
                 )
             )
         )
+        selected = self.step_paths.get()
+        access_profile = (
+            ProcessAccessProfile.workspace(
+                read_roots=runtime_roots,
+                write_roots=(temporary_root,),
+                workspace_writable=False,
+                write_paths=tuple(sorted(selected, key=str)),
+            )
+            if selected is not None
+            else None
+        )
         return self.executor.shell(
             command,
             cwd=self._workspace_cwd(cwd),
             read_roots=runtime_roots,
             write_roots=(temporary_root,),
+            access_profile=access_profile,
         )
 
     def run_test_file(self, command, path, cwd=None):

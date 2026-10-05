@@ -25,6 +25,11 @@ def pytest_configure():
         for server in servers.values():
             if isinstance(server, dict):
                 server["enabled"] = False
+    api = operator_config.get("api", {})
+    if isinstance(api, dict):
+        metrics_listener = api.get("metrics_listener", {})
+        if isinstance(metrics_listener, dict):
+            metrics_listener["enabled"] = False
 
     _previous_config_path = os.environ.get("HARNESS_CONFIG_PATH")
     _temporary_config = TemporaryDirectory(prefix="harness-pytest-config-")

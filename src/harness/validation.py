@@ -274,7 +274,14 @@ class EvidenceValidator:
             errors.append(f"executor result has no plan step: {unexpected}")
         return errors, planned
 
-    def _change_findings(self, outputs, planned, workspace_before, workspace_after):
+    def _change_findings(
+        self,
+        outputs,
+        planned,
+        workspace_before,
+        workspace_after,
+        coverage_report="coverage.json",
+    ):
         errors = []
         claimed = set()
         evidenced = set()
@@ -348,6 +355,7 @@ class EvidenceValidator:
                 name
                 for name in before_filesystem.keys() | after_filesystem.keys()
                 if before_filesystem.get(name) != after_filesystem.get(name)
+                and not self._generated_test_output(name, coverage_report)
             }
             for name in changed_entries:
                 entry = after_filesystem.get(name) or before_filesystem.get(name)
@@ -396,6 +404,47 @@ class EvidenceValidator:
                     errors.append(f"changed file claim lacks tool evidence: {name}")
         return errors, sorted(observed)
 
+    @staticmethod
+    def _generated_test_output(path, coverage_report):
+        return (
+            path in {".coverage", coverage_report, ".pytest_cache"}
+            or path.startswith((".coverage.", ".pytest_cache/"))
+            or "/__pycache__/" in f"/{path}/"
+            or path.endswith(".pyc")
+        )
+
+    @staticmethod
+    def _test_side_effect_findings(
+        workspace_after_executor, workspace_after_tests, coverage_report
+    ):
+        """Reject test-run mutations except known generated reports/caches."""
+        if workspace_after_executor is None and workspace_after_tests is None:
+            return []
+        if not isinstance(workspace_after_executor, dict) or not isinstance(
+            workspace_after_tests, dict
+        ):
+            return ["workspace snapshot around test execution is missing"]
+        before = workspace_after_executor.get("filesystem")
+        after = workspace_after_tests.get("filesystem")
+        if not isinstance(before, dict) or not isinstance(after, dict):
+            return ["workspace filesystem snapshot around tests is invalid"]
+        identity_errors = [
+            f"test execution changed workspace identity: {field}"
+            for field in ("applicable", "root", "branch", "head")
+            if field in workspace_after_executor or field in workspace_after_tests
+            if workspace_after_executor.get(field) != workspace_after_tests.get(field)
+        ]
+        changed = sorted(
+            path
+            for path in set(before) | set(after)
+            if before.get(path) != after.get(path)
+            and not EvidenceValidator._generated_test_output(path, coverage_report)
+        )
+        return identity_errors + [
+            f"test execution modified workspace outside generated outputs: {path}"
+            for path in changed
+        ]
+
     def run_tests(self, task):
         test_input = {
             "task_id": task.id,
@@ -441,6 +490,7 @@ class EvidenceValidator:
         workspace_before=None,
         workspace_after=None,
         verify_workspace_changes=True,
+        workspace_after_tests=None,
     ):
         self.validator_profile.validate_input(
             {
@@ -514,7 +564,11 @@ class EvidenceValidator:
         add_findings("plan", "plan.alignment", plan_errors, source="plan_validator")
         if verify_workspace_changes:
             change_errors, observed_changes = self._change_findings(
-                outputs, planned, workspace_before, workspace_after
+                outputs,
+                planned,
+                workspace_before,
+                workspace_after,
+                task.coverage_report,
             )
         else:
             change_errors, observed_changes = [], []
@@ -524,6 +578,22 @@ class EvidenceValidator:
             "workspace.integrity",
             change_errors,
             source="workspace_validator",
+        )
+        test_mutations = (
+            self._test_side_effect_findings(
+                workspace_after,
+                workspace_after_tests,
+                task.coverage_report,
+            )
+            if workspace_after_tests is not None
+            else []
+        )
+        errors.extend(test_mutations)
+        add_findings(
+            "workspace",
+            "tests.workspace_mutation",
+            test_mutations,
+            source="test_runner_validator",
         )
         coverage = tests.get("coverage") if isinstance(tests, dict) else None
         coverage_errors = []
@@ -602,6 +672,7 @@ class EvidenceValidator:
             ):
                 acceptance_errors.append(f"acceptance criterion failed: {criterion.id}")
         evidence_catalog = {
+            *(f"plan-step:{step['id']}" for step in planned.values()),
             *(f"file:{name}" for name in artifacts),
             *(f"criterion:{name}" for name in observations),
             *(
@@ -630,7 +701,7 @@ class EvidenceValidator:
                 IndependentReviewOutput,
                 self.router.complete(
                     self.profile.name,
-                    "REVIEW: Independently verify every requirement and acceptance criterion against these observations. Return JSON with requirements (exact requirement strings mapped to booleans), criteria (criterion IDs mapped to booleans), requirement_evidence (each exact requirement string mapped to one or more available evidence IDs), criterion_evidence (each criterion ID mapped to one or more available evidence IDs), and evidence (nonempty summary string). Evidence IDs are exactly file:<path>, criterion:<id>, or test:<command> from the supplied observations. Do not invent IDs.\n"
+                    "REVIEW: Independently compare every requirement and acceptance criterion with its mapped plan step, the actual observed workspace diff/artifact contents, and fresh test results. A plan claim alone is not proof: return true only when observed evidence supports the requirement. Return JSON with requirements (exact requirement strings mapped to booleans), criteria (criterion IDs mapped to booleans), requirement_evidence and criterion_evidence (each key mapped to one or more available IDs; cite at least one matching plan-step:<id> and at least one observed file:<path>, criterion:<id>, or test:<command> ID), and evidence (nonempty summary). Do not invent IDs or mark unsupported/unclear work as confirmed.\n"
                     + json.dumps(
                         {
                             "task": task.model_dump(mode="json"),
@@ -696,6 +767,44 @@ class EvidenceValidator:
         requirement_evidence = review.get("requirement_evidence")
         criterion_evidence = review.get("criterion_evidence")
         available = set(available_evidence or ())
+
+        def evidence_is_traceable(references, expected_steps):
+            if not isinstance(references, list) or not references:
+                return False
+            if not all(
+                isinstance(reference, str) and reference in available
+                for reference in references
+            ):
+                return False
+            cited_steps = {item for item in references if item.startswith("plan-step:")}
+            observed = {
+                item for item in references if not item.startswith("plan-step:")
+            }
+            return bool(cited_steps & expected_steps) and bool(observed)
+
+        plan_steps = (
+            task.plan.get("subtasks", []) if isinstance(task.plan, dict) else []
+        )
+        requirement_steps = {
+            requirement: {
+                f"plan-step:{step['id']}"
+                for step in plan_steps
+                if isinstance(step, dict)
+                and isinstance(step.get("id"), str)
+                and requirement in step.get("requirement_ids", [])
+            }
+            for requirement in task.requirements
+        }
+        criterion_steps = {
+            criterion.id: {
+                f"plan-step:{step['id']}"
+                for step in plan_steps
+                if isinstance(step, dict)
+                and isinstance(step.get("id"), str)
+                and criterion.id in step.get("acceptance_criteria", [])
+            }
+            for criterion in task.acceptance_criteria
+        }
         return (
             isinstance(evidence, str)
             and bool(evidence.strip())
@@ -709,16 +818,12 @@ class EvidenceValidator:
             and set(criterion_evidence)
             == {item.id for item in task.acceptance_criteria}
             and all(
-                isinstance(references, list)
-                and bool(references)
-                and all(
-                    isinstance(reference, str) and reference in available
-                    for reference in references
-                )
-                for references in (
-                    *requirement_evidence.values(),
-                    *criterion_evidence.values(),
-                )
+                evidence_is_traceable(requirement_evidence[key], requirement_steps[key])
+                for key in task.requirements
+            )
+            and all(
+                evidence_is_traceable(criterion_evidence[key], criterion_steps[key])
+                for key in criterion_steps
             )
             and all(requirements.get(value) is True for value in task.requirements)
             and all(

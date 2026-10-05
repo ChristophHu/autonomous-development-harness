@@ -4,6 +4,7 @@ The Docker daemon is a privileged boundary, so arbitrary Docker CLI arguments,
 mounts, images, contexts and TCP daemon endpoints are never forwarded.
 """
 
+import json
 import os
 import re
 import shutil
@@ -31,6 +32,14 @@ _ISOLATED_ACTIONS = {"status", "start", "stop", "restart", "cleanup"}
 _PINNED_QDRANT_IMAGE = re.compile(
     r"qdrant/qdrant:v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?"
     r"|qdrant/qdrant@sha256:[0-9a-f]{64}"
+)
+DOCKER_COMPOSE_PLUGIN_PATHS = (
+    Path("/Applications/Docker.app/Contents/Resources/cli-plugins/docker-compose"),
+    Path("/opt/homebrew/lib/docker/cli-plugins/docker-compose"),
+    Path("/usr/local/lib/docker/cli-plugins/docker-compose"),
+    Path("/usr/local/libexec/docker/cli-plugins/docker-compose"),
+    Path("/usr/lib/docker/cli-plugins/docker-compose"),
+    Path("/usr/libexec/docker/cli-plugins/docker-compose"),
 )
 
 
@@ -88,6 +97,33 @@ class DockerComposeBroker:
             raise PermissionError("Docker CLI is not a trusted host executable")
         return resolved
 
+    @staticmethod
+    def _compose_plugin():
+        """Resolve Compose only from fixed Docker Desktop/system plugin paths."""
+        for candidate in DOCKER_COMPOSE_PLUGIN_PATHS:
+            try:
+                resolved = candidate.resolve(strict=True)
+            except OSError:
+                continue
+            if resolved.is_file() and os.access(resolved, os.X_OK):
+                return resolved
+        raise PermissionError("Docker Compose plugin is unavailable")
+
+    def _docker_environment(self, temporary_root):
+        """Use an isolated Docker config exposing only the trusted Compose plugin."""
+        plugin = self._compose_plugin()
+        config = Path(temporary_root) / "docker-config"
+        config.mkdir(mode=0o700)
+        config_file = config / "config.json"
+        config_file.write_text(
+            json.dumps({"cliPluginsExtraDirs": [str(plugin.parent)]})
+        )
+        config_file.chmod(0o600)
+        empty_env = config / "empty.env"
+        empty_env.write_text("")
+        empty_env.chmod(0o600)
+        return config
+
     def _socket(self):
         if not self.socket_path.is_absolute():
             raise PermissionError("Docker daemon socket path must be absolute")
@@ -140,7 +176,7 @@ class DockerComposeBroker:
             "--project-name",
             project_name,
             "--env-file",
-            "/dev/null",
+            str(project_directory / "docker-config" / "empty.env"),
             "-f",
             str(compose_file),
         ]
@@ -208,11 +244,12 @@ class DockerComposeBroker:
         )
 
     def _sandboxed_command(self, command, *, compose_file, temporary_root):
+        compose_plugin = self._compose_plugin()
         profile = ProcessAccessProfile.broker(
             "docker_compose",
-            read_roots=(compose_file,),
+            read_roots=(temporary_root,),
             write_roots=(temporary_root,),
-            executable_paths=(command[0],),
+            executable_paths=(command[0], compose_plugin),
             unix_sockets=(self._socket(),),
         )
         return isolated_command(
@@ -238,12 +275,16 @@ class DockerComposeBroker:
             with tempfile.TemporaryDirectory(
                 prefix="adh-test-compose-", dir="/private/tmp"
             ) as directory:
+                project_directory = Path(directory) / "project"
+                project_directory.mkdir()
                 env = {
                     "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
                     "HOME": directory,
                     "LANG": os.environ.get("LANG", "C.UTF-8"),
                 }
-                snapshot = Path(directory) / "docker-compose.yml"
+                docker_config = self._docker_environment(project_directory)
+                env["DOCKER_CONFIG"] = str(docker_config)
+                snapshot = project_directory / "docker-compose.yml"
                 snapshot.write_text(
                     self._isolated_manifest(project_name, image or IMAGE)
                 )
@@ -259,7 +300,7 @@ class DockerComposeBroker:
                 result = run_cancellable(
                     subprocess.run,
                     command,
-                    cwd=PROJECT_ROOT,
+                    cwd=project_directory,
                     env=env,
                     capture_output=True,
                     text=True,
@@ -451,19 +492,23 @@ class DockerComposeBroker:
             with tempfile.TemporaryDirectory(
                 prefix="adh-compose-", dir="/private/tmp"
             ) as directory:
+                project_directory = Path(directory) / "project"
+                project_directory.mkdir()
                 env = {
                     "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
                     "HOME": directory,
                     "LANG": os.environ.get("LANG", "C.UTF-8"),
                 }
-                snapshot = Path(directory) / "docker-compose.yml"
+                docker_config = self._docker_environment(project_directory)
+                env["DOCKER_CONFIG"] = str(docker_config)
+                snapshot = project_directory / "docker-compose.yml"
                 snapshot.write_text(manifest_text)
                 snapshot.chmod(0o600)
                 docker_command = self.command(
                     action,
                     tail=tail,
                     compose_file=snapshot,
-                    project_directory=Path(directory),
+                    project_directory=project_directory,
                 )
                 command = self._sandboxed_command(
                     docker_command,
@@ -473,7 +518,7 @@ class DockerComposeBroker:
                 result = run_cancellable(
                     subprocess.run,
                     command,
-                    cwd=PROJECT_ROOT,
+                    cwd=project_directory,
                     env=env,
                     capture_output=True,
                     text=True,

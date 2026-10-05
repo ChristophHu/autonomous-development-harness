@@ -110,22 +110,33 @@ class Provider:
             )
         payload = json.loads(prompt.split("\n", 1)[1])
         available = payload["available_evidence_ids"]
-        reference = available[0] if available else None
         requirements = payload["task"]["requirements"]
         criteria = [item["id"] for item in payload["task"]["acceptance_criteria"]]
+        steps = payload["task"].get("plan", {}).get("subtasks", [])
+
+        def references(key, requirement):
+            field = "requirement_ids" if requirement else "acceptance_criteria"
+            matching = [
+                f"plan-step:{step['id']}"
+                for step in steps
+                if key in step.get(field, [])
+            ]
+            observed = next(
+                (item for item in available if not item.startswith("plan-step:")),
+                None,
+            )
+            return [*matching[:1], *([observed] if observed else [])]
+
         return json.dumps(
             {
                 "requirements": dict.fromkeys(requirements, True),
                 "criteria": dict.fromkeys(criteria, True),
                 "evidence": "Observed current source artifacts and fresh test reports.",
                 "requirement_evidence": {
-                    name: [reference] if reference else [] for name in requirements
+                    name: references(name, True) for name in requirements
                 },
                 "criterion_evidence": {
-                    name: [f"criterion:{name}"]
-                    if f"criterion:{name}" in available
-                    else ([reference] if reference else [])
-                    for name in criteria
+                    name: references(name, False) for name in criteria
                 },
             }
         )

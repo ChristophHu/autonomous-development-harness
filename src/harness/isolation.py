@@ -245,11 +245,19 @@ class ProcessAccessProfile:
     write_roots: tuple[Path, ...] = ()
     executable_paths: tuple[Path, ...] = ()
     unix_sockets: tuple[Path, ...] = ()
+    workspace_writable: bool = True
+    write_paths: tuple[Path, ...] = ()
 
     @classmethod
-    def workspace(cls, *, read_roots=(), write_roots=()):
+    def workspace(
+        cls, *, read_roots=(), write_roots=(), workspace_writable=True, write_paths=()
+    ):
         return cls(
-            "workspace", tuple(map(Path, read_roots)), tuple(map(Path, write_roots))
+            "workspace",
+            tuple(map(Path, read_roots)),
+            tuple(map(Path, write_roots)),
+            workspace_writable=workspace_writable,
+            write_paths=tuple(map(Path, write_paths)),
         )
 
     @classmethod
@@ -460,7 +468,17 @@ def isolated_command(
             f"(allow file-map-executable (literal {json.dumps(str(dependency))}))"
         )
     if not read_only:
-        rules.append(f"(allow file-write* (subpath {json.dumps(str(root))}))")
+        if access_profile.workspace_writable:
+            rules.append(f"(allow file-write* (subpath {json.dumps(str(root))}))")
+        for path in access_profile.write_paths:
+            candidate = Path(path)
+            if not candidate.is_absolute():
+                raise PermissionError("process write path must be absolute")
+            candidate = candidate.resolve()
+            if not candidate.is_relative_to(root):
+                raise PermissionError("process write path escapes workspace")
+            scope = "subpath" if candidate.is_dir() else "literal"
+            rules.append(f"(allow file-write* ({scope} {json.dumps(str(candidate))}))")
         for path in access_profile.write_roots:
             candidate = Path(path)
             if not candidate.is_absolute():

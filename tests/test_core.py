@@ -1,10 +1,12 @@
 import asyncio
+import json
 from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
 from test_evidence_workflow import ready_runtime
 
+from harness.agents import ExecutorOutput, Subtask
 from harness.api import app
 from harness.core import (
     Config,
@@ -14,6 +16,7 @@ from harness.core import (
     Store,
     Task,
     ToolRegistry,
+    reusable_correction_outputs,
 )
 from harness.database import (
     Database,
@@ -37,6 +40,53 @@ def test_task_lifecycle(tmp_path):
     assert s.corrections is not None
 
 
+def test_reusable_correction_outputs_require_scoped_unchanged_evidence():
+    steps = [
+        Subtask(id="a", title="A", description="", write_paths=["a.py"]),
+        Subtask(id="b", title="B", description="", write_paths=["b.py"]),
+        Subtask(
+            id="c", title="C", description="", dependencies=["b"], write_paths=["c.py"]
+        ),
+    ]
+    outputs = [
+        ExecutorOutput(subtask_id=step.id, success=True, output="ok") for step in steps
+    ]
+    finding = [{"subtask_id": "b", "affected_paths": []}]
+    assert list(
+        reusable_correction_outputs(steps, outputs, finding, workspace_unchanged=True)
+    ) == ["a"]
+    assert not reusable_correction_outputs(
+        steps, outputs, finding, workspace_unchanged=False
+    )
+    assert not reusable_correction_outputs(
+        steps, outputs, [{"message": "global"}], workspace_unchanged=True
+    )
+    assert not reusable_correction_outputs(
+        steps,
+        outputs,
+        [{"subtask_id": "unknown"}],
+        workspace_unchanged=True,
+    )
+
+
+def test_reusable_correction_outputs_fail_closed_for_missing_evidence():
+    steps = [
+        Subtask(id="a", title="A", description="", write_paths=[]),
+        Subtask(id="b", title="B", description="", write_paths=["b.py"]),
+    ]
+    outputs = [ExecutorOutput(subtask_id="a", success=False, output="failed")]
+    assert (
+        reusable_correction_outputs(
+            steps,
+            outputs,
+            [{"subtask_id": "a"}],
+            workspace_unchanged=True,
+        )
+        == {}
+    )
+    assert not reusable_correction_outputs(steps, outputs, [], workspace_unchanged=True)
+
+
 def test_permissions():
     c = Config()
     c.data["tools"] = {"permissions": {"filesystem": "read"}}
@@ -54,6 +104,212 @@ def test_orchestrator_success(tmp_path):
     t = s.create(Task(title="run"))
     result = asyncio.run(Orchestrator(s).run(t.id))
     assert result.status.value == "waiting_human"
+
+
+def test_correction_time_budget_is_durable_and_stops_after_restart(tmp_path):
+    from datetime import UTC, datetime, timedelta
+
+    from harness.domain import EventKind
+
+    store, orchestrator, task = ready_runtime(tmp_path)
+    task = store.create(task)
+    store.events.append(task.id, EventKind.CORRECTION_STARTED, {"attempt": 1})
+    with store.database.connect() as connection:
+        connection.execute(
+            "UPDATE events SET created_at=? WHERE task_id=? AND kind=?",
+            (
+                (datetime.now(UTC) - timedelta(seconds=5)).isoformat(),
+                task.id,
+                EventKind.CORRECTION_STARTED.value,
+            ),
+        )
+    orchestrator.config.data["harness"]["max_correction_elapsed_seconds"] = 2
+
+    with pytest.raises(RuntimeError, match="elapsed-time budget exhausted"):
+        orchestrator._check_correction_time_budget(task.id)
+
+    assert store.events.list(
+        task.id, event_type=EventKind.CORRECTION_BUDGET_EXHAUSTED.value
+    )
+
+
+def test_correction_time_budget_allows_unstarted_and_in_budget_runs(tmp_path):
+    from datetime import UTC, datetime
+
+    from harness.domain import EventKind
+
+    store, orchestrator, task = ready_runtime(tmp_path)
+    task = store.create(task)
+    orchestrator.config.data["harness"]["max_correction_elapsed_seconds"] = 1
+    orchestrator._check_correction_time_budget(task.id)
+    store.events.append(task.id, EventKind.CORRECTION_STARTED, {"attempt": 1})
+    orchestrator._check_correction_time_budget(task.id, now=datetime.now(UTC))
+
+
+def test_correction_time_budget_normalizes_legacy_naive_timestamp(tmp_path):
+    from datetime import UTC, datetime, timedelta
+
+    from harness.domain import EventKind
+
+    store, orchestrator, task = ready_runtime(tmp_path)
+    task = store.create(task)
+    store.events.append(task.id, EventKind.CORRECTION_STARTED, {"attempt": 1})
+    with store.database.connect() as connection:
+        connection.execute(
+            "UPDATE events SET created_at=? WHERE task_id=? AND kind=?",
+            (
+                (datetime.now(UTC) - timedelta(seconds=1))
+                .replace(tzinfo=None)
+                .isoformat(),
+                task.id,
+                EventKind.CORRECTION_STARTED.value,
+            ),
+        )
+    orchestrator.config.data["harness"]["max_correction_elapsed_seconds"] = 10
+
+    orchestrator._check_correction_time_budget(task.id)
+
+
+@pytest.mark.parametrize(
+    "calibrated_tokens,run_status,expected_error",
+    [
+        (12, "completed", "input-token budget exhausted"),
+        (None, "completed", "usage is unverifiable"),
+        (12, "running", "usage is unverifiable"),
+    ],
+)
+def test_correction_input_token_budget_is_durable_and_fails_closed(
+    tmp_path, calibrated_tokens, run_status, expected_error
+):
+    from harness.domain import EventKind
+
+    store, orchestrator, task = ready_runtime(tmp_path)
+    task = store.create(task)
+    store.events.append(task.id, EventKind.CORRECTION_STARTED, {"attempt": 1})
+    with store.database.connect() as connection:
+        connection.execute(
+            "INSERT INTO model_runs(task_id,provider,model,created_at,status,"
+            "calibration_raw_tokens) VALUES(?,?,?,?,?,?)",
+            (
+                task.id,
+                "fixture",
+                "fixture-model",
+                store.database.now(),
+                run_status,
+                calibrated_tokens,
+            ),
+        )
+    orchestrator.config.data["harness"]["max_correction_input_tokens"] = 10
+
+    with pytest.raises(RuntimeError, match=expected_error):
+        orchestrator._check_correction_time_budget(task.id)
+
+    exhausted = store.events.list(
+        task.id, event_type=EventKind.CORRECTION_BUDGET_EXHAUSTED.value
+    )
+    assert exhausted
+
+
+def test_correction_budget_uses_persisted_limits_after_config_change(tmp_path):
+    from datetime import UTC, datetime, timedelta
+
+    from harness.domain import EventKind
+
+    store, orchestrator, task = ready_runtime(tmp_path)
+    task = store.create(task)
+    store.events.append(
+        task.id,
+        EventKind.CORRECTION_STARTED,
+        {"budget_limits": {"elapsed_seconds": 2, "input_tokens": 10}},
+    )
+    with store.database.connect() as connection:
+        connection.execute(
+            "UPDATE events SET created_at=? WHERE task_id=? AND kind=?",
+            (
+                (datetime.now(UTC) - timedelta(seconds=5)).isoformat(),
+                task.id,
+                EventKind.CORRECTION_STARTED.value,
+            ),
+        )
+    orchestrator.config.data["harness"]["max_correction_elapsed_seconds"] = 100
+    orchestrator.config.data["harness"]["max_correction_input_tokens"] = None
+
+    with pytest.raises(RuntimeError, match="elapsed-time budget exhausted"):
+        orchestrator._check_correction_time_budget(task.id)
+
+
+def test_correction_budget_snapshot_keeps_token_cap_after_config_change(tmp_path):
+    from harness.domain import EventKind
+
+    store, orchestrator, task = ready_runtime(tmp_path)
+    task = store.create(task)
+    store.events.append(
+        task.id,
+        EventKind.CORRECTION_STARTED,
+        {"budget_limits": {"elapsed_seconds": 60, "input_tokens": 10}},
+    )
+    with store.database.connect() as connection:
+        connection.execute(
+            "INSERT INTO model_runs(task_id,provider,model,created_at,status,"
+            "calibration_raw_tokens) VALUES(?,?,?,?,?,?)",
+            (
+                task.id,
+                "fixture",
+                "fixture-model",
+                store.database.now(),
+                "completed",
+                10,
+            ),
+        )
+    orchestrator.config.data["harness"]["max_correction_input_tokens"] = None
+
+    with pytest.raises(RuntimeError, match="input-token budget exhausted"):
+        orchestrator._check_correction_time_budget(task.id)
+
+
+def test_correction_budget_snapshot_survives_audit_redaction(tmp_path):
+    from harness.domain import EventKind
+
+    store, orchestrator, task = ready_runtime(tmp_path)
+    task = store.create(task)
+    store.event(
+        task.id,
+        EventKind.CORRECTION_STARTED,
+        {
+            "budget_limits": {
+                "elapsed_seconds": 60,
+                "input_estimate_limit": 10,
+            }
+        },
+    )
+    event = store.events.list(task.id, EventKind.CORRECTION_STARTED.value)[0]
+    assert json.loads(event["payload"])["budget_limits"] == {
+        "elapsed_seconds": 60,
+        "input_estimate_limit": 10,
+    }
+    orchestrator._check_correction_time_budget(task.id)
+
+
+@pytest.mark.parametrize(
+    "limits",
+    [
+        "invalid",
+        {},
+        {"elapsed_seconds": True, "input_tokens": None},
+        {"elapsed_seconds": 60, "input_tokens": 0},
+    ],
+)
+def test_correction_budget_rejects_invalid_snapshot(tmp_path, limits):
+    from harness.domain import EventKind
+
+    store, orchestrator, task = ready_runtime(tmp_path)
+    task = store.create(task)
+    store.events.append(
+        task.id, EventKind.CORRECTION_STARTED, {"budget_limits": limits}
+    )
+
+    with pytest.raises(RuntimeError, match="budget snapshot is invalid"):
+        orchestrator._check_correction_time_budget(task.id)
 
 
 def test_authorized_repair_plan_cannot_write_outside_approved_paths(tmp_path):
@@ -383,7 +639,17 @@ def test_config_resolves_defaults_without_mutating_or_exposing_secrets(
     config = Config(path)
     resolved = config.resolved()
     assert resolved["harness"]["name"] == "fixture"
-    assert resolved["api"] == {"host": "127.0.0.1", "port": 9000, "swagger": True}
+    assert resolved["api"] == {
+        "host": "127.0.0.1",
+        "port": 9000,
+        "swagger": True,
+        "metrics_listener": {
+            "enabled": False,
+            "host": "127.0.0.1",
+            "port": 9091,
+            "bearer_file": None,
+        },
+    }
     assert resolved["paths"]["database"] == "./data/harness.db"
     redacted = config.redacted()
     assert redacted["secrets"]["OPENAI_API_KEY"] == "********"
@@ -515,6 +781,12 @@ def test_orchestrator_does_not_reuse_unverified_checkpoint(tmp_path):
     store.subtasks.save_plan(created.id, previous.subtasks)
     store.subtasks.update(created.id, "old", "completed", "{}")
     assert asyncio.run(orchestrator.run(created.id)).status == "completed"
+    assert len(store.events.list(created.id, "plan.contract_stale")) == 1
+    reconciliation = json.loads(
+        store.events.list(created.id, "recovery.reconciled")[0]["payload"]
+    )
+    assert reconciliation["previous_plan_current"] is False
+    assert reconciliation["previous_plan"] is None
     assert store.plans.latest(created.id)["summary"] != "obsolete"
     assert len(store.subtasks.list(created.id)) == 2
 
@@ -688,7 +960,17 @@ def test_configuration_service_maps_documented_dotenv_names(tmp_path, monkeypatc
     )
     assert resolved["models"]["providers"]["openai"]["model"] == "another-model"
     assert resolved["git"]["remote"] == "https://git.test/repo"
-    assert resolved["api"] == {"host": "localhost", "port": 8090, "swagger": True}
+    assert resolved["api"] == {
+        "host": "localhost",
+        "port": 8090,
+        "swagger": True,
+        "metrics_listener": {
+            "enabled": False,
+            "host": "127.0.0.1",
+            "port": 9091,
+            "bearer_file": None,
+        },
+    }
 
 
 def test_env_example_is_loadable(tmp_path, monkeypatch):

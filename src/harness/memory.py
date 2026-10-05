@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
@@ -50,6 +51,7 @@ def context_evidence_envelope(context):
                 "truncated",
                 "review_state",
                 "provenance",
+                "trust",
             )
             envelope[name] = [
                 {key: fragment[key] for key in keys if key in fragment}
@@ -170,24 +172,122 @@ class ContextBuilder:
         return self.build_evidence(task, workspace)["text"]
 
     @staticmethod
-    def _selection_priority(fragment):
+    def _trust_assessment(fragment):
+        """Explain evidence-ordering signals; tiers are not confidence scores."""
         kind = fragment["kind"]
         if kind == "decision_memory":
-            return 0 if "Memory: none" not in fragment["text"] else 8
+            if "Memory: none" in fragment["text"]:
+                return {
+                    "priority": 8,
+                    "tier": "empty_memory_context",
+                    "basis": ["no_decision_content"],
+                }
+            return {
+                "priority": 0,
+                "tier": "curated_decision_memory",
+                "basis": ["curated_decision_memory"],
+            }
         if kind == "vault":
-            if fragment.get("review_state") == "current":
-                return (
-                    1
-                    if fragment.get("provenance", {}).get("source_state") == "current"
-                    else 2
-                )
-            return 6
+            provenance = fragment.get("provenance")
+            source_current = (
+                isinstance(provenance, dict)
+                and provenance.get("source_state") == "current"
+            )
+            review_current = fragment.get("review_state") == "current"
+            basis = [
+                "review_current" if review_current else "review_not_current",
+                "source_hash_current" if source_current else "source_hash_not_current",
+            ]
+            if review_current and source_current:
+                return {
+                    "priority": 1,
+                    "tier": "reviewed_source_hash_current",
+                    "basis": basis,
+                }
+            if source_current:
+                return {
+                    "priority": 2,
+                    "tier": "source_hash_current_unreviewed",
+                    "basis": basis,
+                }
+            if review_current:
+                return {
+                    "priority": 3,
+                    "tier": "reviewed_source_unverified",
+                    "basis": basis,
+                }
+            return {
+                "priority": 6,
+                "tier": "vault_unreviewed_unverified",
+                "basis": basis,
+            }
+        if kind == "repository_symbol":
+            provenance = fragment.get("provenance")
+            digest = provenance.get("sha256") if isinstance(provenance, dict) else None
+            hashed = isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest)
+            return {
+                "priority": 3 if hashed else 4,
+                "tier": "static_symbol_hash_identified"
+                if hashed
+                else "static_symbol_hash_missing",
+                "basis": [
+                    "static_symbol",
+                    "source_hash_present" if hashed else "source_hash_missing",
+                    "not_semantically_reviewed",
+                ],
+            }
+        if kind == "repository":
+            return {
+                "priority": 5,
+                "tier": "repository_file_unreviewed",
+                "basis": ["repository_file", "not_semantically_reviewed"],
+            }
+        if kind == "qdrant":
+            provenance = fragment.get("provenance")
+            source_current = (
+                isinstance(provenance, dict)
+                and provenance.get("source_state") == "current"
+            )
+            if source_current and fragment.get("review_state") == "current":
+                return {
+                    "priority": 1,
+                    "tier": "qdrant_hit_current_source_and_review",
+                    "basis": [
+                        "vector_retrieval",
+                        "source_hash_current",
+                        "review_current",
+                    ],
+                }
+            if source_current:
+                return {
+                    "priority": 2,
+                    "tier": "qdrant_hit_current_source_unreviewed",
+                    "basis": [
+                        "vector_retrieval",
+                        "source_hash_current",
+                        "not_semantically_reviewed",
+                    ],
+                }
+            return {
+                "priority": 4,
+                "tier": "retrieval_without_current_source_proof",
+                "basis": ["retrieval_only", "current_source_not_verified_here"],
+            }
+        if kind == "qdrant_status":
+            return {
+                "priority": 9,
+                "tier": "availability_notice",
+                "basis": ["status_only"],
+            }
         return {
-            "repository_symbol": 3,
-            "qdrant": 4,
-            "repository": 5,
-            "qdrant_status": 9,
-        }.get(kind, 7)
+            "priority": 7,
+            "tier": "unknown_origin",
+            "basis": ["origin_not_classified"],
+        }
+
+    @classmethod
+    def _selection_priority(cls, fragment):
+        return cls._trust_assessment(fragment)["priority"]
 
     @classmethod
     def _ordered_fragments(cls, fragments, task):
@@ -200,9 +300,24 @@ class ContextBuilder:
             relevance = sum(content.count(term) for term in terms)
             return cls._selection_priority(fragment), -relevance, fragment["ref"]
 
-        return [fragment for fragment in fragments if fragment["required"]] + sorted(
+        required = [fragment for fragment in fragments if fragment["required"]]
+        optional = sorted(
             (fragment for fragment in fragments if not fragment["required"]), key=key
         )
+        return [
+            *required,
+            *(
+                {
+                    **fragment,
+                    "trust": {
+                        key: value
+                        for key, value in cls._trust_assessment(fragment).items()
+                        if key != "priority"
+                    },
+                }
+                for fragment in optional
+            ),
+        ]
 
     def build_evidence(self, task, workspace: str):
         fragments = [
@@ -270,16 +385,103 @@ class ContextBuilder:
             rejected_sources = []
         if self.qdrant:
             try:
+                if self.memory.vault.is_dir():
+                    from .vault_knowledge import VaultKnowledgeService
+
+                    qdrant_vault = VaultKnowledgeService(
+                        self.memory.vault, source_root=workspace
+                    )
+                else:
+                    qdrant_vault = None
                 for point in self.qdrant.search(task.title, limit=3):
-                    payload = point.get("payload", {})
-                    point_id = str(point.get("id", len(fragments)))
+                    point_id = (
+                        str(point.get("id", len(fragments)))
+                        if isinstance(point, dict)
+                        else str(len(fragments))
+                    )
+                    payload = (
+                        point.get("payload", {}) if isinstance(point, dict) else {}
+                    )
+                    source = (
+                        payload.get("source") if isinstance(payload, dict) else None
+                    )
+                    text = payload.get("text") if isinstance(payload, dict) else None
+                    source_hash = (
+                        payload.get("source_hash")
+                        if isinstance(payload, dict)
+                        else None
+                    )
+                    rejection = None
+                    metadata = {}
+                    raw_source = None
+                    source_path = (
+                        source
+                        if isinstance(source, str) and source.endswith(".md")
+                        else f"{source}.md"
+                        if isinstance(source, str)
+                        else None
+                    )
+                    if (
+                        qdrant_vault is None
+                        or not isinstance(source_path, str)
+                        or not source_path
+                        or not isinstance(text, str)
+                        or not text
+                        or not isinstance(source_hash, str)
+                        or re.fullmatch(r"[0-9a-f]{64}", source_hash) is None
+                    ):
+                        rejection = "invalid_or_unverifiable_source"
+                    else:
+                        try:
+                            raw_source = qdrant_vault._read(source_path)
+                            metadata = qdrant_vault._metadata(raw_source)
+                        except (OSError, TypeError, UnicodeError, ValueError):
+                            rejection = "source_unavailable"
+                    if (
+                        rejection is None
+                        and hashlib.sha256(raw_source.encode("utf-8")).hexdigest()
+                        != source_hash
+                    ):
+                        rejection = "source_hash_stale"
+                    if rejection is None and text not in raw_source:
+                        rejection = "payload_not_in_source"
+                    if rejection is None:
+                        review_state, _reviewed_on = qdrant_vault._review_status(
+                            metadata
+                        )
+                        if review_state in {"stale", "future", "invalid"}:
+                            rejection = review_state
+                    if rejection is None:
+                        source_state, source_checks = qdrant_vault._source_checks(
+                            metadata
+                        )
+                        if source_state in {"invalid", "unavailable", "stale"}:
+                            rejection = f"source_{source_state}"
+                    if rejection is not None:
+                        rejected_sources.append(
+                            {"ref": f"context:qdrant/{point_id}", "status": rejection}
+                        )
+                        continue
+                    claims = (
+                        metadata.get("claims", {})
+                        if review_state == "current"
+                        and isinstance(metadata.get("claims", {}), dict)
+                        else {}
+                    )
                     fragments.append(
                         {
                             "kind": "qdrant",
                             "ref": f"context:qdrant/{point_id}",
-                            "text": str(payload.get("text", "")),
+                            "text": text,
                             "required": False,
-                            "claims": payload.get("claims", {}),
+                            "claims": claims,
+                            "review_state": review_state,
+                            "provenance": {
+                                "source_state": source_state,
+                                "source_hash": source_hash,
+                                "source_ref": f"context:vault/{source_path}",
+                                "source_checks": source_checks,
+                            },
                         }
                     )
             except httpx.HTTPError:

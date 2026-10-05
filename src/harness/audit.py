@@ -10,6 +10,7 @@ from dataclasses import replace
 
 from .database import AgentRunRepository, AuditRepository
 from .errors import failure_record
+from .token_calibration import calibration_report
 
 CURRENT_RUN = ContextVar("harness_run", default=None)
 LOGGER = logging.getLogger("harness")
@@ -70,6 +71,14 @@ class AuditRecorder:
             ).fetchone()
         return dict(row)
 
+    def model_token_calibration(
+        self, model, calibration_key, *, min_samples=5, max_multiplier=1.5
+    ):
+        samples = self.repository.token_calibration_samples(model, calibration_key)
+        return calibration_report(
+            samples, min_samples=min_samples, max_multiplier=max_multiplier
+        )
+
     @contextmanager
     def agent(self, task, agent, profile):
         agent, profile = self.sanitize(agent), self.sanitize(profile)
@@ -126,6 +135,7 @@ class AuditRecorder:
 
     def _finish_model(self, run_id, status, started, span, error=None):
         usage = span["usage"]
+        estimate = span.get("input_token_preflight")
         if usage is not None:
             usage = replace(
                 usage,
@@ -143,6 +153,11 @@ class AuditRecorder:
             else None,
             self.sanitize(span["provider"]),
             self.sanitize(span["model"]),
+            estimate.get("raw_tokens") if isinstance(estimate, dict) else None,
+            estimate.get("safety_margin_percent")
+            if isinstance(estimate, dict)
+            else None,
+            estimate.get("calibration_key") if isinstance(estimate, dict) else None,
         )
 
     def tool_event(self, kind, payload):

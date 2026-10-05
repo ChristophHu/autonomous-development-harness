@@ -14,6 +14,7 @@ from dataclasses import dataclass
 import httpx
 
 from .domain import EventKind, Status, Task
+from .errors import failure_category
 from .evidence import EvidenceRepository, audit_evidence
 from .process_control import RunControl, TaskCancelled, use_run_control
 from .providers import ProviderHealth
@@ -272,7 +273,15 @@ class OperationalDiagnosticsService:
                 for name, state in providers.items()
             }
         )
-        mcp = orchestrator.tools.mcp_status()
+        from .database import OperationalSnapshotRepository
+        from .mcp_status import MCPStatusApplicationService
+
+        mcp = MCPStatusApplicationService(
+            orchestrator.tools.mcp_status,
+            lambda: OperationalSnapshotRepository.read_latest_mcp_statuses(
+                conf.path("database")
+            ),
+        ).status()
         checks.update(
             {
                 f"MCP {item['name']}": item["state"]
@@ -317,6 +326,22 @@ class OperationalDiagnosticsService:
     @classmethod
     def doctor(cls, checks, *, details=None):
         return cls.status(checks, details=details)
+
+
+class ObservabilityApplicationService:
+    """Shared, read-only metrics contract for HTTP, CLI, and scrape listeners."""
+
+    def __init__(self, observability):
+        self.observability = observability
+
+    def metrics(self):
+        return self.observability.metrics()
+
+    def prometheus(self):
+        return self.observability.prometheus()
+
+    def event_kinds(self):
+        return list(self.observability.event_kinds)
 
 
 class VerificationEvidenceService:
@@ -495,11 +520,12 @@ class ModelOperationsService:
             text = response[0] if isinstance(response, tuple) else response
             if not isinstance(text, str) or not text.strip():
                 raise ValueError("empty model response")
-        except (OSError, RuntimeError, TypeError, ValueError, httpx.HTTPError) as error:
+        except Exception as error:  # noqa: BLE001 — model/provider adapter boundary
             return {
                 "model": model_name,
                 "status": "failed",
                 "error_type": type(error).__name__,
+                "error_category": failure_category(error).value,
             }
         return {"model": model_name, "status": "successful"}
 

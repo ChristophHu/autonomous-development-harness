@@ -34,6 +34,8 @@ class HarnessSettings(ExtensibleSettings):
     environment: StrictStr = "development"
     max_parallel_steps: StrictInt = Field(default=4, ge=1, le=32)
     max_correction_attempts: StrictInt = Field(default=2, ge=0, le=10)
+    max_correction_elapsed_seconds: StrictInt = Field(default=1800, ge=1, le=86400)
+    max_correction_input_tokens: StrictInt | None = Field(default=None, ge=1)
 
 
 class PathSettings(ExtensibleSettings):
@@ -179,6 +181,8 @@ class ModelInputTokenBudget(BaseModel):
     max_input_tokens: StrictInt = Field(ge=1)
     framing_tokens: StrictInt = Field(default=0, ge=0)
     safety_margin_percent: StrictInt = Field(default=20, ge=0, le=100)
+    calibration_min_samples: StrictInt = Field(default=5, ge=1, le=100)
+    calibration_max_multiplier: Number = Field(default=1.5, ge=1, le=2)
 
     @model_validator(mode="after")
     def exactly_one_tokenizer(self):
@@ -291,11 +295,33 @@ class DockerSettings(ExtensibleSettings):
     socket_path: StrictStr | None = None
 
 
+class MetricsListenerSettings(ExtensibleSettings):
+    enabled: StrictBool = False
+    host: Literal["127.0.0.1", "0.0.0.0"] = "127.0.0.1"
+    port: StrictInt = Field(default=9091, ge=1, le=65535)
+    bearer_file: StrictStr | None = None
+
+    @model_validator(mode="after")
+    def enabled_listener_requires_token_file(self):
+        if self.enabled and (self.bearer_file is None or not self.bearer_file.strip()):
+            raise ValueError("enabled metrics listener requires bearer_file")
+        return self
+
+
 class APISettings(ExtensibleSettings):
     enabled: StrictBool | None = None
     host: StrictStr = "127.0.0.1"
     port: StrictInt = Field(default=8080, ge=1, le=65535)
     swagger: StrictBool = True
+    metrics_listener: MetricsListenerSettings = Field(
+        default_factory=MetricsListenerSettings
+    )
+
+    @model_validator(mode="after")
+    def metrics_listener_uses_dedicated_port(self):
+        if self.metrics_listener.enabled and self.metrics_listener.port == self.port:
+            raise ValueError("metrics listener must use a port separate from the API")
+        return self
 
 
 class LoggingSettings(ExtensibleSettings):

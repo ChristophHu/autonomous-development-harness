@@ -41,7 +41,83 @@ def test_complete_example_config_is_valid_and_has_specified_sections(tmp_path):
     assert settings.testing.coverage.branches == 100
     assert settings.tools.permissions["filesystem.delete"] == "denied"
     assert settings.harness.max_correction_attempts == 2
+    assert settings.harness.max_correction_elapsed_seconds == 1800
     assert ConfigurationService(sample).validate()
+
+
+def test_metrics_listener_defaults_to_disabled_and_accepts_explicit_authenticated_setup():
+    defaults = HarnessConfig.model_validate({})
+    assert defaults.api.metrics_listener.enabled is False
+    assert defaults.api.metrics_listener.host == "127.0.0.1"
+    enabled = HarnessConfig.model_validate(
+        {
+            "api": {
+                "metrics_listener": {
+                    "enabled": True,
+                    "host": "0.0.0.0",
+                    "port": 9091,
+                    "bearer_file": "/private/tmp/metrics-token",
+                }
+            }
+        }
+    )
+    assert enabled.api.metrics_listener.enabled is True
+    assert enabled.api.metrics_listener.host == "0.0.0.0"
+
+
+@pytest.mark.parametrize(
+    "api",
+    [
+        {
+            "port": 8080,
+            "metrics_listener": {
+                "enabled": True,
+                "port": 8080,
+                "bearer_file": "/tmp/metrics-token",
+            },
+        },
+        {
+            "port": 9091,
+            "metrics_listener": {
+                "enabled": True,
+                "port": 9091,
+                "bearer_file": "/tmp/metrics-token",
+            },
+        },
+        {"metrics_listener": {"host": "192.168.1.10"}},
+        {"metrics_listener": {"enabled": True, "bearer_file": ""}},
+        {"metrics_listener": {"port": True}},
+        {"metrics_listener": {"enabled": True}},
+    ],
+)
+def test_metrics_listener_rejects_unsafe_or_invalid_settings(api):
+    with pytest.raises(ValidationError):
+        HarnessConfig.model_validate({"api": api})
+
+
+@pytest.mark.parametrize(
+    "budget",
+    [
+        {"calibration_min_samples": 0},
+        {"calibration_min_samples": True},
+        {"calibration_max_multiplier": 0.9},
+        {"calibration_max_multiplier": 2.1},
+    ],
+)
+def test_token_calibration_limits_are_strict_and_bounded(budget):
+    payload = {
+        "models": {
+            "input_token_budgets": {
+                "model": {
+                    "characters_per_token": 3.5,
+                    "max_input_tokens": 1000,
+                    **budget,
+                }
+            }
+        }
+    }
+    with pytest.raises(ValidationError):
+        HarnessConfig.model_validate(payload)
 
 
 def test_configuration_extensions_are_explicit_and_unknown_fields_are_rejected():
@@ -661,6 +737,22 @@ def test_parallel_step_limit_is_strict_and_bounded(value):
 def test_correction_attempt_limit_is_strict_and_bounded(value):
     with pytest.raises(ValidationError):
         HarnessConfig.model_validate({"harness": {"max_correction_attempts": value}})
+
+
+@pytest.mark.parametrize("value", [0, 86401, True, "30"])
+def test_correction_elapsed_budget_is_strict_and_bounded(value):
+    with pytest.raises(ValidationError):
+        HarnessConfig.model_validate(
+            {"harness": {"max_correction_elapsed_seconds": value}}
+        )
+
+
+@pytest.mark.parametrize("value", [0, True, "5"])
+def test_correction_input_token_budget_is_strict(value):
+    with pytest.raises(ValidationError):
+        HarnessConfig.model_validate(
+            {"harness": {"max_correction_input_tokens": value}}
+        )
 
 
 def test_typed_config_preserves_extensions_at_root_and_known_sections():

@@ -1,6 +1,7 @@
 import asyncio
 import json
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
@@ -184,6 +185,13 @@ def test_model_router_records_estimate_and_provider_usage_calibration():
             spans.append(span)
 
         @staticmethod
+        def model_token_calibration(model, calibration_key, **limits):
+            assert model == "model-id"
+            assert calibration_key == "characters_per_token:100"
+            assert limits == {"min_samples": 5, "max_multiplier": 1.5}
+            return {"sample_count": 5, "calibrated": True, "multiplier": 1.25}
+
+        @staticmethod
         def sanitize(value):
             return value
 
@@ -212,6 +220,12 @@ def test_model_router_records_estimate_and_provider_usage_calibration():
     )
     assert spans[0]["input_token_preflight"]["method"] == "characters_per_token"
     assert spans[0]["input_token_preflight"]["provider_exact"] is False
+    assert spans[0]["input_token_preflight"]["calibration_multiplier"] == 1.25
+    baseline = (spans[0]["input_token_preflight"]["raw_tokens"] * 125 + 99) // 100
+    assert (
+        spans[0]["input_token_preflight"]["estimated_tokens"]
+        == (baseline * 125 + 99) // 100
+    )
     assert spans[0]["input_token_calibration"]["provider_prompt_tokens"] == 4
     assert spans[0]["input_token_calibration"]["estimate_minus_provider"] == (
         spans[0]["input_token_preflight"]["estimated_tokens"] - 4
@@ -304,7 +318,11 @@ def test_configured_token_budget_requires_every_fallback_model():
 )
 def test_plan_dag_serializes_conflicting_or_undeclared_writes(paths):
     steps = [
-        Subtask(id="a", title="A", description="", write_paths=paths[0]),
+        (
+            SimpleNamespace(id="a", dependencies=[], write_paths=paths[0])
+            if paths[0] == [""]
+            else Subtask(id="a", title="A", description="", write_paths=paths[0])
+        ),
         Subtask(id="b", title="B", description="", write_paths=paths[1]),
     ]
     active = maximum = 0
@@ -415,6 +433,183 @@ def test_plan_dag_awaits_async_completion_persistence():
     assert persisted == [("a", "ok")]
 
 
+def test_plan_dag_reuses_prior_success_without_worker_or_persistence():
+    steps = [
+        Subtask(id="a", title="A", description="", write_paths=["a.py"]),
+        Subtask(
+            id="b", title="B", description="", dependencies=["a"], write_paths=["b.py"]
+        ),
+    ]
+    prior = ExecutorOutput(subtask_id="a", success=True, output="previous")
+    seen = []
+
+    async def worker(step):
+        seen.append(step.id)
+        return ExecutorOutput(subtask_id=step.id, success=True, output="new")
+
+    result = asyncio.run(
+        execute_plan_dag(
+            steps,
+            worker,
+            on_complete=lambda step, output: seen.append("persist:" + step.id),
+            prior_outputs={"a": prior},
+        )
+    )
+    assert [output.output for output in result] == ["previous", "new"]
+    assert seen == ["b", "persist:b"]
+
+
+@pytest.mark.parametrize(
+    "prior",
+    [
+        {"unknown": ExecutorOutput(subtask_id="unknown", success=True, output="x")},
+        {"a": ExecutorOutput(subtask_id="a", success=False, output="x")},
+        {"a": ExecutorOutput(subtask_id="b", success=True, output="x")},
+        ["invalid"],
+    ],
+)
+def test_plan_dag_rejects_invalid_prior_outputs(prior):
+    step = Subtask(id="a", title="A", description="", write_paths=["a.py"])
+
+    async def worker(_step):
+        raise AssertionError("invalid prior evidence must fail before execution")
+
+    with pytest.raises(ValueError, match="prior step outputs"):
+        asyncio.run(execute_plan_dag([step], worker, prior_outputs=prior))
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["../escape", "/tmp/escape", "C:\\escape", ".git/config", "a//b", "a/./b"],
+)
+def test_plan_rejects_unsafe_write_paths(path):
+    with pytest.raises(ValueError, match="write path"):
+        Subtask(id="unsafe", title="Unsafe", description="", write_paths=[path])
+
+
+def test_versioned_plan_quality_goldset_checks_observable_targets(tmp_path):
+    from harness.domain import AcceptanceCriterion
+
+    goldset = json.loads(
+        (
+            Path(__file__).parent / "fixtures" / "plan_quality_goldset_v1.json"
+        ).read_text()
+    )
+    assert goldset["version"] == 1
+    for case in goldset["cases"]:
+        workspace = tmp_path / case["id"]
+        workspace.mkdir()
+        if case["existing"] is not None:
+            target = workspace / case["criterion_path"]
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(case["existing"])
+        criterion = AcceptanceCriterion(
+            id="result",
+            description="result file",
+            kind=case["kind"],
+            path=case["criterion_path"],
+            contains=case["contains"],
+        )
+        task = Task(title="result", acceptance_criteria=[criterion])
+        plan = PlannerOutput(
+            summary="result",
+            complexity="low",
+            subtasks=[
+                Subtask(
+                    id="implement",
+                    title="Implement",
+                    description="Write result",
+                    acceptance_criteria=["result"],
+                    write_paths=case["write_paths"],
+                )
+            ],
+        )
+        assert (
+            plan.observable_target_findings(task, workspace)
+            == case["expected_findings"]
+        ), case["id"]
+
+
+def test_observable_plan_quality_skips_nonfile_criteria_and_handles_unreadable_file(
+    tmp_path, monkeypatch
+):
+    from harness.domain import AcceptanceCriterion
+
+    output = PlannerOutput(
+        summary="inspect",
+        complexity="low",
+        subtasks=[Subtask(id="s", title="s", description="")],
+    )
+    task = Task(
+        title="inspect",
+        acceptance_criteria=[
+            AcceptanceCriterion(id="manual", description="manual", kind="review"),
+            AcceptanceCriterion(
+                id="text",
+                description="text",
+                kind="file_contains",
+                path="note.txt",
+                contains="ready",
+            ),
+        ],
+    )
+    (tmp_path / "note.txt").write_text("ready")
+    original = Path.read_text
+
+    def unreadable(path, *args, **kwargs):
+        if path.name == "note.txt":
+            raise OSError("read denied")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", unreadable)
+    assert output.observable_target_findings(task, tmp_path) == [
+        "criterion target has no linked write scope: text"
+    ]
+
+
+def test_planner_rejects_observable_target_without_linked_write_scope(tmp_path):
+    from harness.domain import AcceptanceCriterion
+
+    class Router:
+        config = config(
+            {
+                "paths": {"workspace": str(tmp_path)},
+                "profiles": {
+                    name: {"model": {"primary": "fake"}}
+                    for name in ("planner", "coding")
+                },
+            }
+        )
+
+        def complete(self, *_args, **_kwargs):
+            return json.dumps(
+                {
+                    "summary": "missing write scope",
+                    "complexity": "low",
+                    "subtasks": [
+                        {
+                            "id": "s",
+                            "title": "s",
+                            "description": "s",
+                            "expected_result": "done",
+                            "acceptance_criteria": ["result"],
+                        }
+                    ],
+                }
+            )
+
+    task = Task(
+        title="result",
+        acceptance_criteria=[
+            AcceptanceCriterion(
+                id="result", description="result", kind="file_exists", path="result.txt"
+            )
+        ],
+    )
+    with pytest.raises(ValueError, match="cannot satisfy observable criterion"):
+        Planner(Router()).plan(task)
+
+
 class FakeProvider:
     def __init__(self, result=None, error=None):
         self.result = result
@@ -517,6 +712,36 @@ def test_agent_dispatch_rejects_explicit_profile_capability_mismatch():
     )
     with pytest.raises(ValueError, match="lacks required capabilities for executor"):
         registry.for_role("executor")
+
+
+def test_independent_review_uses_its_own_model_and_capability_profile():
+    registry = ProfileRegistry(
+        config(
+            {
+                "profiles": {
+                    "validator": {
+                        "model": {"primary": "validation-model"},
+                        "capabilities": ["review"],
+                        "tools": ["test.run_tests"],
+                    },
+                    "reviewer": {
+                        "model": {"primary": "independent-model"},
+                        "capabilities": ["review"],
+                        "tools": [],
+                    },
+                },
+                "agent_roles": {"independent-review": "reviewer"},
+            }
+        )
+    )
+
+    validator = registry.for_role("validator")
+    reviewer = registry.for_role("independent-review")
+    assert validator.model == "validation-model"
+    assert validator.tools == ["test.run_tests"]
+    assert reviewer.model == "independent-model"
+    assert reviewer.tools == []
+    assert reviewer.capabilities == ["review"]
 
 
 def test_agent_dispatch_accepts_explicit_minimum_role_capability():
@@ -1529,6 +1754,46 @@ def test_planner_rejects_malformed_recovery_scope_and_incomplete_coverage():
     required = Task(title="t", requirements=["not mapped"])
     with pytest.raises(ValueError, match="requirement has no plan step"):
         planner.plan(required)
+
+
+@pytest.mark.parametrize(
+    "step_criteria,expected_error",
+    [
+        (["criterion:output"], False),
+        (["unrelated-criterion"], True),
+    ],
+)
+def test_plan_requirement_must_link_to_a_task_acceptance_criterion(
+    step_criteria, expected_error
+):
+    from harness.domain import AcceptanceCriterion
+
+    task = Task(
+        title="implement output",
+        requirements=["write output"],
+        acceptance_criteria=[
+            AcceptanceCriterion(id="criterion:output", description="output exists")
+        ],
+    )
+    plan = PlannerOutput(
+        summary="implement output",
+        complexity="low",
+        subtasks=[
+            Subtask(
+                id="write",
+                title="write output",
+                description="write output",
+                expected_result="output exists",
+                requirement_ids=["write output"],
+                acceptance_criteria=step_criteria,
+            )
+        ],
+    )
+
+    errors = plan.validate_task_coverage(task)
+    assert (
+        "requirement has no linked acceptance criterion: write output" in errors
+    ) is expected_error
 
 
 def test_router_cancellation_during_cross_candidate_backoff(monkeypatch):

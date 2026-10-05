@@ -79,6 +79,27 @@ def git_runtime(tmp_path, monkeypatch):
     return store, harness, task, git, repo
 
 
+def test_git_target_review_side_effect_blocks_completion(tmp_path, monkeypatch):
+    store, harness, task, _git, repo = git_runtime(tmp_path, monkeypatch)
+    task = store.create(task)
+    original = harness.validator.validate
+    target_calls = 0
+
+    def mutate_after_target_review(*args, **kwargs):
+        nonlocal target_calls
+        result = original(*args, **kwargs)
+        if args and args[-1] is False:
+            target_calls += 1
+            (repo / "review-side-effect.txt").write_text("unapproved change")
+        return result
+
+    harness.validator.validate = mutate_after_target_review
+    result = asyncio.run(harness.run(task.id))
+    assert target_calls == 1
+    assert result.status != "completed"
+    assert store.events.list(task.id, "task.completed") == []
+
+
 @pytest.mark.parametrize("workflow", ["feature", "bugfix", "hotfix", "release"])
 def test_real_local_workflow_tests_merge_sync_tag_and_human_cleanup(
     tmp_path, monkeypatch, workflow

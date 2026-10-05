@@ -157,6 +157,20 @@ def test_probe_distinguishes_profile_rejection_and_child_start(
     }
 
 
+@pytest.mark.parametrize(
+    ("stderr", "reason"),
+    [
+        ("connection refused", "child_connection_failed"),
+        ("sandbox-exec profile syntax error", "sandbox_profile_rejected"),
+    ],
+)
+def test_probe_classifies_socket_and_profile_errors(stderr, reason):
+    report = diagnostics._status_for_result(
+        SimpleNamespace(returncode=1, stderr=stderr)
+    )
+    assert report["reason"] == reason
+
+
 def test_probe_requires_child_success_and_workspace_write(monkeypatch):
     monkeypatch.setattr(diagnostics, "_SANDBOX_EXEC", Path("/usr/bin/true"))
 
@@ -255,6 +269,96 @@ def test_socket_probe_classifies_host_denial(tmp_path, monkeypatch):
     assert diagnostics._socket_probe("tcp_loopback", tmp_path, subprocess.run) == {
         "status": "blocked_by_host",
         "reason": "local_socket_denied",
+    }
+
+
+def test_socket_probe_classifies_timeout_and_missing_accept(tmp_path, monkeypatch):
+    class Listener:
+        def bind(self, _address):
+            pass
+
+        def getsockname(self):
+            return ("127.0.0.1", 45678)
+
+        def listen(self, _backlog):
+            pass
+
+        def settimeout(self, _timeout):
+            pass
+
+        def accept(self):
+            raise OSError("closed")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(diagnostics.socket, "socket", lambda *_args: Listener())
+    monkeypatch.setattr(
+        diagnostics, "isolated_command", lambda command, *_a, **_k: command
+    )
+    timed_out = diagnostics._socket_probe(
+        "tcp_loopback",
+        tmp_path,
+        lambda *_a, **_k: (_ for _ in ()).throw(subprocess.TimeoutExpired("x", 1)),
+    )
+    assert timed_out == {"status": "probe_timeout", "reason": "child_timeout"}
+
+    monkeypatch.setattr(
+        diagnostics,
+        "_status_for_result",
+        lambda _result, **_kwargs: {"status": "supported", "reason": None},
+    )
+    no_accept = diagnostics._socket_probe(
+        "tcp_loopback",
+        tmp_path,
+        lambda *_a, **_k: SimpleNamespace(returncode=0, stderr=""),
+    )
+    assert no_accept == {
+        "status": "probe_failed",
+        "reason": "local_connection_not_observed",
+    }
+
+
+def test_socket_probe_classifies_profile_and_non_host_socket_errors(
+    tmp_path, monkeypatch
+):
+    class Listener:
+        def bind(self, _address):
+            pass
+
+        def getsockname(self):
+            return ("127.0.0.1", 45678)
+
+        def listen(self, _backlog):
+            pass
+
+        def settimeout(self, _timeout):
+            pass
+
+        def accept(self):
+            raise OSError("closed")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(diagnostics.socket, "socket", lambda *_a: Listener())
+    monkeypatch.setattr(
+        diagnostics,
+        "isolated_command",
+        lambda *_a, **_k: (_ for _ in ()).throw(ValueError("invalid profile")),
+    )
+    assert diagnostics._socket_probe("tcp_loopback", tmp_path, subprocess.run) == {
+        "status": "profile_error",
+        "reason": "profile_invalid",
+    }
+
+    def unavailable(*_args):
+        raise OSError(2, "missing")
+
+    monkeypatch.setattr(diagnostics.socket, "socket", unavailable)
+    assert diagnostics._socket_probe("tcp_loopback", tmp_path, subprocess.run) == {
+        "status": "probe_failed",
+        "reason": "local_socket_unavailable",
     }
 
 

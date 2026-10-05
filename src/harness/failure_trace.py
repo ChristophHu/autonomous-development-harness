@@ -55,6 +55,18 @@ def _safe_payload(payload):
     return result
 
 
+def _question_failure_class(question):
+    """Return a bounded diagnostic code, never the stored question text."""
+    if not isinstance(question, str):
+        return None
+    folded = question.casefold()
+    if "sandbox_apply: operation not permitted" in folded:
+        return "host_sandbox_blocked"
+    if "sandbox-exec:" in folded and "operation not permitted" in folded:
+        return "sandbox_execution_denied"
+    return None
+
+
 def read_git_workflow_trace(database_path, *, limit=30):
     """Read only bounded Git/lifecycle breadcrumbs; never return raw payloads."""
     path = Path(database_path)
@@ -89,23 +101,31 @@ def read_git_workflow_trace(database_path, *, limit=30):
                     if type(question_id) is int
                 }
             )
-            reasons = {}
+            question_details = {}
             if question_ids and "questions" in tables:
                 placeholders = ",".join("?" for _ in question_ids)
-                reasons = dict(
-                    db.execute(
-                        f"SELECT id, reason FROM questions WHERE id IN ({placeholders})",
+                columns = {row[1] for row in db.execute("PRAGMA table_info(questions)")}
+                question_expression = "question" if "question" in columns else "NULL"
+                question_details = {
+                    row[0]: (row[1], row[2])
+                    for row in db.execute(
+                        f"SELECT id, reason, {question_expression} FROM questions "
+                        f"WHERE id IN ({placeholders})",
                         question_ids,
                     ).fetchall()
-                )
+                }
     except (OSError, sqlite3.Error, ValueError):
         return []
     trace = []
     for row in reversed(rows):
         state = _safe_payload(row[3])
-        reason = reasons.get(state.get("question_id"))
+        details = question_details.get(state.get("question_id"), (None, None))
+        reason, question = details
         if isinstance(reason, str) and re.fullmatch(r"git:[a-z_]{1,40}", reason):
             state["reason_category"] = reason
+        failure_class = _question_failure_class(question)
+        if failure_class is not None:
+            state["failure_class"] = failure_class
         trace.append(
             {
                 "event_id": row[0],

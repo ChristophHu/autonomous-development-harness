@@ -68,8 +68,10 @@ def test_independent_review_must_cover_exactly_declared_contract_keys():
         "requirements": {"add two integers": True},
         "criteria": {"sum": True},
         "evidence": "checked output and tests",
-        "requirement_evidence": {"add two integers": ["criterion:sum"]},
-        "criterion_evidence": {"sum": ["criterion:sum"]},
+        "requirement_evidence": {
+            "add two integers": ["plan-step:implement", "criterion:sum"]
+        },
+        "criterion_evidence": {"sum": ["plan-step:implement", "criterion:sum"]},
     }
     extra = {
         **valid,
@@ -81,12 +83,33 @@ def test_independent_review_must_cover_exactly_declared_contract_keys():
         "requirement_evidence": {"add two integers": ["file:outside.py"]},
     }
 
-    assert EvidenceValidator._review_confirms(valid, task, {"criterion:sum"})
-    assert not EvidenceValidator._review_confirms(extra, task, {"criterion:sum"})
-    assert not EvidenceValidator._review_confirms(missing, task, {"criterion:sum"})
-    assert EvidenceValidator._review_confirms(valid, task, {"criterion:sum"})
+    evidence = {"plan-step:implement", "criterion:sum"}
+    assert EvidenceValidator._review_confirms(valid, task, evidence)
+    assert not EvidenceValidator._review_confirms(extra, task, evidence)
+    assert not EvidenceValidator._review_confirms(missing, task, evidence)
+    assert EvidenceValidator._review_confirms(valid, task, evidence)
+    assert not EvidenceValidator._review_confirms(invented_evidence, task, evidence)
+
+
+def test_independent_review_requires_matching_plan_step_and_observed_evidence():
+    from harness.validation import EvidenceValidator
+
+    task = _task()
+    valid = {
+        "requirements": {"add two integers": True},
+        "criteria": {"sum": True},
+        "evidence": "checked",
+        "requirement_evidence": {
+            "add two integers": ["plan-step:other", "criterion:sum"]
+        },
+        "criterion_evidence": {"sum": ["plan-step:implement", "criterion:sum"]},
+    }
     assert not EvidenceValidator._review_confirms(
-        invented_evidence, task, {"criterion:sum"}
+        valid, task, {"plan-step:other", "plan-step:implement", "criterion:sum"}
+    )
+    valid["requirement_evidence"]["add two integers"] = ["plan-step:implement"]
+    assert not EvidenceValidator._review_confirms(
+        valid, task, {"plan-step:implement", "criterion:sum"}
     )
 
 
@@ -139,6 +162,30 @@ def test_correction_finding_contract_does_not_parse_error_text(tmp_path):
     assert findings[("human_input", "question.required_open")].source == "validator"
     assert findings[("plan", "plan.alignment")].source == "plan_validator"
     assert findings[("workspace", "workspace.integrity")].evidence["messages"]
+
+
+def test_correction_findings_are_routed_by_step_or_overlapping_write_path():
+    from harness.agents import Subtask
+    from harness.core import corrections_for_step
+
+    step = Subtask(
+        id="edit-api",
+        title="edit",
+        description="edit API files",
+        write_paths=["src/api"],
+    )
+    findings = [
+        {"rule": "unscoped"},
+        {"rule": "step", "subtask_id": "edit-api", "affected_paths": []},
+        {"rule": "path", "affected_paths": ["src/api/routes.py"]},
+        {"rule": "unrelated", "affected_paths": ["docs/guide.md"]},
+    ]
+
+    assert [item["rule"] for item in corrections_for_step(step, findings)] == [
+        "unscoped",
+        "step",
+        "path",
+    ]
 
 
 def test_changed_file_claim_requires_observed_mutation_evidence(tmp_path):
@@ -237,6 +284,92 @@ def test_non_git_workspace_is_explicitly_not_applicable(tmp_path):
     assert snapshot["applicable"] is False
     assert snapshot["reason"] == "workspace is not a Git repository"
     assert isinstance(snapshot["filesystem"], dict)
+
+
+def test_test_runner_workspace_mutation_gate_ignores_only_generated_outputs():
+    from harness.validation import EvidenceValidator
+
+    before = {
+        "filesystem": {
+            "README.md": "file:644:4:before",
+            "addition.py": "file:644:5:before",
+        }
+    }
+    after = {
+        "filesystem": {
+            "README.md": "file:644:4:before",
+            "addition.py": "file:644:5:before",
+            "coverage.json": "file:644:10:coverage",
+            ".coverage": "file:600:10:coverage-data",
+            ".pytest_cache/v/cache/nodeids": "file:644:4:cache",
+            "src/__pycache__/module.pyc": "file:644:4:bytecode",
+        }
+    }
+    assert (
+        EvidenceValidator._test_side_effect_findings(before, after, "coverage.json")
+        == []
+    )
+
+
+def test_test_runner_workspace_mutation_gate_rejects_source_changes():
+    from harness.validation import EvidenceValidator
+
+    before = {"filesystem": {"addition.py": "file:644:before"}}
+    after = {
+        "filesystem": {
+            "addition.py": "file:644:after",
+            "unplanned.txt": "file:644:new",
+        }
+    }
+    assert EvidenceValidator._test_side_effect_findings(
+        before, after, "coverage.json"
+    ) == [
+        "test execution modified workspace outside generated outputs: addition.py",
+        "test execution modified workspace outside generated outputs: unplanned.txt",
+    ]
+
+
+def test_test_runner_workspace_mutation_gate_rejects_git_identity_changes():
+    from harness.validation import EvidenceValidator
+
+    before = {
+        "applicable": True,
+        "root": "/workspace",
+        "branch": "main",
+        "head": "a" * 40,
+        "filesystem": {},
+    }
+    after = before | {"head": "b" * 40}
+    assert EvidenceValidator._test_side_effect_findings(
+        before, after, "coverage.json"
+    ) == ["test execution changed workspace identity: head"]
+
+
+@pytest.mark.parametrize(
+    "before,after,expected",
+    [
+        (None, None, []),
+        (
+            None,
+            {"filesystem": {}},
+            ["workspace snapshot around test execution is missing"],
+        ),
+        (
+            {"filesystem": None},
+            {"filesystem": {}},
+            ["workspace filesystem snapshot around tests is invalid"],
+        ),
+    ],
+)
+def test_test_runner_workspace_mutation_gate_rejects_missing_snapshots(
+    before, after, expected
+):
+    from harness.validation import EvidenceValidator
+
+    assert (
+        EvidenceValidator._test_side_effect_findings(before, after, "coverage.json")
+        == expected
+    )
 
 
 def test_filesystem_snapshot_detects_mutation_of_preexisting_untracked_path(tmp_path):

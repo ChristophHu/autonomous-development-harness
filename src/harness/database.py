@@ -14,7 +14,7 @@ from typing import ClassVar
 
 
 class Database:
-    CURRENT_SCHEMA_VERSION: ClassVar[int] = 17
+    CURRENT_SCHEMA_VERSION: ClassVar[int] = 18
 
     def __init__(self, path: Path, *, timeout: float = 5.0):
         if (
@@ -318,6 +318,23 @@ class Database:
                     BEFORE DELETE ON mcp_status_snapshots
                     BEGIN SELECT RAISE(ABORT,'MCP status snapshots are append-only'); END""")
                 c.execute("INSERT INTO schema_versions VALUES(17,?)", (self.now(),))
+            if not c.execute(
+                "SELECT 1 FROM schema_versions WHERE version=18"
+            ).fetchone():
+                c.execute(
+                    "ALTER TABLE model_runs ADD COLUMN calibration_raw_tokens "
+                    "INTEGER CHECK(calibration_raw_tokens IS NULL OR calibration_raw_tokens >= 0)"
+                )
+                c.execute(
+                    "ALTER TABLE model_runs ADD COLUMN calibration_safety_margin "
+                    "INTEGER CHECK(calibration_safety_margin IS NULL OR calibration_safety_margin BETWEEN 0 AND 100)"
+                )
+                c.execute("ALTER TABLE model_runs ADD COLUMN calibration_key TEXT")
+                c.execute(
+                    "CREATE INDEX model_runs_token_calibration ON "
+                    "model_runs(model,calibration_key,id DESC)"
+                )
+                c.execute("INSERT INTO schema_versions VALUES(18,?)", (self.now(),))
 
     @classmethod
     def _validate_migration_history(cls, connection):
@@ -797,6 +814,113 @@ class TaskRepository:
                 ),
             )
 
+    def complete(self, task_id, result, attempt, owner=None, evidence=None):
+        """Atomically persist successful task completion and its audit events."""
+        from .domain import EventKind, may_transition
+
+        if (
+            isinstance(task_id, bool)
+            or not isinstance(task_id, int)
+            or task_id < 1
+            or not isinstance(result, str)
+            or not result.strip()
+            or isinstance(attempt, bool)
+            or not isinstance(attempt, int)
+            or attempt < 0
+            or (owner is not None and (not isinstance(owner, str) or not owner))
+        ):
+            raise ValueError("task completion contract is invalid")
+        with self.db.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT status,title,description,metadata FROM tasks WHERE id=?",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("task not found")
+            if (
+                owner is not None
+                and not connection.execute(
+                    "SELECT 1 FROM task_leases WHERE task_id=? AND owner=? AND expires_at>?",
+                    (task_id, owner, time.time()),
+                ).fetchone()
+            ):
+                raise ValueError("task lease is no longer owned")
+            if not may_transition(row["status"], "completed"):
+                raise ValueError(
+                    f"invalid task transition: {row['status']} -> completed"
+                )
+            if connection.execute(
+                "SELECT 1 FROM questions WHERE task_id=? AND required=1 AND status='open'",
+                (task_id,),
+            ).fetchone():
+                raise ValueError("required question is still open")
+            if connection.execute(
+                "SELECT 1 FROM correction_items WHERE task_id=? AND status IN ('open','in_progress') LIMIT 1",
+                (task_id,),
+            ).fetchone():
+                raise ValueError("required correction is still open or unverified")
+            plan = connection.execute(
+                "SELECT id,payload FROM plans WHERE task_id=? ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if plan is not None:
+                latest_validation = connection.execute(
+                    "SELECT id,valid,report FROM validations WHERE task_id=? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (task_id,),
+                ).fetchone()
+                try:
+                    binding = json.loads(latest_validation["report"])[
+                        "completion_evidence"
+                    ]
+                    plan_digest = json.loads(plan["payload"])["task_contract_sha256"]
+                    metadata = json.loads(row["metadata"])
+                    metadata["title"] = row["title"]
+                    metadata["description"] = row["description"]
+                    current_digest = PlanRepository.contract_digest(metadata)
+                    current = (
+                        isinstance(evidence, dict)
+                        and isinstance(evidence.get("validation_id"), int)
+                        and not isinstance(evidence["validation_id"], bool)
+                        and evidence["validation_id"] == latest_validation["id"]
+                        and latest_validation["valid"] == 1
+                        and binding.get("plan_id") == plan["id"]
+                        and binding.get("task_contract_sha256") == current_digest
+                        and plan_digest == current_digest
+                        and isinstance(evidence.get("workspace_sha256"), str)
+                        and re.fullmatch(r"[0-9a-f]{64}", evidence["workspace_sha256"])
+                        is not None
+                        and binding.get("workspace_sha256")
+                        == evidence["workspace_sha256"]
+                    )
+                except (TypeError, ValueError, KeyError, AttributeError):
+                    current = False
+                if not current:
+                    raise ValueError("current validation evidence is required")
+            now = self.db.now()
+            connection.execute(
+                "UPDATE tasks SET status='completed',result=?,updated_at=? WHERE id=?",
+                (result, now, task_id),
+            )
+            connection.executemany(
+                "INSERT INTO events(task_id,kind,payload,created_at) VALUES(?,?,?,?)",
+                (
+                    (
+                        task_id,
+                        EventKind.TASK_STATUS.value,
+                        json.dumps({"from": row["status"], "status": "completed"}),
+                        now,
+                    ),
+                    (
+                        task_id,
+                        EventKind.TASK_COMPLETED.value,
+                        json.dumps({"attempt": attempt}),
+                        now,
+                    ),
+                ),
+            )
+
 
 class EventRepository:
     def __init__(self, db):
@@ -850,8 +974,32 @@ class EventRepository:
 
 
 class PlanRepository:
+    CONTRACT_FIELDS = (
+        "title",
+        "description",
+        "goal",
+        "requirements",
+        "acceptance_criteria",
+        "test_commands",
+        "coverage_command",
+    )
+
     def __init__(self, db):
         self.db = db
+
+    @classmethod
+    def contract_digest(cls, metadata):
+        if not isinstance(metadata, dict):
+            raise TypeError("task contract metadata must be a mapping")
+        contract = {name: metadata.get(name) for name in cls.CONTRACT_FIELDS}
+        encoded = json.dumps(
+            contract,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
     def save(self, task_id, summary, payload):
         with self.db.connect() as c:
@@ -860,6 +1008,57 @@ class PlanRepository:
                 (task_id, summary, json.dumps(payload), self.db.now()),
             )
             return cur.lastrowid
+
+    def save_execution_plan(self, task_id, summary, payload, subtasks, metadata):
+        """Persist a plan revision, its steps and task snapshot atomically."""
+        step_ids = [getattr(step, "id", None) for step in subtasks]
+        if (
+            not isinstance(summary, str)
+            or not summary.strip()
+            or any(not isinstance(step_id, str) or not step_id for step_id in step_ids)
+            or len(step_ids) != len(set(step_ids))
+            or not isinstance(metadata, dict)
+        ):
+            raise ValueError("execution plan persistence contract is invalid")
+        persisted_payload = dict(payload)
+        persisted_payload["task_contract_sha256"] = self.contract_digest(metadata)
+        serialized_plan = json.dumps(
+            persisted_payload, ensure_ascii=False, allow_nan=False
+        )
+        serialized_metadata = json.dumps(metadata, ensure_ascii=False, allow_nan=False)
+        with self.db.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if (
+                connection.execute(
+                    "SELECT 1 FROM tasks WHERE id=?", (task_id,)
+                ).fetchone()
+                is None
+            ):
+                raise ValueError("task not found")
+            cursor = connection.execute(
+                "INSERT INTO plans(task_id,summary,payload,created_at) VALUES(?,?,?,?)",
+                (task_id, summary, serialized_plan, self.db.now()),
+            )
+            plan_id = cursor.lastrowid
+            for step in subtasks:
+                connection.execute(
+                    "INSERT INTO subtasks(task_id,external_id,title,description,profile,status,plan_id) VALUES(?,?,?,?,?,'pending',?)",
+                    (
+                        task_id,
+                        step.id,
+                        step.title,
+                        step.description,
+                        step.profile,
+                        plan_id,
+                    ),
+                )
+            updated = connection.execute(
+                "UPDATE tasks SET metadata=?,updated_at=? WHERE id=?",
+                (serialized_metadata, self.db.now(), task_id),
+            )
+            if updated.rowcount != 1:
+                raise ValueError("task not found")
+            return plan_id
 
     def latest(self, task_id):
         with self.db.connect() as c:
@@ -872,6 +1071,47 @@ class PlanRepository:
             result = dict(row)
             result["payload"] = json.loads(result["payload"])
             return result
+
+    def inspect_latest_contract(self, task_id):
+        """Compare the latest plan fingerprint against the current task contract."""
+        with self.db.connect() as connection:
+            task = connection.execute(
+                "SELECT title,description,metadata FROM tasks WHERE id=?", (task_id,)
+            ).fetchone()
+            plan = connection.execute(
+                "SELECT id,payload FROM plans WHERE task_id=? ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+        if task is None or plan is None:
+            return {
+                "current": False,
+                "plan_id": None,
+                "stored_sha256": None,
+                "current_sha256": None,
+            }
+        try:
+            metadata = json.loads(task["metadata"])
+            payload = json.loads(plan["payload"])
+            if not isinstance(metadata, dict) or not isinstance(payload, dict):
+                raise TypeError("task or plan metadata is not a mapping")
+            metadata["title"] = task["title"]
+            metadata["description"] = task["description"]
+            current_digest = self.contract_digest(metadata)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {
+                "current": False,
+                "plan_id": plan["id"],
+                "stored_sha256": None,
+                "current_sha256": None,
+            }
+        stored_digest = payload.get("task_contract_sha256")
+        return {
+            "current": isinstance(stored_digest, str)
+            and stored_digest == current_digest,
+            "plan_id": plan["id"],
+            "stored_sha256": stored_digest if isinstance(stored_digest, str) else None,
+            "current_sha256": current_digest,
+        }
 
 
 class ArtifactRepository:
@@ -1219,6 +1459,48 @@ class CorrectionRepository:
             rows = connection.execute(query, parameters).fetchall()
         return [self._decode(row) for row in rows]
 
+    def start_open_for_task(self, task_id, max_attempts):
+        """Claim every pending correction as one durable, budgeted retry batch."""
+        self._task_id(task_id)
+        if (
+            not isinstance(max_attempts, int)
+            or isinstance(max_attempts, bool)
+            or not 0 <= max_attempts <= 10
+        ):
+            raise ValueError("max_attempts must be an integer between 0 and 10")
+        now = self.db.now()
+        with self.db.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                "SELECT * FROM correction_items WHERE task_id=? AND status='open' ORDER BY created_at,id",
+                (task_id,),
+            ).fetchall()
+            if any(row["attempts"] >= max_attempts for row in rows):
+                raise ValueError("correction retry budget exhausted")
+            for row in rows:
+                connection.execute(
+                    "UPDATE correction_items SET status='in_progress',attempts=attempts+1,updated_at=?,resolved_at=NULL WHERE id=? AND status='open'",
+                    (now, row["id"]),
+                )
+                self._append_event(
+                    connection,
+                    task_id,
+                    "correction.item_status",
+                    {
+                        "item_id": row["id"],
+                        "from": "open",
+                        "status": "in_progress",
+                    },
+                    now,
+                )
+            claimed = [
+                connection.execute(
+                    "SELECT * FROM correction_items WHERE id=?", (row["id"],)
+                ).fetchone()
+                for row in rows
+            ]
+            return [self._decode(row) for row in claimed]
+
     def set_status(self, item_id, status):
         if not isinstance(status, str) or status not in self.STATUSES:
             raise ValueError("unsupported correction status")
@@ -1289,6 +1571,97 @@ class SubtaskRepository:
                 ).rowcount
                 == 1
             )
+
+    def persist_result(
+        self, task_id, external_id, plan_id, status, output, artifact_key, content
+    ):
+        """Commit a step result, its append-only artifact and audit event together."""
+        if not isinstance(task_id, int) or isinstance(task_id, bool) or task_id < 1:
+            raise ValueError("task_id must be a positive integer")
+        if not isinstance(external_id, str) or not external_id.strip():
+            raise ValueError("external_id must be a nonempty string")
+        if plan_id is not None and (
+            not isinstance(plan_id, int) or isinstance(plan_id, bool) or plan_id < 1
+        ):
+            raise ValueError("plan_id must be a positive integer or null")
+        if status not in {"completed", "failed"}:
+            raise ValueError("step result status must be completed or failed")
+        if not isinstance(output, str) or not isinstance(content, str):
+            raise TypeError("step output and artifact content must be strings")
+        if not isinstance(artifact_key, str) or not artifact_key.strip():
+            raise ValueError("artifact_key must be a nonempty string")
+
+        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        now = self.db.now()
+        with self.db.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT status,output FROM subtasks WHERE task_id=? AND external_id=? AND plan_id IS ?",
+                (task_id, external_id, plan_id),
+            ).fetchone()
+            if existing is None:
+                raise ValueError("subtask not found")
+            if existing["status"] == status and existing["output"] == output:
+                committed = connection.execute(
+                    """SELECT artifacts.* FROM artifacts
+                    JOIN events ON events.task_id=artifacts.task_id
+                    WHERE artifacts.task_id=? AND artifacts.artifact_key=?
+                    AND artifacts.sha256=?
+                    AND json_extract(events.payload,'$.key')=artifacts.artifact_key
+                    AND json_extract(events.payload,'$.version')=artifacts.version
+                    AND json_extract(events.payload,'$.subtask_id')=?
+                    AND json_extract(events.payload,'$.plan_id') IS ?
+                    AND json_extract(events.payload,'$.sha256')=?
+                    AND events.kind=? ORDER BY artifacts.version DESC LIMIT 1""",
+                    (
+                        task_id,
+                        artifact_key,
+                        digest,
+                        external_id,
+                        plan_id,
+                        digest,
+                        "artifact.recorded",
+                    ),
+                ).fetchone()
+                if committed is not None:
+                    return dict(committed)
+            updated = connection.execute(
+                "UPDATE subtasks SET status=?,output=? WHERE task_id=? AND external_id=? AND plan_id IS ?",
+                (status, output, task_id, external_id, plan_id),
+            )
+            if updated.rowcount != 1:
+                raise ValueError("subtask not found")
+            current = connection.execute(
+                "SELECT COALESCE(MAX(version),0) FROM artifacts WHERE task_id=? AND artifact_key=?",
+                (task_id, artifact_key),
+            ).fetchone()[0]
+            cursor = connection.execute(
+                "INSERT INTO artifacts(task_id,artifact_key,version,content,sha256,created_at) VALUES(?,?,?,?,?,?)",
+                (task_id, artifact_key, current + 1, content, digest, now),
+            )
+            from .domain import EventKind
+
+            connection.execute(
+                "INSERT INTO events(task_id,kind,payload,created_at) VALUES(?,?,?,?)",
+                (
+                    task_id,
+                    EventKind.ARTIFACT_RECORDED.value,
+                    json.dumps(
+                        {
+                            "key": artifact_key,
+                            "version": current + 1,
+                            "sha256": digest,
+                            "plan_id": plan_id,
+                            "subtask_id": external_id,
+                        }
+                    ),
+                    now,
+                ),
+            )
+            artifact = connection.execute(
+                "SELECT * FROM artifacts WHERE id=?", (cursor.lastrowid,)
+            ).fetchone()
+            return dict(artifact)
 
     def list(self, task_id):
         with self.db.connect() as c:
@@ -1863,6 +2236,9 @@ class AuditRepository:
         error_category=None,
         provider=None,
         model=None,
+        calibration_raw_tokens=None,
+        calibration_safety_margin=None,
+        calibration_key=None,
     ):
         if error_category is not None:
             from .errors import FailureCategory
@@ -1886,7 +2262,7 @@ class AuditRepository:
                 else (provider, model, None, None, None, None, None)
             )
             connection.execute(
-                "UPDATE model_runs SET status=?,finished_at=?,latency_ms=?,provider=COALESCE(?,provider),model=COALESCE(?,model),prompt_tokens=?,completion_tokens=?,cost=?,cached_tokens=?,reasoning_tokens=?,error_type=?,error_category=? WHERE id=?",
+                "UPDATE model_runs SET status=?,finished_at=?,latency_ms=?,provider=COALESCE(?,provider),model=COALESCE(?,model),prompt_tokens=?,completion_tokens=?,cost=?,cached_tokens=?,reasoning_tokens=?,error_type=?,error_category=?,calibration_raw_tokens=?,calibration_safety_margin=?,calibration_key=? WHERE id=?",
                 (
                     status,
                     self.db.now(),
@@ -1894,6 +2270,34 @@ class AuditRepository:
                     *values,
                     error_type,
                     error_category,
+                    calibration_raw_tokens,
+                    calibration_safety_margin,
+                    calibration_key,
                     run_id,
                 ),
             )
+
+    def token_calibration_samples(self, model, calibration_key, *, limit=100):
+        if not isinstance(model, str) or not model:
+            raise ValueError("model ID is required for token calibration")
+        if not isinstance(calibration_key, str) or not calibration_key:
+            raise ValueError("calibration key is required")
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= 1000
+        ):
+            raise ValueError(
+                "token calibration sample limit must be between 1 and 1000"
+            )
+        with self.db.connect() as connection:
+            rows = connection.execute(
+                "SELECT calibration_raw_tokens,prompt_tokens,calibration_safety_margin "
+                "FROM model_runs WHERE model=? AND calibration_key=? "
+                "AND status='completed' AND calibration_raw_tokens>0 "
+                "AND prompt_tokens IS NOT NULL "
+                "AND calibration_safety_margin IS NOT NULL "
+                "ORDER BY id DESC LIMIT ?",
+                (model, calibration_key, limit),
+            ).fetchall()
+        return [tuple(row) for row in rows]

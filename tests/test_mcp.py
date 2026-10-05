@@ -18,10 +18,69 @@ from pydantic import ValidationError
 
 from harness.configuration import HarnessConfig
 from harness.core import Config, Permissions
-from harness.mcp import MCPClient, MCPError, builtin_filesystem_command
+from harness.mcp import (
+    MCPClient,
+    MCPError,
+    builtin_filesystem_command,
+    builtin_obsidian_command,
+)
 from harness.mcp_servers.filesystem import FilesystemServer, _response
 from harness.process_control import RunControl, TaskCancelled, use_run_control
 from harness.tools import ToolExecutionError, ToolRegistry
+
+
+def test_obsidian_command_optionally_includes_source_root(tmp_path):
+    vault = tmp_path / "vault"
+    command = builtin_obsidian_command(vault)
+    assert command[-1] == str(vault)
+    command_with_source = builtin_obsidian_command(vault, tmp_path)
+    assert command_with_source[-2:] == [str(vault), str(tmp_path)]
+
+
+def test_discover_skips_disabled_mcp_and_rejects_unknown_apple_shell_tool(
+    tmp_path, monkeypatch
+):
+    config = Config()
+    config.data["tools"] = {
+        "permissions": {"apple_shell": "read"},
+        "mcp": {
+            "servers": {
+                "disabled": {"enabled": False, "builtin": "filesystem"},
+                "shell": {"enabled": True, "builtin": "apple_shell"},
+            }
+        },
+    }
+    registry = ToolRegistry(Permissions(config), workspace=tmp_path)
+    registry._discover_mcp_server("disabled")
+
+    class Client:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def discover(self):
+            return [{"name": "untrusted_tool", "inputSchema": {"type": "object"}}]
+
+    monkeypatch.setattr("harness.mcp.MCPClient", Client)
+    with pytest.raises(ValueError, match="unknown tool"):
+        registry._discover_mcp_server("shell")
+
+
+def test_execute_distinguishes_unavailable_mcp_from_unknown_tool(tmp_path):
+    config = Config()
+    config.data["tools"] = {
+        "permissions": {"filesystem": "read"},
+        "mcp": {"servers": {"files": {"enabled": True, "builtin": "filesystem"}}},
+    }
+    registry = ToolRegistry(Permissions(config), workspace=tmp_path)
+    assert registry.mcp_status(probe=False) == registry.mcp_manager.report()
+    registry.mcp_manager._loader = None
+    with pytest.raises(KeyError, match="unknown tool"):
+        registry.execute("mcp.files.unadvertised", {})
+    registry.mcp_manager.mark("files", "unavailable", "MCPError")
+    with pytest.raises(RuntimeError, match="unavailable"):
+        registry.execute("mcp.files.unadvertised", {})
+    with pytest.raises(KeyError, match="unknown tool"):
+        registry.execute("mcp.malformed", {})
 
 
 def test_builtin_server_lives_in_dedicated_installable_package(tmp_path):
@@ -1102,7 +1161,9 @@ def test_client_uses_only_explicit_python_import_roots(tmp_path, monkeypatch):
             client.discover()
     assert "PYTHONPATH" not in environments[0]
     assert environments[1]["PYTHONPATH"] == str(trusted.resolve())
-    for invalid in (Path("relative"), tmp_path / "missing", workspace / "file"):
+    file_root = tmp_path / "not-a-directory"
+    file_root.write_text("file")
+    for invalid in (Path("relative"), tmp_path / "missing", file_root):
         with pytest.raises((ValueError, FileNotFoundError)):
             MCPClient([sys.executable], workspace, python_import_roots=(invalid,))
 

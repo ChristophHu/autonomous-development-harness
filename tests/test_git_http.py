@@ -317,6 +317,57 @@ def test_https_transport_rejects_git_helper_lookup_failure(tmp_path, monkeypatch
         )
 
 
+def test_https_transport_reports_host_sandbox_helper_lookup_failure(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        "harness.git_broker.run_cancellable",
+        lambda command, *args, **kwargs: subprocess.CompletedProcess(
+            command, 71, "", "sandbox_apply: Operation not permitted"
+        ),
+    )
+    with pytest.raises(PermissionError, match="host sandbox blocked"):
+        HttpsTransport.prepare(
+            ["clone", "https://git.example.com/repo.git", "copy"],
+            tmp_path,
+            {},
+            allowed_hosts=["git.example.com"],
+        )
+
+
+def test_https_transport_reports_host_sandbox_git_config_failure(tmp_path, monkeypatch):
+    helper_dir = Path(
+        subprocess.run(
+            ["git", "--exec-path"], capture_output=True, text=True, check=True
+        ).stdout.strip()
+    )
+    assert (helper_dir / "git-remote-https").is_file()
+    calls = 0
+
+    def run(command, *_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return subprocess.CompletedProcess(command, 0, str(helper_dir), "")
+        return subprocess.CompletedProcess(
+            command, 71, "", "sandbox_apply: Operation not permitted"
+        )
+
+    monkeypatch.setattr(
+        "harness.git_broker.isolated_command", lambda *_a, **_k: ["git"]
+    )
+    monkeypatch.setattr("harness.git_broker.run_cancellable", run)
+    with pytest.raises(
+        PermissionError, match="host sandbox blocked HTTPS Git configuration"
+    ):
+        HttpsTransport.prepare(
+            ["clone", "https://git.example.com/repo.git", "copy"],
+            tmp_path,
+            {},
+            allowed_hosts=["git.example.com"],
+        )
+
+
 def test_tool_registry_loads_git_host_allowlist_and_ca_bundle(tmp_path):
     config = Config()
     config.data["tools"] = {

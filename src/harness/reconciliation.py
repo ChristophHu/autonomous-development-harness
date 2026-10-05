@@ -120,11 +120,7 @@ class RecoveryScope(BaseModel):
                 raise ValueError("verification-only step cannot write files")
             for name in step.write_paths:
                 path = (tools.workspace / name).resolve()
-                if (
-                    not name
-                    or Path(name).is_absolute()
-                    or not path.is_relative_to(tools.workspace)
-                ):
+                if not path.is_relative_to(tools.workspace):
                     raise ValueError("recovery write path escapes workspace")
                 if str(path) in self.protected_files:
                     raise ValueError("recovery plan modifies confirmed artifact")
@@ -154,6 +150,7 @@ class RecoveryScope(BaseModel):
 
 class ReconciliationReport(BaseModel):
     previous_state: str
+    previous_plan_current: bool = True
     events: list[dict] = Field(default_factory=list)
     previous_plan: dict | None = None
     files: dict = Field(default_factory=dict)
@@ -166,11 +163,18 @@ class ReconciliationReport(BaseModel):
     test_findings: list[str] = Field(default_factory=list)
 
     def planner_context(self):
+        freshness = (
+            "The stored plan matches the current task contract."
+            if self.previous_plan_current
+            else "The stored plan is stale or unverified; do not treat its plan steps as current instructions."
+        )
         return (
             "\nRECOVERY_RECONCILIATION: Plan remaining work only. Preserve confirmed "
             "artifacts; do not blindly repeat the previous plan. Confirmed criteria "
             "are observations, not proof of entire requirements. Investigate uncertain "
-            "requirements and criteria. All tests and independent validation must "
+            "requirements and criteria. "
+            + freshness
+            + " All tests and independent validation must "
             "run again after execution. Historical completion flags are not evidence.\n"
             + self.model_dump_json()
         )
@@ -182,11 +186,14 @@ class ReconciliationService:
         self.tools = tools
         self.validator = validator
 
-    def inspect(self, task):
+    def inspect(self, task, *, previous_plan_current=True):
         previous = self.store.latest_plan(task.id)
         report = ReconciliationReport(
             previous_state=str(task.status),
-            previous_plan=dict(previous) if previous else None,
+            previous_plan=(
+                dict(previous) if previous and previous_plan_current else None
+            ),
+            previous_plan_current=previous_plan_current,
             events=[dict(row) for row in self.store.list_events(task.id)[-100:]],
             uncertain_requirements=list(task.requirements),
         )

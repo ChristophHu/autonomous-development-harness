@@ -266,6 +266,19 @@ def test_missing_and_invalid_git_remote_are_denied(tmp_path):
         LocalTransport.prepare(["clone", str(tmp_path), "dest"], tmp_path, {})
 
 
+def test_local_remote_verification_reports_host_sandbox_block(tmp_path, monkeypatch):
+    remote = tmp_path / "remote.git"
+    remote.mkdir()
+    monkeypatch.setattr(
+        "harness.git_broker.run_cancellable",
+        lambda command, *args, **kwargs: subprocess.CompletedProcess(
+            command, 71, "", "sandbox_apply: Operation not permitted"
+        ),
+    )
+    with pytest.raises(PermissionError, match="host sandbox blocked"):
+        LocalTransport.prepare(["clone", str(remote), "dest"], tmp_path, {})
+
+
 def test_push_to_working_repository_is_denied(tmp_path, monkeypatch):
     _store, harness, _task, _git, repo = git_runtime(tmp_path, monkeypatch)
     with pytest.raises(PermissionError, match="bare"):
@@ -302,6 +315,28 @@ def test_remote_fd_helper_must_be_the_trusted_git_image(tmp_path, monkeypatch, p
         LocalTransport.prepare(
             ["clone", str(repo), "dest"], repo, harness.tools.executor._environment()
         )
+
+
+def test_local_transport_rejects_untrusted_server_helper_mapping(tmp_path, monkeypatch):
+    remote = tmp_path / "remote.git"
+    remote.mkdir()
+    commands = iter(
+        [
+            ["sandbox-exec", "-p", "(version 1)", "/tmp/untrusted-git", "upload"],
+            ["sandbox-exec", "-p", "(version 1)", "/tmp/check-git", "rev-parse"],
+        ]
+    )
+    monkeypatch.setattr(
+        "harness.git_broker.isolated_command", lambda *_a, **_k: next(commands)
+    )
+    monkeypatch.setattr(
+        "harness.git_broker.run_cancellable",
+        lambda command, *args, **kwargs: subprocess.CompletedProcess(
+            command, 0, "true", ""
+        ),
+    )
+    with pytest.raises(PermissionError, match="trusted Git remote-fd helper"):
+        LocalTransport.prepare(["clone", str(remote), "dest"], tmp_path, {})
 
 
 def test_failed_kernel_probe_preserves_grant(tmp_path, monkeypatch):

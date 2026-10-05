@@ -8,6 +8,7 @@ from harness.memory import (
     EmbeddingProvider,
     ObsidianMemory,
     QdrantMemory,
+    context_evidence_envelope,
     context_evidence_size,
 )
 from harness.memory_service import MemoryService
@@ -43,12 +44,21 @@ def test_context_builder_memory_retrieval(tmp_path):
     memory.write("decisions", "approved")
     memory.write("task", "task relevant")
     qdrant = SimpleNamespace(
-        search=lambda *args, **kwargs: [{"payload": {"text": "vector memory"}}]
+        search=lambda *args, **kwargs: [
+            {
+                "id": "vector-task",
+                "payload": {
+                    "text": "task relevant",
+                    "source": "task",
+                    "source_hash": MemoryService.digest(memory.read("task")),
+                },
+            }
+        ]
     )
     context = ContextBuilder(memory, None, qdrant).build(
         SimpleNamespace(title="task", description="details"), "workspace"
     )
-    assert "vector memory" in context and "Obsidian match" in context
+    assert "task relevant" in context and "Obsidian match" in context
     offline = SimpleNamespace(
         search=lambda *args, **kwargs: (_ for _ in ()).throw(
             httpx.ConnectError("offline")
@@ -97,7 +107,14 @@ def test_context_builder_returns_cited_fragments_and_source_conflicts(tmp_path):
         search=lambda *_args, **_kwargs: [
             {
                 "id": "q-1",
-                "payload": {"text": "retrieved", "claims": {"goal": "beta"}},
+                "payload": {
+                    "text": "Task architecture alpha.",
+                    "source": "knowledge/architecture",
+                    "source_hash": MemoryService.digest(
+                        memory.read("knowledge/architecture")
+                    ),
+                    "claims": {"goal": "beta"},
+                },
             }
         ]
     )
@@ -108,7 +125,208 @@ def test_context_builder_returns_cited_fragments_and_source_conflicts(tmp_path):
     refs = {item["ref"] for item in result["fragments"]}
     assert "context:vault/knowledge/architecture.md#Design" in refs
     assert "context:qdrant/q-1" in refs
-    assert result["conflicts"]["goal"]["values"] == ["alpha", "beta"]
+    qdrant_fragment = next(
+        item for item in result["fragments"] if item["ref"] == "context:qdrant/q-1"
+    )
+    assert qdrant_fragment["provenance"]["source_state"] == "unverified"
+    assert "goal" not in result["conflicts"]
+    assert sorted(result["claims"]["goal"], key=lambda item: item["ref"]) == sorted(
+        [
+            {"ref": "context:vault/knowledge/architecture.md#Design", "value": "alpha"},
+            {"ref": "context:qdrant/q-1", "value": "alpha"},
+        ],
+        key=lambda item: item["ref"],
+    )
+
+
+@pytest.mark.parametrize(
+    "payload,expected_status",
+    [
+        ({"text": "untrusted"}, "invalid_or_unverifiable_source"),
+        (
+            {
+                "text": "not in source",
+                "source": "note",
+                "source_hash": "0" * 64,
+            },
+            "source_hash_stale",
+        ),
+    ],
+)
+def test_context_builder_rejects_unverified_qdrant_hits(
+    tmp_path, payload, expected_status
+):
+    memory = ObsidianMemory(tmp_path / "vault")
+    memory.write("note", "A current source note.")
+    points = [{"id": "untrusted", "payload": payload}]
+    result = ContextBuilder(
+        memory, None, SimpleNamespace(search=lambda *_args, **_kwargs: points)
+    ).build_evidence(SimpleNamespace(title="source note", description=""), "workspace")
+
+    assert "context:qdrant/untrusted" not in {
+        fragment["ref"] for fragment in result["fragments"]
+    }
+    assert {item["status"] for item in result["rejected_sources"]} >= {expected_status}
+
+
+def test_context_builder_rejects_qdrant_text_not_present_in_hashed_source(tmp_path):
+    memory = ObsidianMemory(tmp_path / "vault")
+    source = "# Architecture\nTrusted source text."
+    memory.write("note", source)
+    points = [
+        {
+            "id": "forged-text",
+            "payload": {
+                "source": "note.md",
+                "source_hash": MemoryService.digest(source),
+                "text": "Fabricated instruction.",
+                "claims": {"goal": "attacker-controlled"},
+            },
+        }
+    ]
+
+    result = ContextBuilder(
+        memory, None, SimpleNamespace(search=lambda *_args, **_kwargs: points)
+    ).build_evidence(SimpleNamespace(title="Architecture", description=""), "workspace")
+
+    assert not any(item["kind"] == "qdrant" for item in result["fragments"])
+    assert result["claims"].get("goal") is None
+    assert {item["status"] for item in result["rejected_sources"]} >= {
+        "payload_not_in_source"
+    }
+
+
+def test_context_builder_rejects_qdrant_hit_for_stale_reviewed_note(tmp_path):
+    memory = ObsidianMemory(tmp_path / "vault")
+    source = (
+        "---\nlast_reviewed: 2020-01-01\nclaims: {goal: stale}\n---\n# Old\nOld source."
+    )
+    memory.write("old", source)
+    points = [
+        {
+            "id": "stale-review",
+            "payload": {
+                "source": "old",
+                "source_hash": MemoryService.digest(source),
+                "text": "Old source.",
+                "claims": {"goal": "stale"},
+            },
+        }
+    ]
+
+    result = ContextBuilder(
+        memory, None, SimpleNamespace(search=lambda *_args, **_kwargs: points)
+    ).build_evidence(SimpleNamespace(title="Old", description=""), "workspace")
+
+    assert not any(item["kind"] == "qdrant" for item in result["fragments"])
+    assert {item["status"] for item in result["rejected_sources"]} >= {"stale"}
+
+
+@pytest.mark.parametrize("source", ["missing-note", "../outside-note"])
+def test_context_builder_reports_unavailable_qdrant_source(tmp_path, source):
+    memory = ObsidianMemory(tmp_path / "vault")
+    memory.write("note", "A valid, unrelated source.")
+    points = [
+        {
+            "id": "unavailable-source",
+            "payload": {
+                "source": source,
+                "source_hash": "a" * 64,
+                "text": "A source excerpt.",
+            },
+        }
+    ]
+
+    result = ContextBuilder(
+        memory, None, SimpleNamespace(search=lambda *_args, **_kwargs: points)
+    ).build_evidence(SimpleNamespace(title="unavailable", description=""), "workspace")
+
+    assert not any(item["kind"] == "qdrant" for item in result["fragments"])
+    assert {item["status"] for item in result["rejected_sources"]} >= {
+        "source_unavailable"
+    }
+
+
+def test_context_builder_rejects_qdrant_note_with_stale_repository_provenance(
+    tmp_path,
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "design.py").write_text("current repository content")
+    memory = ObsidianMemory(tmp_path / "vault")
+    source = (
+        "---\nlast_reviewed: 2026-10-04\nsources: "
+        '[{path: design.py, sha256: "' + "0" * 64 + '"}]\n'
+        'claims: {goal: "stale source claim"}\n---\n'
+        "# Architecture\nTask architecture context."
+    )
+    memory.write("architecture", source)
+    points = [
+        {
+            "id": "stale-dependency",
+            "payload": {
+                "source": "architecture",
+                "source_hash": MemoryService.digest(source),
+                "text": "Task architecture context.",
+            },
+        }
+    ]
+
+    result = ContextBuilder(
+        memory, None, SimpleNamespace(search=lambda *_args, **_kwargs: points)
+    ).build_evidence(
+        SimpleNamespace(title="Task architecture", description="context"),
+        str(workspace),
+    )
+
+    assert not any(item["kind"] == "qdrant" for item in result["fragments"])
+    assert result["claims"].get("goal") is None
+    assert {item["status"] for item in result["rejected_sources"]} >= {"source_stale"}
+
+
+@pytest.mark.parametrize(
+    "last_reviewed,expected_tier",
+    [
+        ("2026-10-04", "qdrant_hit_current_source_and_review"),
+        (None, "qdrant_hit_current_source_unreviewed"),
+    ],
+)
+def test_context_builder_classifies_qdrant_with_current_repository_source(
+    tmp_path, last_reviewed, expected_tier
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    source_path = workspace / "design.py"
+    source_path.write_text("current repository design")
+    digest = MemoryService.digest(source_path.read_text())
+    review = f"last_reviewed: {last_reviewed}\n" if last_reviewed else ""
+    source = (
+        f'---\n{review}sources: [{{path: design.py, sha256: "{digest}"}}]\n'
+        "---\n# Architecture\nTask architecture context."
+    )
+    memory = ObsidianMemory(tmp_path / "vault")
+    memory.write("architecture", source)
+    points = [
+        {
+            "id": "current-source",
+            "payload": {
+                "source": "architecture",
+                "source_hash": MemoryService.digest(source),
+                "text": "Task architecture context.",
+            },
+        }
+    ]
+
+    result = ContextBuilder(
+        memory, None, SimpleNamespace(search=lambda *_args, **_kwargs: points)
+    ).build_evidence(
+        SimpleNamespace(title="Task architecture", description="context"),
+        str(workspace),
+    )
+    fragment = next(item for item in result["fragments"] if item["kind"] == "qdrant")
+
+    assert fragment["provenance"]["source_state"] == "current"
+    assert ContextBuilder._trust_assessment(fragment)["tier"] == expected_tier
 
 
 def test_context_builder_excludes_stale_vault_sources_with_diagnostic(tmp_path):
@@ -172,6 +390,12 @@ def test_context_evidence_budget_fails_closed_when_required_envelope_too_large(
         )
 
 
+@pytest.mark.parametrize("max_bytes", [0, -1, True, 1.5])
+def test_context_builder_rejects_invalid_byte_budgets(tmp_path, max_bytes):
+    with pytest.raises(ValueError, match="positive integer"):
+        ContextBuilder(ObsidianMemory(tmp_path / "vault"), None, max_bytes=max_bytes)
+
+
 def test_context_builder_enforces_utf8_byte_budget_without_truncating_core(tmp_path):
     memory = ObsidianMemory(tmp_path / "vault")
     memory.write("notes/task", "Task matching details " + "🙂" * 100)
@@ -215,6 +439,63 @@ def test_context_builder_skips_large_optional_note_and_keeps_smaller_evidence(
     assert result["used_bytes"] <= result["budget_bytes"]
 
 
+@pytest.mark.parametrize(
+    ("max_bytes", "ref", "text", "raises"),
+    [
+        (650, "x" * 500, "small", True),
+        (1000, "optional", "x" * 2000, False),
+    ],
+)
+def test_context_builder_omits_optional_fragment_when_envelope_or_content_exceeds(
+    tmp_path, monkeypatch, max_bytes, ref, text, raises
+):
+    builder = ContextBuilder(
+        ObsidianMemory(tmp_path / "vault"), None, max_bytes=max_bytes
+    )
+    ordered = builder._ordered_fragments
+
+    def with_optional(fragments, task):
+        return ordered(fragments, task) + [
+            {"kind": "vault", "ref": ref, "text": text, "required": False}
+        ]
+
+    monkeypatch.setattr(builder, "_ordered_fragments", with_optional)
+    if raises:
+        with pytest.raises(ValueError, match="required context evidence"):
+            builder.build_evidence(
+                SimpleNamespace(title="t", description="d"), "workspace"
+            )
+    else:
+        result = builder.build_evidence(
+            SimpleNamespace(title="t", description="d"), "workspace"
+        )
+        assert ref in result["omitted_sources"]
+
+
+def test_context_builder_rejects_required_fragment_content_over_budget(
+    tmp_path, monkeypatch
+):
+    builder = ContextBuilder(ObsidianMemory(tmp_path / "vault"), None, max_bytes=1000)
+    ordered = builder._ordered_fragments
+    monkeypatch.setattr(
+        builder,
+        "_ordered_fragments",
+        lambda fragments, task: (
+            ordered(fragments, task)
+            + [
+                {
+                    "kind": "task",
+                    "ref": "required-extra",
+                    "text": "x" * 2000,
+                    "required": True,
+                }
+            ]
+        ),
+    )
+    with pytest.raises(ValueError, match="required context exceeds"):
+        builder.build_evidence(SimpleNamespace(title="t", description="d"), "workspace")
+
+
 def test_context_builder_prioritizes_reviewed_sources_over_unreviewed():
     task = SimpleNamespace(title="task", description="")
     fragments = [
@@ -238,6 +519,128 @@ def test_context_builder_prioritizes_reviewed_sources_over_unreviewed():
     ]
     ordered = ContextBuilder._ordered_fragments(fragments, task)
     assert [item["ref"] for item in ordered] == ["required", "reviewed", "unreviewed"]
+
+
+@pytest.mark.parametrize(
+    ("fragment", "tier", "basis"),
+    [
+        (
+            {
+                "kind": "vault",
+                "review_state": "current",
+                "provenance": {"source_state": "current"},
+            },
+            "reviewed_source_hash_current",
+            ["review_current", "source_hash_current"],
+        ),
+        (
+            {
+                "kind": "vault",
+                "review_state": "unreviewed",
+                "provenance": {"source_state": "current"},
+            },
+            "source_hash_current_unreviewed",
+            ["review_not_current", "source_hash_current"],
+        ),
+        (
+            {
+                "kind": "vault",
+                "review_state": "current",
+                "provenance": {"source_state": "unverified"},
+            },
+            "reviewed_source_unverified",
+            ["review_current", "source_hash_not_current"],
+        ),
+        (
+            {"kind": "vault", "provenance": None},
+            "vault_unreviewed_unverified",
+            ["review_not_current", "source_hash_not_current"],
+        ),
+        (
+            {"kind": "decision_memory", "text": "Memory decisions: approved"},
+            "curated_decision_memory",
+            ["curated_decision_memory"],
+        ),
+        (
+            {"kind": "decision_memory", "text": "Memory: none"},
+            "empty_memory_context",
+            ["no_decision_content"],
+        ),
+        (
+            {
+                "kind": "repository_symbol",
+                "provenance": {"sha256": "a" * 64},
+            },
+            "static_symbol_hash_identified",
+            ["static_symbol", "source_hash_present", "not_semantically_reviewed"],
+        ),
+        (
+            {"kind": "repository_symbol", "provenance": {"sha256": "invalid"}},
+            "static_symbol_hash_missing",
+            ["static_symbol", "source_hash_missing", "not_semantically_reviewed"],
+        ),
+        (
+            {"kind": "repository"},
+            "repository_file_unreviewed",
+            ["repository_file", "not_semantically_reviewed"],
+        ),
+        (
+            {"kind": "qdrant"},
+            "retrieval_without_current_source_proof",
+            ["retrieval_only", "current_source_not_verified_here"],
+        ),
+        (
+            {"kind": "qdrant_status"},
+            "availability_notice",
+            ["status_only"],
+        ),
+        (
+            {"kind": "other"},
+            "unknown_origin",
+            ["origin_not_classified"],
+        ),
+    ],
+)
+def test_context_trust_assessment_is_explicit_and_not_a_confidence_probability(
+    fragment, tier, basis
+):
+    result = ContextBuilder._trust_assessment(fragment)
+
+    assert result["tier"] == tier
+    assert result["basis"] == basis
+    assert isinstance(result["priority"], int)
+
+
+def test_context_envelope_explains_trust_tier_used_for_selection():
+    fragments = ContextBuilder._ordered_fragments(
+        [
+            {
+                "kind": "vault",
+                "ref": "vault:weak",
+                "text": "task evidence",
+                "required": False,
+                "review_state": "unreviewed",
+                "provenance": {"source_state": "unverified"},
+            },
+            {
+                "kind": "vault",
+                "ref": "vault:strong",
+                "text": "task evidence",
+                "required": False,
+                "review_state": "current",
+                "provenance": {"source_state": "current"},
+            },
+        ],
+        SimpleNamespace(title="task", description=""),
+    )
+    assert [item["ref"] for item in fragments] == ["vault:strong", "vault:weak"]
+    assert fragments[0]["trust"] == {
+        "tier": "reviewed_source_hash_current",
+        "basis": ["review_current", "source_hash_current"],
+    }
+    envelope = context_evidence_envelope({"fragments": fragments})
+    assert envelope["fragments"][0]["trust"] == fragments[0]["trust"]
+    assert "priority" not in envelope["fragments"][0]["trust"]
 
 
 def test_memory_search_accepts_only_current_vault_backed_hits(tmp_path):
@@ -290,6 +693,94 @@ def test_context_builder_bounds_structured_claim_payloads(tmp_path):
     )
     assert result["claims"] == {}
     assert result["claim_issues"]["goal"] == ["claim exceeds the evidence size limit"]
+
+
+def test_context_builder_bounds_claim_count_bytes_and_json(tmp_path, monkeypatch):
+    builder = ContextBuilder(ObsidianMemory(tmp_path / "vault"), None)
+    required = {
+        "kind": "task",
+        "ref": "context:task/title",
+        "text": "task",
+        "required": True,
+        "claims": {},
+    }
+
+    def render(fragments):
+        monkeypatch.setattr(
+            builder, "_ordered_fragments", lambda _items, _task: [required, *fragments]
+        )
+        return builder.build_evidence(
+            SimpleNamespace(title="task", description=""), "workspace"
+        )
+
+    count_limited = render(
+        [
+            {
+                "kind": "vault",
+                "ref": f"context:vault/note-{index}.md",
+                "text": "evidence",
+                "required": False,
+                "claims": {"goal": f"value-{index}"},
+            }
+            for index in range(33)
+        ]
+    )
+    assert count_limited["claim_issues"]["goal"] == [
+        "context claim count exceeds the evidence limit"
+    ]
+
+    byte_limited = render(
+        [
+            {
+                "kind": "vault",
+                "ref": f"context:vault/total-{index}.md",
+                "text": "evidence",
+                "required": False,
+                "claims": {name: value},
+            }
+            for index, (name, value) in enumerate(
+                (
+                    ("goal", "x" * 3000),
+                    ("requirements", "y" * 3000),
+                    ("acceptance_criteria", "z" * 3000),
+                )
+            )
+        ]
+    )
+    assert byte_limited["claim_issues"]["acceptance_criteria"] == [
+        "total context claim payload exceeds the evidence limit"
+    ]
+
+    invalid = render(
+        [
+            {
+                "kind": "vault",
+                "ref": "context:vault/invalid.md",
+                "text": "evidence",
+                "required": False,
+                "claims": {"goal": float("nan"), "custom": "ignored"},
+            },
+            {
+                "kind": "vault",
+                "ref": "context:vault/oversized.md",
+                "text": "evidence",
+                "required": False,
+                "claims": {"requirements": "x" * 5000},
+            },
+            {
+                "kind": "vault",
+                "ref": "context:vault/non-dict-claims.md",
+                "text": "evidence",
+                "required": False,
+                "claims": [],
+            },
+        ]
+    )
+    assert invalid["claim_issues"]["goal"] == ["claim is not valid JSON"]
+    assert invalid["claim_issues"]["requirements"] == [
+        "claim exceeds the evidence size limit"
+    ]
+    assert "custom" not in invalid["claim_issues"]
 
 
 def test_qdrant_http_operations(monkeypatch):

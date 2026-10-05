@@ -60,6 +60,19 @@ class ModelTestResponse(BaseModel):
     model: str
     status: Literal["successful", "failed"]
     error_type: str | None = None
+    error_category: (
+        Literal[
+            "cancellation",
+            "execution",
+            "permission",
+            "persistence",
+            "provider",
+            "timeout",
+            "transport",
+            "validation",
+        ]
+        | None
+    ) = None
 
 
 class TaskKnowledgeResponse(BaseModel):
@@ -350,20 +363,20 @@ def configuration_status():
 
 @router.get("/metrics")
 def metrics():
-    return orchestrator.observability.metrics()
+    return orchestrator.observability_operations.metrics()
 
 
 @router.get("/metrics/prometheus", response_class=PlainTextResponse)
 def prometheus_metrics():
     return PlainTextResponse(
-        orchestrator.observability.prometheus(),
+        orchestrator.observability_operations.prometheus(),
         media_type="text/plain; version=0.0.4; charset=utf-8",
     )
 
 
 @router.get("/event-kinds")
 def event_kinds():
-    return {"event_kinds": list(orchestrator.observability.event_kinds)}
+    return {"event_kinds": orchestrator.observability_operations.event_kinds()}
 
 
 @router.get("/models/status")

@@ -317,6 +317,47 @@ def test_registry_confines_process_tools_to_workspace(tmp_path, monkeypatch):
         registry.execute("shell.execute", {"command": ["pwd"], "cwd": "file.txt"})
 
 
+def test_executor_step_scope_blocks_outside_files_and_unscoped_tools(tmp_path):
+    config = Config()
+    config.data["tools"] = {"permissions": {"filesystem": "write", "docker": "write"}}
+    registry = ToolRegistry(Permissions(config), workspace=tmp_path)
+    with registry.step_writes(["allowed.txt"]):
+        registry.execute("filesystem.write", {"path": "allowed.txt", "content": "ok"})
+        with pytest.raises(PermissionError, match="executor step scope"):
+            registry.execute(
+                "filesystem.write", {"path": "outside.txt", "content": "bad"}
+            )
+        with pytest.raises(PermissionError, match="unscoped mutation"):
+            registry.execute("docker.execute", {"action": "status"})
+    assert (tmp_path / "allowed.txt").read_text() == "ok"
+    assert not (tmp_path / "outside.txt").exists()
+    assert registry.step_paths.get() is None
+
+
+def test_executor_step_scope_rejects_escape_and_scopes_shell_profile(
+    tmp_path, monkeypatch
+):
+    config = Config()
+    config.data["tools"] = {"permissions": {"shell": "write"}}
+    registry = ToolRegistry(Permissions(config), workspace=tmp_path)
+    with (
+        pytest.raises(PermissionError, match="escapes workspace"),
+        registry.step_writes(["../outside"]),
+    ):
+        pass
+    profiles = []
+
+    def fake_shell(_command, _cwd=None, **kwargs):
+        profiles.append(kwargs["access_profile"])
+        return subprocess.CompletedProcess(["true"], 0, "", "")
+
+    monkeypatch.setattr(registry.executor, "shell", fake_shell)
+    with registry.step_writes(["allowed.txt"]):
+        registry.execute("shell.execute", {"command": ["/usr/bin/true"]})
+    assert profiles[0].workspace_writable is False
+    assert profiles[0].write_paths == (tmp_path / "allowed.txt",)
+
+
 @pytest.mark.parametrize(
     "tool,args",
     [
@@ -460,3 +501,35 @@ def test_shell_wrappers_and_registry_without_sink(monkeypatch, tmp_path):
     )
     with pytest.raises(RuntimeError):
         registry.execute("no-sink-error", {})
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout", "stderr", "message"),
+    [
+        (71, "", "sandbox_apply: Operation not permitted", "host sandbox blocked"),
+        (1, "", "bad ref", "source verification failed"),
+        (0, "not-a-commit", "", "source branch is unavailable"),
+    ],
+)
+def test_git_push_target_reports_source_verification_failures(
+    monkeypatch, tmp_path, returncode, stdout, stderr, message
+):
+    config = Config()
+    config.data["tools"] = {
+        "permissions": {"git": "write"},
+        "mcp": {"servers": {}},
+    }
+    registry = ToolRegistry(Permissions(config), workspace=tmp_path)
+    monkeypatch.setattr("harness.tools.isolated_command", lambda *_a, **_k: ["git"])
+    monkeypatch.setattr(
+        "harness.tools.run_cancellable",
+        lambda command, *args, **kwargs: subprocess.CompletedProcess(
+            command, returncode, stdout, stderr
+        ),
+    )
+    with pytest.raises(PermissionError, match=message):
+        registry.git_target(
+            1,
+            ["push", "origin", "main:refs/heads/main"],
+            tmp_path,
+        )

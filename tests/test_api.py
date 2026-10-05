@@ -163,7 +163,17 @@ def test_api_model_test_uses_shared_redacted_service_contract(client):
         "model": "local",
         "status": "failed",
         "error_type": "RuntimeError",
+        "error_category": "execution",
     }
+
+    from harness.providers import ProviderError
+
+    orchestrator.models.resolve = lambda _name: (_ for _ in ()).throw(
+        ProviderError("private provider response")
+    )
+    categorized = http.post("/api/models/test", json={"model": "local"})
+    assert categorized.json()["error_category"] == "provider"
+    assert "private provider response" not in categorized.text
     assert http.post("/api/models/test", json={"model": ""}).status_code == 422
 
 

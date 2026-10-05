@@ -20,6 +20,7 @@ class TokenEstimate:
     estimated_tokens: int
     method: str
     safety_margin_percent: int
+    calibration_multiplier: float = 1.0
 
 
 class TokenCounterRegistry:
@@ -68,6 +69,7 @@ class TokenCounterRegistry:
         *,
         framing_tokens=0,
         safety_margin_percent=0,
+        calibration_multiplier=1.0,
     ):
         if not isinstance(model, str) or not model:
             raise TokenBudgetError("a resolved model ID is required for token counting")
@@ -91,6 +93,13 @@ class TokenCounterRegistry:
             or not 0 <= safety_margin_percent <= 100
         ):
             raise ValueError("token estimate safety margin must be between 0 and 100")
+        if (
+            isinstance(calibration_multiplier, bool)
+            or not isinstance(calibration_multiplier, (int, float))
+            or not math.isfinite(calibration_multiplier)
+            or not 1 <= calibration_multiplier <= 2
+        ):
+            raise ValueError("token calibration multiplier must be between 1 and 2")
         payload = {
             "model": model,
             "messages": messages,
@@ -111,7 +120,16 @@ class TokenCounterRegistry:
             method = "characters_per_token"
         raw_tokens = count + framing_tokens
         estimated_tokens = math.ceil(raw_tokens * (100 + margin) / 100)
-        return TokenEstimate(raw_tokens, estimated_tokens, method, margin)
+        estimated_tokens = math.ceil(estimated_tokens * calibration_multiplier)
+        return TokenEstimate(
+            raw_tokens, estimated_tokens, method, margin, calibration_multiplier
+        )
+
+    def calibration_key(self, model):
+        estimator = self._estimators.get(model)
+        if estimator is None:
+            return None
+        return f"characters_per_token:{estimator[0]:.12g}"
 
     def count(self, model, messages, tools=None, *, framing_tokens=0):
         return self.estimate(
@@ -128,6 +146,7 @@ def enforce_token_budget(
     *,
     framing_tokens=0,
     safety_margin_percent=0,
+    calibration_multiplier=1.0,
 ):
     if isinstance(budget, bool) or not isinstance(budget, int) or budget < 1:
         raise ValueError("token budget must be a positive integer")
@@ -137,6 +156,7 @@ def enforce_token_budget(
         tools,
         framing_tokens=framing_tokens,
         safety_margin_percent=safety_margin_percent,
+        calibration_multiplier=calibration_multiplier,
     )
     if estimate.estimated_tokens > budget:
         raise TokenBudgetError(

@@ -39,7 +39,15 @@ profiles:
     instructions: Independently inspect observed artifacts, tests and requirements; fail closed on missing evidence.
     tools: [mcp.vault.read_note, mcp.vault.list_notes, mcp.vault.search_notes, mcp.vault.knowledge_note, mcp.vault.backlinks, mcp.vault.knowledge_search]
     permissions: [obsidian]
-api: {host: 127.0.0.1, port: 8080, swagger: true}
+api:
+  host: 127.0.0.1
+  port: 8080
+  swagger: true
+  metrics_listener:
+    enabled: true
+    host: 0.0.0.0
+    port: 9091
+    bearer_file: /Users/christophhuschenhofer/services/prometheus-harness/harness-metrics-token
 logging: {level: INFO, file: ./logs/harness.log}
 tools:
   permissions: {filesystem: write, shell: write, git: read, docker: denied, filesystem.delete: denied, obsidian: read}

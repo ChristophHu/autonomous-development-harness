@@ -319,6 +319,242 @@ def test_runtime_resource_metrics_normalize_rss_and_database_size(
     }
 
 
+def test_host_metrics_include_bounded_cpu_memory_and_workspace_disk(
+    tmp_path, monkeypatch
+):
+    from types import SimpleNamespace
+
+    import harness.observability as module
+
+    values = {
+        "SC_PAGE_SIZE": 4096,
+        "SC_PHYS_PAGES": 100,
+        "SC_AVPHYS_PAGES": 25,
+    }
+    monkeypatch.setattr(module, "_host_cpu_ticks", lambda: (20, 10, 50, 0))
+    monkeypatch.setattr(module.os, "getloadavg", lambda: (1.25, 1.0, 0.5))
+    monkeypatch.setattr(module.os, "cpu_count", lambda: 8)
+    monkeypatch.setattr(module.os, "sysconf", lambda name: values[name])
+    monkeypatch.setattr(
+        module.shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(total=1000, free=250),
+    )
+    service = ObservabilityService(SimpleNamespace(path=tmp_path / "db.sqlite"), ())
+    assert service.host_metrics() == {
+        "cpu_count": 8,
+        "cpu_utilization_percent": None,
+        "load1": 1.25,
+        "memory_total_bytes": 409600,
+        "memory_available_bytes": 102400,
+        "workspace_disk_total_bytes": 1000,
+        "workspace_disk_free_bytes": 250,
+    }
+
+
+def test_host_metrics_report_unknown_when_platform_probes_are_unavailable(
+    tmp_path, monkeypatch
+):
+    from types import SimpleNamespace
+
+    import harness.observability as module
+
+    def unavailable(*_args):
+        raise OSError("host details must not be exposed")
+
+    monkeypatch.setattr(module.os, "getloadavg", unavailable)
+    monkeypatch.setattr(module, "_host_cpu_ticks", lambda: None)
+    monkeypatch.setattr(module.os, "cpu_count", lambda: None)
+    monkeypatch.setattr(module.os, "sysconf", unavailable)
+    monkeypatch.setattr(module.shutil, "disk_usage", unavailable)
+    service = ObservabilityService(SimpleNamespace(path=tmp_path / "db.sqlite"), ())
+    assert service.host_metrics() == {
+        "cpu_count": None,
+        "cpu_utilization_percent": None,
+        "load1": None,
+        "memory_total_bytes": None,
+        "memory_available_bytes": None,
+        "workspace_disk_total_bytes": None,
+        "workspace_disk_free_bytes": None,
+    }
+
+
+def test_host_metrics_reject_negative_memory_counts(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    import harness.observability as module
+
+    monkeypatch.setattr(module.os, "getloadavg", lambda: [0.0])
+    monkeypatch.setattr(module.os, "cpu_count", lambda: 1)
+    monkeypatch.setattr(
+        module.os,
+        "sysconf",
+        lambda name: {"SC_PAGE_SIZE": 4096, "SC_PHYS_PAGES": -1, "SC_AVPHYS_PAGES": -1}[
+            name
+        ],
+    )
+    monkeypatch.setattr(
+        module.shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(total=10, free=5),
+    )
+    service = ObservabilityService(SimpleNamespace(path=tmp_path / "db.sqlite"), ())
+    result = service.host_metrics()
+    assert result["memory_total_bytes"] is None
+    assert result["memory_available_bytes"] is None
+
+
+def test_host_metrics_keep_total_ram_when_available_pages_are_unsupported(
+    tmp_path, monkeypatch
+):
+    from types import SimpleNamespace
+
+    import harness.observability as module
+
+    values = {"SC_PAGE_SIZE": 16384, "SC_PHYS_PAGES": 3145728}
+
+    def sysconf(name):
+        if name == "SC_AVPHYS_PAGES":
+            raise ValueError("unsupported on this OS")
+        return values[name]
+
+    monkeypatch.setattr(module.os, "getloadavg", lambda: (0.5, 0.4, 0.3))
+    monkeypatch.setattr(module.os, "cpu_count", lambda: 12)
+    monkeypatch.setattr(module.os, "sysconf", sysconf)
+    monkeypatch.setattr(
+        module.shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(total=100, free=50),
+    )
+    service = ObservabilityService(SimpleNamespace(path=tmp_path / "db.sqlite"), ())
+    result = service.host_metrics()
+    assert result["memory_total_bytes"] == 3145728 * 16384
+    assert result["memory_available_bytes"] is None
+
+
+def test_prometheus_includes_host_gauges_without_machine_identifiers(tmp_path):
+    from harness.core import Config, Store
+    from harness.domain import EventKind
+
+    config = Config(tmp_path / "host-metrics.yaml")
+    config.data["paths"]["database"] = str(tmp_path / "host-metrics.sqlite")
+    store = Store(config)
+    exported = ObservabilityService(store.database, EventKind).prometheus()
+    assert "# TYPE harness_host_cpu_count gauge" in exported
+    assert "# TYPE harness_host_cpu_utilization_percent gauge" in exported
+    assert "harness_host_load1 " in exported
+    assert "harness_host_memory_total_bytes " in exported
+    assert "harness_workspace_disk_free_bytes " in exported
+    assert str(tmp_path) not in exported
+
+
+def test_cpu_utilization_requires_two_valid_monotonic_samples():
+    from harness.observability import _cpu_utilization_percent
+
+    assert _cpu_utilization_percent(None, (1, 2, 3, 4)) is None
+    assert _cpu_utilization_percent((1, 2), (1, 2, 3, 4)) is None
+    assert _cpu_utilization_percent((1, 2, 3, 4), None) is None
+    assert _cpu_utilization_percent((2, 3, 4, 5), (1, 3, 4, 5)) is None
+    assert _cpu_utilization_percent((1, 2, 3, 4), (1, 2, 3, 4)) is None
+    assert _cpu_utilization_percent((0, 0, 0, 0), (30, 10, 60, 0)) == 40.0
+    assert _cpu_utilization_percent((0, 0, 0, 0), (200, 10, 0, 0)) == 100.0
+
+
+def test_linux_cpu_ticks_normalize_proc_stat_idle_and_iowait(monkeypatch):
+    import harness.observability as module
+
+    monkeypatch.setattr(module.sys, "platform", "linux")
+    monkeypatch.setattr(
+        module.Path,
+        "read_text",
+        lambda _path, encoding: "cpu 10 2 3 40 5 6 7 8\n",
+    )
+    assert module._host_cpu_ticks() == (10, 3, 45, 2)
+
+    monkeypatch.setattr(
+        module.Path, "read_text", lambda _path, encoding: "cpu 10 2 3 40\n"
+    )
+    assert module._host_cpu_ticks() == (10, 3, 40, 2)
+
+
+def test_cpu_tick_providers_reject_malformed_and_unavailable_samples(monkeypatch):
+    import harness.observability as module
+
+    monkeypatch.setattr(module.sys, "platform", "linux")
+    monkeypatch.setattr(module.Path, "read_text", lambda _path, encoding: "intr 10\n")
+    assert module._host_cpu_ticks() is None
+    monkeypatch.setattr(
+        module.Path, "read_text", lambda _path, encoding: "cpu 1 x 3 4\n"
+    )
+    assert module._host_cpu_ticks() is None
+
+    def denied(_path, encoding):
+        raise OSError("not available")
+
+    monkeypatch.setattr(module.Path, "read_text", denied)
+    assert module._host_cpu_ticks() is None
+
+
+def test_macos_cpu_ticks_reads_mach_sample_and_rejects_failed_calls(monkeypatch):
+    import harness.observability as module
+
+    class Function:
+        def __init__(self, callback):
+            self.callback = callback
+
+        def __call__(self, *args):
+            return self.callback(*args)
+
+    class Library:
+        mach_host_self = Function(lambda: 42)
+
+        def host_statistics_call(_port, _flavor, ticks, count):
+            tick_pointer = module.ctypes.cast(
+                ticks, module.ctypes.POINTER(module.ctypes.c_int)
+            )
+            for index, value in enumerate((11, 12, 13, 14)):
+                tick_pointer[index] = value
+            module.ctypes.cast(count, module.ctypes.POINTER(module.ctypes.c_uint))[
+                0
+            ] = 4
+            return 0
+
+        host_statistics = Function(host_statistics_call)
+
+    monkeypatch.setattr(module, "_MACH_HOST_PORT", None)
+    monkeypatch.setattr(module.ctypes, "CDLL", lambda _path: Library())
+    assert module._macos_cpu_ticks() == (11, 12, 13, 14)
+
+    Library.host_statistics = Function(lambda *_args: 5)
+    assert module._macos_cpu_ticks() is None
+
+    monkeypatch.setattr(
+        module.ctypes,
+        "CDLL",
+        lambda _path: (_ for _ in ()).throw(OSError("unavailable")),
+    )
+    assert module._macos_cpu_ticks() is None
+
+
+def test_cpu_sampler_returns_unknown_for_unsupported_platform(monkeypatch):
+    import harness.observability as module
+
+    monkeypatch.setattr(module.sys, "platform", "win32")
+    assert module._host_cpu_ticks() is None
+
+
+def test_observability_service_reports_delta_cpu_utilization(tmp_path, monkeypatch):
+    import harness.observability as module
+
+    samples = iter(((0, 0, 0, 0), (30, 10, 60, 0)))
+    monkeypatch.setattr(module, "_host_cpu_ticks", lambda: next(samples))
+    service = ObservabilityService(
+        type("Database", (), {"path": tmp_path / "db.sqlite"})(), ()
+    )
+    assert service.host_metrics()["cpu_utilization_percent"] is None
+    assert service.host_metrics()["cpu_utilization_percent"] == 40.0
+
+
 def test_runtime_metrics_fail_safe_for_missing_database_and_clock_regression(
     tmp_path, monkeypatch
 ):

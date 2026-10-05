@@ -41,6 +41,83 @@ def test_verification_evidence_service_audits_each_required_kind_independently(
     assert provider_audit["items"][0]["reason"] == "subject_mismatch"
 
 
+def test_mcp_status_service_shares_reports_and_snapshot_age_without_mutating_input():
+    from datetime import UTC, datetime
+
+    from harness.mcp_status import MCPStatusApplicationService
+
+    original = [{"name": "filesystem", "state": "available"}]
+    service = MCPStatusApplicationService(
+        lambda: original,
+        lambda: [
+            {
+                "server": "filesystem",
+                "observed_at": "2026-10-04T11:59:00+00:00",
+                "state": "available",
+                "error_type": None,
+            },
+            None,
+            {"server": 5},
+        ],
+        clock=lambda: datetime(2026, 10, 4, 12, 0, tzinfo=UTC),
+    )
+
+    result = service.status()
+
+    assert result[0]["last_probe"] == {
+        "observed_at": "2026-10-04T11:59:00+00:00",
+        "state": "available",
+        "error_type": None,
+        "age_seconds": 60,
+    }
+    assert "last_probe" not in original[0]
+
+
+def test_mcp_status_service_handles_missing_and_malformed_probe_times():
+    from harness.mcp_status import MCPStatusApplicationService
+
+    reports = [
+        {"name": "no-history", "state": "disabled"},
+        {"name": "bad-time", "state": "unavailable"},
+        {"name": "missing-time", "state": "unavailable"},
+    ]
+    service = MCPStatusApplicationService(
+        lambda: reports,
+        lambda: [
+            {"server": "bad-time", "observed_at": None, "state": "failed"},
+            {"server": "missing-time", "state": "failed"},
+        ],
+    )
+
+    result = service.status()
+
+    assert result[0]["last_probe"] is None
+    assert result[1]["last_probe"]["age_seconds"] is None
+    assert result[2]["last_probe"]["age_seconds"] is None
+
+
+def test_mcp_status_service_clamps_future_snapshot_age_and_accepts_explicit_reports():
+    from datetime import UTC, datetime
+
+    from harness.mcp_status import MCPStatusApplicationService
+
+    service = MCPStatusApplicationService(
+        lambda: (_ for _ in ()).throw(AssertionError("provider must not be called")),
+        lambda: [
+            {
+                "server": "stdio",
+                "observed_at": "2026-10-05T00:00:00",
+                "state": "available",
+            }
+        ],
+        clock=lambda: datetime(2026, 10, 4, tzinfo=UTC),
+    )
+
+    result = service.status([{"name": "stdio", "state": "available"}])
+
+    assert result[0]["last_probe"]["age_seconds"] == 0
+
+
 def test_task_service_shares_status_queries_and_sanitized_task_inspection(tmp_path):
     store, orchestrator, task = ready_runtime(tmp_path)
     created = store.create(task)
@@ -69,6 +146,23 @@ def test_task_service_routes_question_creation_and_unscoped_event_cursor(tmp_pat
     assert store.questions.get(question_id)["task_id"] == created.id
     store.event(created.id, "task.created", {})
     assert orchestrator.service.events_after(0) == store.events.after(0)
+
+
+def test_observability_application_service_shares_read_only_contract():
+    from types import SimpleNamespace
+
+    from harness.services import ObservabilityApplicationService
+
+    report = {"tasks": {"total": 3}}
+    provider = SimpleNamespace(
+        metrics=lambda: report,
+        prometheus=lambda: "harness_tasks_total 3\n",
+        event_kinds=("task.created", "task.completed"),
+    )
+    service = ObservabilityApplicationService(provider)
+    assert service.metrics() is report
+    assert service.prometheus() == "harness_tasks_total 3\n"
+    assert service.event_kinds() == ["task.created", "task.completed"]
 
 
 def test_model_operations_service_shares_health_and_inventory_contracts(tmp_path):
@@ -199,6 +293,7 @@ def test_model_inventory_can_run_without_persistence(tmp_path):
 def test_model_operations_test_returns_only_safe_success_or_failure():
     from types import SimpleNamespace
 
+    from harness.providers import ProviderError
     from harness.services import ModelOperationsService
 
     registry = SimpleNamespace(
@@ -214,7 +309,21 @@ def test_model_operations_test_returns_only_safe_success_or_failure():
         "model": "local",
         "status": "failed",
         "error_type": "RuntimeError",
+        "error_category": "execution",
     }
+
+    registry.resolve = lambda _name: (_ for _ in ()).throw(
+        ProviderError("secret provider response")
+    )
+    failure = service.test_model("local")
+    assert failure["error_category"] == "provider"
+    assert "secret provider response" not in str(failure)
+
+    registry.resolve = lambda _name: (_ for _ in ()).throw(KeyError("secret alias"))
+    failure = service.test_model("local")
+    assert failure["error_category"] == "execution"
+    assert failure["error_type"] == "KeyError"
+    assert "secret alias" not in str(failure)
 
 
 def test_task_knowledge_search_is_task_scoped_redacted_and_read_only(tmp_path):

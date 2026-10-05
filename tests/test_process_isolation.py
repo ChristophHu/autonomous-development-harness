@@ -63,6 +63,22 @@ def test_metadata_path_entries_follow_nested_symlink_targets(tmp_path):
     assert executable in entries
 
 
+def test_metadata_path_entries_rejects_relative_and_uninspectable_paths(
+    tmp_path, monkeypatch
+):
+    with pytest.raises(PermissionError, match="absolute"):
+        isolation._metadata_path_entries(Path("relative"))
+    candidate = tmp_path / "candidate"
+    candidate.touch()
+    monkeypatch.setattr(
+        Path,
+        "is_symlink",
+        lambda _path: (_ for _ in ()).throw(OSError("denied")),
+    )
+    with pytest.raises(PermissionError, match="cannot be inspected"):
+        isolation._metadata_path_entries(candidate)
+
+
 def test_python_profile_inspects_sqlite_extension_runtime_dependencies(
     tmp_path, monkeypatch
 ):
@@ -110,6 +126,79 @@ def test_homebrew_python_metadata_grants_match_loaded_runtime(tmp_path):
         assert f'(allow file-read-metadata (subpath "{directory}"))' in profile
     assert '(allow file-read-metadata (subpath "/opt/homebrew"))' not in profile
     assert '(allow file-read-metadata (subpath "/opt/homebrew/Cellar"))' not in profile
+
+
+def test_sqlite_extension_lookup_handles_other_interpreters_and_missing_extension(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(isolation.sysconfig, "get_config_var", lambda _key: None)
+    assert isolation._sqlite_extension_for_interpreter(sys.executable) is None
+    other = tmp_path / "other-python"
+    other.write_text("not a runtime")
+    assert isolation._sqlite_extension_for_interpreter(other) is None
+
+    monkeypatch.setattr(
+        isolation.sysconfig, "get_config_var", lambda _key: str(tmp_path)
+    )
+    assert isolation._sqlite_extension_for_interpreter(sys.executable) is None
+
+
+def test_sqlite_extension_lookup_handles_interpreter_resolution_errors(monkeypatch):
+    monkeypatch.setattr(
+        Path,
+        "resolve",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("unavailable")),
+    )
+    assert isolation._sqlite_extension_for_interpreter(sys.executable) is None
+
+
+def test_homebrew_cellar_path_without_formula_version_is_not_granted(monkeypatch):
+    monkeypatch.setattr(
+        Path,
+        "resolve",
+        lambda *_args, **_kwargs: Path("/opt/homebrew/Cellar/python"),
+    )
+    assert isolation._homebrew_cellar_version("python") is None
+
+
+def test_profile_handles_non_homebrew_python_and_sqlite_dependencies(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(isolation.sys, "platform", "darwin")
+    extension = tmp_path / "_sqlite3.cpython-test.so"
+    extension.touch()
+    monkeypatch.setattr(
+        isolation, "_sqlite_extension_for_interpreter", lambda _executable: extension
+    )
+    monkeypatch.setattr(isolation, "_homebrew_cellar_version", lambda _path: None)
+    monkeypatch.setattr(isolation, "_runtime_dylibs", lambda _paths: ())
+    command = isolated_command([sys.executable, "-c", "pass"], tmp_path)
+    assert (
+        '(allow file-read-metadata (subpath "/opt/homebrew/Cellar/python@'
+        not in command[2]
+    )
+
+
+def test_profile_rejects_executable_that_disappears_during_profile_build(
+    tmp_path, monkeypatch
+):
+    missing = tmp_path / "ephemeral-executable"
+    missing.write_text("trusted until profile mapping")
+    profile = ProcessAccessProfile.broker("test", executable_paths=(missing,))
+    original_resolve = Path.resolve
+    calls = 0
+
+    def disappearing(path, *args, **kwargs):
+        nonlocal calls
+        if path == missing:
+            calls += 1
+            if calls > 1:
+                raise OSError("disappeared")
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", disappearing)
+    with pytest.raises(PermissionError, match="process executable is unavailable"):
+        isolated_command([sys.executable], tmp_path, access_profile=profile)
 
 
 def test_profile_allows_executable_mapping_only_for_runtime_paths(tmp_path):
@@ -537,6 +626,68 @@ def test_mcp_stdio_profile_normalizes_read_roots(tmp_path):
     profile = ProcessAccessProfile.mcp_stdio(read_roots=(tmp_path,))
     assert profile.name == "mcp_stdio"
     assert profile.read_roots == (tmp_path,)
+
+
+def test_executor_shell_profile_allows_only_declared_workspace_file(tmp_path):
+    allowed = tmp_path / "allowed.txt"
+    forbidden = tmp_path / "forbidden.txt"
+    profile = ProcessAccessProfile.workspace(
+        workspace_writable=False, write_paths=(allowed,)
+    )
+    permitted = subprocess.run(
+        isolated_command(
+            [
+                sys.executable,
+                "-c",
+                "from pathlib import Path; Path('allowed.txt').write_text('ok')",
+            ],
+            tmp_path,
+            access_profile=profile,
+        ),
+        cwd=tmp_path,
+        capture_output=True,
+        check=False,
+    )
+    assert permitted.returncode == 0, permitted.stderr
+    denied = subprocess.run(
+        isolated_command(
+            [
+                sys.executable,
+                "-c",
+                "from pathlib import Path; Path('forbidden.txt').write_text('bad')",
+            ],
+            tmp_path,
+            access_profile=profile,
+        ),
+        cwd=tmp_path,
+        capture_output=True,
+        check=False,
+    )
+    assert denied.returncode != 0
+    assert allowed.read_text() == "ok"
+    assert not forbidden.exists()
+
+
+def test_executor_shell_profile_requires_absolute_declared_paths(tmp_path):
+    with pytest.raises(PermissionError, match="must be absolute"):
+        isolated_command(
+            [sys.executable],
+            tmp_path,
+            access_profile=ProcessAccessProfile.workspace(
+                workspace_writable=False, write_paths=(Path("relative.txt"),)
+            ),
+        )
+
+
+def test_executor_shell_profile_rejects_outside_write_path(tmp_path):
+    with pytest.raises(PermissionError, match="escapes workspace"):
+        isolated_command(
+            [sys.executable],
+            tmp_path,
+            access_profile=ProcessAccessProfile.workspace(
+                workspace_writable=False, write_paths=(tmp_path.parent,)
+            ),
+        )
 
 
 def test_absolute_executable_must_resolve(tmp_path):

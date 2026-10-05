@@ -52,6 +52,14 @@ def test_estimator_budget_uses_conservative_estimate_and_reports_method():
     assert enforce_token_budget(registry, "model-a", "abcd", expected) == expected
 
 
+@pytest.mark.parametrize("multiplier", [True, 0.99, 2.01, float("nan")])
+def test_registry_rejects_invalid_calibration_multiplier(multiplier):
+    registry = TokenCounterRegistry()
+    registry.register_estimator("model-a", characters_per_token=2)
+    with pytest.raises(ValueError, match="calibration multiplier"):
+        registry.estimate("model-a", "hello", calibration_multiplier=multiplier)
+
+
 def test_registry_rejects_invalid_estimator_settings():
     registry = TokenCounterRegistry()
     for model, ratio, margin in (

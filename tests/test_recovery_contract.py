@@ -50,7 +50,7 @@ def test_restart_from_recovering_does_not_repeat_recovery_transition(
     for status in ("analyzing", "planning", "ready", "executing", "recovering"):
         store.tasks.transition(task_id, status)
 
-    def fail_inspection(*_args):
+    def fail_inspection(*_args, **_kwargs):
         raise RuntimeError("recovery inspection unavailable")
 
     monkeypatch.setattr(ReconciliationService, "inspect", fail_inspection)
@@ -205,6 +205,19 @@ def test_recovery_plan_rejects_invalid_scope(tmp_path, problem):
         scope.validate_plan(rest_plan(targets, paths, tools), runtime.tools)
 
 
+def test_recovery_plan_rejects_symlinked_write_scope_outside_workspace(tmp_path):
+    runtime, task, report = assessed_runtime(tmp_path, "remaining")
+    scope = RecoveryScope.assess(task, report, runtime.router, runtime.validator)
+    (runtime.tools.workspace / "outside-link").symlink_to(
+        tmp_path.parent, target_is_directory=True
+    )
+    with pytest.raises(ValueError, match="recovery write path escapes workspace"):
+        scope.validate_plan(
+            rest_plan(scope.remaining_targets, ["outside-link/new.txt"], []),
+            runtime.tools,
+        )
+
+
 def test_recovery_valid_plan_preservation_and_runtime_write_guard(tmp_path):
     runtime, task, report = assessed_runtime(tmp_path, "remaining")
     scope = RecoveryScope.assess(task, report, runtime.router, runtime.validator)
@@ -288,8 +301,8 @@ def test_recovery_cannot_complete_after_confirmed_artifact_tampering(tmp_path, s
     else:
         original = runtime.validator.validate
 
-        def validate(*args):
-            result = original(*args)
+        def validate(*args, **kwargs):
+            result = original(*args, **kwargs)
             corrupt()
             return result
 

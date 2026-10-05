@@ -17,6 +17,8 @@ _SIGNALS = (
             "sandbox-exec",
             "host sandbox blocked",
             "sandbox operation not permitted",
+            "host_sandbox_blocked",
+            "sandbox_execution_denied",
         ),
     ),
     ("network", ("connection refused", "network is unreachable", "loopback", "socket")),
@@ -61,6 +63,15 @@ def _failure(case):
         trace_properties,
     )
     return " ".join(sections).strip()
+
+
+def _display_message(message):
+    """Remove raw task traces from persisted cluster excerpts."""
+    return re.sub(
+        r"(?m)HARNESS_GIT_WORKFLOW_TRACE=.*$",
+        "HARNESS_GIT_WORKFLOW_TRACE=[redacted]",
+        message,
+    )
 
 
 def _category(message):
@@ -155,6 +166,12 @@ def _workflow_signals(nodeid, message):
                     r"git:[a-z_]{1,40}", reason_category
                 ):
                     safe_state["reason_category"] = reason_category
+                failure_class = state.get("failure_class")
+                if failure_class in {
+                    "host_sandbox_blocked",
+                    "sandbox_execution_denied",
+                }:
+                    safe_state["failure_class"] = failure_class
                 safe_trace.append(
                     {
                         "event_id": event["event_id"],
@@ -204,7 +221,7 @@ def cluster_junit(junit_path):
         entry = {
             "nodeid": nodeid,
             "subsystem": _subsystem(nodeid),
-            "message": message[:2000],
+            "message": _display_message(message)[:2000],
             "signals": [
                 signal_category
                 for signal_category, signals in _SIGNALS
@@ -214,7 +231,10 @@ def cluster_junit(junit_path):
         }
         if category == "network":
             entry["network_subcategory"] = _network_subcategory(nodeid)
-        if category == "assertion":
+        if entry["subsystem"] in {
+            "git_workflow_resume",
+            "git_workflow_integration",
+        }:
             entry.update(_workflow_signals(nodeid, message))
         clusters[category].append(entry)
     network_breakdown = defaultdict(int)

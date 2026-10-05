@@ -73,6 +73,20 @@ def test_isolation_doctor_returns_failure_for_host_blocked_probe(monkeypatch):
     assert "blocked_by_host" in result.stdout
 
 
+def test_isolation_doctor_redacts_probe_start_error(monkeypatch):
+    from typer.testing import CliRunner
+
+    monkeypatch.setattr(
+        cli,
+        "probe_sandbox_capability",
+        lambda: (_ for _ in ()).throw(OSError("private path")),
+    )
+    result = CliRunner().invoke(cli.app, ["isolation", "doctor"])
+    assert result.exit_code == 2
+    assert "OSError" in result.stdout
+    assert "private path" not in result.stdout
+
+
 @pytest.fixture
 def harness_context(tmp_path, monkeypatch):
     cfg = Config()
@@ -423,6 +437,176 @@ def test_serve_api_stops_when_startup_times_out(monkeypatch):
     assert cli._serve_api("127.0.0.1", 8080, object(), timeout=0.001) is False
 
 
+@pytest.mark.parametrize("metrics_started", [True, False])
+def test_serve_api_starts_and_stops_isolated_metrics_listener(
+    monkeypatch, capsys, metrics_started
+):
+    servers = []
+
+    class FakeServer:
+        def __init__(self, config):
+            self.config = config
+            self.started = False
+            self.should_exit = False
+            servers.append(self)
+
+        async def startup(self, _sockets=None):
+            self.started = (
+                metrics_started if not isinstance(self.config.app, str) else True
+            )
+
+        def run(self):
+            cli.asyncio.run(self.startup())
+
+    class Lifecycle:
+        def wait_until_ready(self, *_args):
+            return True
+
+    listener = SimpleNamespace(enabled=True, host="0.0.0.0", port=9091)
+    monkeypatch.setattr(cli.uvicorn, "Server", FakeServer)
+    monkeypatch.setattr(
+        cli.uvicorn,
+        "Config",
+        lambda app, **kwargs: SimpleNamespace(app=app, **kwargs),
+    )
+
+    result = cli._serve_api(
+        "127.0.0.1",
+        8080,
+        Lifecycle(),
+        timeout=0.1,
+        metrics_listener=listener,
+        metrics_token="s" * 32,
+        metrics_provider=lambda: "metrics",
+    )
+
+    assert result is metrics_started
+    assert len(servers) == (2 if metrics_started else 1)
+    if metrics_started:
+        assert servers[0].config.host == "0.0.0.0"
+        assert servers[0].config.port == 9091
+        assert servers[0].should_exit is True
+    assert ("Harness ready" in capsys.readouterr().out) is metrics_started
+
+
+def test_serve_api_fails_closed_when_metrics_auth_is_missing():
+    assert (
+        cli._serve_api(
+            "127.0.0.1",
+            8080,
+            object(),
+            metrics_listener=SimpleNamespace(enabled=True),
+            metrics_token=None,
+            metrics_provider=lambda: "metrics",
+        )
+        is False
+    )
+
+
+def test_start_metrics_listener_fails_closed_without_private_token_file(
+    harness_context, monkeypatch, capsys
+):
+    config, store, orchestrator, _root = harness_context
+    config.data["api"]["metrics_listener"] = {
+        "enabled": True,
+        "host": "0.0.0.0",
+        "port": 9091,
+        "bearer_file": "/private/tmp/missing-metrics-token",
+    }
+    monkeypatch.setattr(cli, "build", lambda: (config, store, orchestrator))
+    monkeypatch.setattr(
+        cli,
+        "_start_preflight",
+        lambda *_args: [
+            {"name": "Configuration", "status": "available", "critical": True}
+        ],
+    )
+    monkeypatch.setattr(
+        cli, "_lifecycle", lambda: (_ for _ in ()).throw(AssertionError("not ready"))
+    )
+
+    with pytest.raises(cli.typer.Exit):
+        cli.start()
+    assert "token file is unavailable" in capsys.readouterr().out
+
+
+def test_start_passes_verified_metrics_listener_token_without_logging_it(
+    harness_context, monkeypatch, tmp_path, capsys
+):
+    config, store, orchestrator, _root = harness_context
+    token = "t" * 64
+    token_file = tmp_path / "metrics-token"
+    token_file.write_text(token)
+    token_file.chmod(0o600)
+    config.data["api"]["metrics_listener"] = {
+        "enabled": True,
+        "host": "0.0.0.0",
+        "port": 9091,
+        "bearer_file": str(token_file),
+    }
+    monkeypatch.setattr(cli, "build", lambda: (config, store, orchestrator))
+    monkeypatch.setattr(
+        cli,
+        "_start_preflight",
+        lambda *_args: [
+            {"name": "Configuration", "status": "available", "critical": True}
+        ],
+    )
+
+    class Lifecycle:
+        def register_current(self, *_args):
+            return "pid-record"
+
+        def remove_record(self, record):
+            assert record == "pid-record"
+
+    calls = []
+    monkeypatch.setattr(cli, "_lifecycle", Lifecycle)
+    monkeypatch.setattr(
+        cli,
+        "_serve_api",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or True,
+    )
+
+    cli.start()
+
+    kwargs = calls[0][1]
+    assert kwargs["metrics_token"] == token
+    assert kwargs["metrics_listener"].host == "0.0.0.0"
+    assert (
+        kwargs["metrics_provider"] == orchestrator.observability_operations.prometheus
+    )
+    assert token not in capsys.readouterr().out
+
+
+def test_serve_api_ignores_explicitly_disabled_metrics_listener(monkeypatch):
+    class FakeServer:
+        def __init__(self, _config):
+            self.started = False
+            self.should_exit = False
+
+        async def startup(self, _sockets=None):
+            self.started = True
+
+        def run(self):
+            cli.asyncio.run(self.startup())
+
+    class Lifecycle:
+        @staticmethod
+        def wait_until_ready(*_args):
+            return True
+
+    monkeypatch.setattr(cli.uvicorn, "Server", FakeServer)
+    monkeypatch.setattr(cli.uvicorn, "Config", lambda *_args, **_kwargs: object())
+    assert cli._serve_api(
+        "127.0.0.1",
+        8080,
+        Lifecycle(),
+        timeout=0.1,
+        metrics_listener=SimpleNamespace(enabled=False),
+    )
+
+
 def test_health_helpers_are_fail_safe_and_sqlite_check_is_read_only(
     harness_context, monkeypatch
 ):
@@ -531,6 +715,39 @@ def test_artifact_cli_lists_latest_and_history(harness_context, monkeypatch):
     )
     assert history.exit_code == 0
     assert [row["version"] for row in json.loads(history.stdout)] == [1, 2]
+
+
+def test_artifact_cli_routes_reads_through_task_application_service(
+    monkeypatch,
+):
+    from types import SimpleNamespace
+
+    from typer.testing import CliRunner
+
+    calls = []
+
+    class Service:
+        def artifacts(self, task_id):
+            calls.append(("artifacts", task_id))
+            return [{"key": "shared", "version": 3}]
+
+        def artifact_history(self, task_id, key):
+            calls.append(("history", task_id, key))
+            return [{"key": key, "version": 1}]
+
+    monkeypatch.setattr(
+        cli, "build", lambda: (None, object(), SimpleNamespace(service=Service()))
+    )
+    runner = CliRunner()
+    latest = runner.invoke(cli.app, ["artifacts", "list", "--task-id", "7"])
+    history = runner.invoke(
+        cli.app,
+        ["artifacts", "history", "--task-id", "7", "--key", "shared"],
+    )
+    assert latest.exit_code == history.exit_code == 0
+    assert json.loads(latest.stdout) == [{"key": "shared", "version": 3}]
+    assert json.loads(history.stdout) == [{"key": "shared", "version": 1}]
+    assert calls == [("artifacts", 7), ("history", 7, "shared")]
 
 
 @pytest.mark.parametrize(
@@ -688,6 +905,118 @@ def test_mcp_status_is_read_only_and_doctor_reports_server_failures(
     assert status_after_probe.exit_code == 0
     assert '"last_probe"' in status_after_probe.stdout
     assert '"error_type": "OSError"' in status_after_probe.stdout
+
+
+@pytest.mark.parametrize(
+    ("observed_at", "age"),
+    [("not-a-date", None), ("2026-10-04T10:00:00", 0)],
+)
+def test_mcp_status_handles_invalid_and_naive_snapshot_timestamps(
+    harness_context, monkeypatch, observed_at, age
+):
+    from typer.testing import CliRunner
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            value = cls(2026, 10, 4, 10, 0, tzinfo=UTC)
+            return value if tz is None else value.astimezone(tz)
+
+    monkeypatch.setattr("harness.mcp_status.datetime", FixedDateTime)
+    cfg, _, _, _ = harness_context
+    cfg.data["tools"]["mcp"] = {
+        "servers": {
+            "filesystem": {
+                "enabled": False,
+                "builtin": "filesystem",
+                "read_only": True,
+                "allow_delete": False,
+            }
+        }
+    }
+    monkeypatch.setattr(cli, "Config", lambda: cfg)
+
+    class Manager:
+        def __init__(self, _config):
+            pass
+
+        def report(self):
+            return [{"name": "filesystem", "state": "disabled"}]
+
+    monkeypatch.setattr("harness.mcp_manager.MCPServerManager", Manager)
+    monkeypatch.setattr(
+        cli.OperationalSnapshotRepository,
+        "read_latest_mcp_statuses",
+        lambda _path: [
+            {
+                "server": "filesystem",
+                "observed_at": observed_at,
+                "state": "available",
+                "error_type": None,
+            }
+        ],
+    )
+    result = CliRunner().invoke(cli.app, ["mcp", "status"])
+    assert result.exit_code == 0
+    assert json.loads(result.stdout)[0]["last_probe"]["age_seconds"] == age
+
+
+def test_mcp_doctor_redacts_initialization_errors(harness_context, monkeypatch):
+    from typer.testing import CliRunner
+
+    cfg, _, _, _ = harness_context
+    monkeypatch.setattr(cli, "Config", lambda: cfg)
+    monkeypatch.setattr(
+        "harness.tools.ToolRegistry",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("private configuration")),
+    )
+    result = CliRunner().invoke(cli.app, ["mcp", "doctor"])
+    assert result.exit_code == 2
+    assert "RuntimeError" in result.stdout
+    assert "private configuration" not in result.stdout
+
+
+@pytest.mark.parametrize(("state", "exit_code"), [("available", 0), ("unavailable", 1)])
+def test_mcp_doctor_returns_status_exit_for_server_state(
+    harness_context, monkeypatch, state, exit_code
+):
+    from typer.testing import CliRunner
+
+    cfg, _, _, _ = harness_context
+    monkeypatch.setattr(cli, "Config", lambda: cfg)
+
+    class Registry:
+        def __init__(self, _permissions):
+            pass
+
+        def mcp_status(self, *, probe):
+            assert probe is True
+            return [{"name": "server", "state": state}]
+
+    monkeypatch.setattr("harness.tools.ToolRegistry", Registry)
+    result = CliRunner().invoke(cli.app, ["mcp", "doctor"])
+    assert result.exit_code == exit_code
+    report = json.loads(result.stdout)[0]
+    assert report["name"] == "server"
+    assert report["state"] == state
+    assert report["last_probe"]["state"] == state
+
+
+def test_sqlite_health_exits_nonzero_when_database_is_unavailable(
+    harness_context, monkeypatch
+):
+    from typer.testing import CliRunner
+
+    cfg, _, _, _ = harness_context
+    monkeypatch.setattr(cli, "Config", lambda: cfg)
+    monkeypatch.setattr(
+        cli,
+        "inspect_sqlite",
+        lambda _path: {"status": "unavailable", "reason": "database_missing"},
+    )
+    result = CliRunner().invoke(cli.app, ["sqlite-health"])
+    assert result.exit_code == 1
+    assert json.loads(result.stdout)["status"] == "unavailable"
 
 
 def test_verify_clusters_command_emits_failure_groups(tmp_path):
@@ -1034,7 +1363,7 @@ def test_model_test_runs_configured_model_and_fails_closed(harness_context, caps
     assert "coding-model" in capsys.readouterr().out
     with pytest.raises(cli.typer.Exit):
         cli.model_test("not-configured")
-    assert "Model test failed (ValueError)" in capsys.readouterr().out
+    assert "Model test failed (validation/ValueError)" in capsys.readouterr().out
 
 
 def test_model_discovery_failure_is_reported_without_aborting(harness_context, capsys):
@@ -2349,6 +2678,128 @@ def test_knowledge_proposal_cli_rejects_invalid_source_and_records_rejection(
     assert json.loads(rejected.output)["status"] == "rejected"
 
 
+def test_knowledge_proposals_reports_unavailable_store(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+
+    config = SimpleNamespace(path=lambda _name: tmp_path / "vault")
+    monkeypatch.setattr(cli, "Config", lambda: config)
+    monkeypatch.setattr(
+        "harness.vault_steward.VaultKnowledgeSteward",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("private path")),
+    )
+    result = CliRunner().invoke(cli.app, ["memory", "knowledge-proposals"])
+    assert result.exit_code == 2
+    assert "OSError" in result.stdout
+    assert "private path" not in result.stdout
+
+
+def test_knowledge_review_reads_and_decodes_persisted_decisions(
+    harness_context, monkeypatch
+):
+    from typer.testing import CliRunner
+
+    from harness import vault_audit, vault_steward
+
+    cfg, store, _, root = harness_context
+    task = store.create(Task(title="decision for vault review"))
+    store.decisions.record(
+        task.id,
+        "requirement_resolution",
+        "human",
+        "Chosen project goal",
+        "The approved source is authoritative.",
+        [{"source": "task", "ref": f"task:{task.id}"}],
+        ["goal"],
+        None,
+        alternatives=[{"value": "alternative"}],
+        tags=["architecture"],
+    )
+    monkeypatch.setattr(cli, "Config", lambda: cfg)
+    monkeypatch.setattr(cli, "ROOT", root)
+    monkeypatch.setattr(
+        vault_audit,
+        "audit_vault",
+        lambda *_args, decision_rows, **_kwargs: {
+            "healthy": True,
+            "findings": [],
+            "audited_notes": len(decision_rows),
+        },
+    )
+
+    class Steward:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def pending(self):
+            return []
+
+    monkeypatch.setattr(vault_steward, "VaultKnowledgeSteward", Steward)
+    result = CliRunner().invoke(cli.app, ["memory", "knowledge-review"])
+    assert result.exit_code == 0, result.stdout
+    assert json.loads(result.stdout)["curated_notes"] == 1
+
+
+def test_knowledge_review_redacts_invalid_persisted_decision_json(
+    harness_context, monkeypatch
+):
+    from typer.testing import CliRunner
+
+    from harness import vault_audit
+
+    cfg, _, _, _ = harness_context
+    with Database(cfg.path("database")).connect() as connection:
+        connection.execute(
+            "INSERT INTO decisions(task_id,decision,rationale,created_at,category,source,evidence,field_names,alternatives,outcome,tags) "
+            "VALUES(NULL,'invalid','invalid','now','test','test','{','[]','[]',NULL,'[]')"
+        )
+    monkeypatch.setattr(cli, "Config", lambda: cfg)
+    monkeypatch.setattr(
+        vault_audit,
+        "audit_vault",
+        lambda *_args, **_kwargs: pytest.fail("invalid row must fail before audit"),
+    )
+    result = CliRunner().invoke(cli.app, ["memory", "knowledge-review"])
+    assert result.exit_code == 2
+    assert "JSONDecodeError" in result.stdout
+
+
+@pytest.mark.parametrize("operation", ["approve", "reject"])
+def test_knowledge_mutations_report_stale_proposal_errors(
+    tmp_path, monkeypatch, operation
+):
+    from typer.testing import CliRunner
+
+    config = SimpleNamespace(path=lambda _name: tmp_path / "vault")
+    monkeypatch.setattr(cli, "Config", lambda: config)
+    monkeypatch.setattr(
+        "harness.vault_steward.VaultKnowledgeSteward",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            **{operation: lambda *_a, **_k: (_ for _ in ()).throw(ValueError("stale"))}
+        ),
+    )
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "memory",
+            f"knowledge-{operation}",
+            "a" * 24,
+            "--sha256",
+            "b" * 64,
+            "--confirm",
+        ],
+    )
+    assert result.exit_code == 2
+    assert "ValueError" in result.stdout
+    assert "stale" not in result.stdout
+
+
+def test_knowledge_reject_requires_confirmation(capsys):
+    with pytest.raises(cli.typer.Exit) as exc:
+        cli.memory_knowledge_reject("a" * 24, sha256="b" * 64, confirm=False)
+    assert exc.value.exit_code == 2
+    assert "No action taken" in capsys.readouterr().out
+
+
 @pytest.mark.parametrize(
     ("proposal_state", "expected_exit", "expected_ready"),
     [("current", 0, True), ("stale_or_unavailable", 1, False)],
@@ -2530,6 +2981,48 @@ def test_qdrant_reconcile_reports_only_error_type(harness_context, monkeypatch, 
     )
     with pytest.raises(cli.typer.Exit):
         cli.qdrant_reconcile(confirm=True)
+    output = capsys.readouterr().out
+    assert "RuntimeError" in output
+    assert "secret-bearing detail" not in output
+
+
+def test_qdrant_reconcile_plan_is_read_only_and_redacts_errors(
+    harness_context, monkeypatch, capsys
+):
+    cfg, _store, orchestrator, _root = harness_context
+    cfg.data["memory"]["qdrant"]["enabled"] = False
+    with pytest.raises(cli.typer.Exit) as result:
+        cli.qdrant_reconcile_plan()
+    assert result.value.exit_code == 1
+    capsys.readouterr()
+    cfg.data["memory"]["qdrant"]["enabled"] = True
+    monkeypatch.setattr(
+        orchestrator.memory_service,
+        "plan_reconciliation",
+        lambda: {
+            "notes": 2,
+            "chunks": 3,
+            "needs_index": ["a"],
+            "orphan_sources": ["b"],
+            "orphan_points": {"b": ["internal-id"]},
+        },
+    )
+    monkeypatch.setattr(
+        orchestrator.memory_service,
+        "reconcile",
+        lambda: pytest.fail("preview must not apply"),
+    )
+    cli.qdrant_reconcile_plan()
+    output = capsys.readouterr().out
+    assert json.loads(output)["orphan_points"] == 1
+    assert "internal-id" not in output
+    monkeypatch.setattr(
+        orchestrator.memory_service,
+        "plan_reconciliation",
+        lambda: (_ for _ in ()).throw(RuntimeError("secret-bearing detail")),
+    )
+    with pytest.raises(cli.typer.Exit):
+        cli.qdrant_reconcile_plan()
     output = capsys.readouterr().out
     assert "RuntimeError" in output
     assert "secret-bearing detail" not in output
@@ -2901,6 +3394,60 @@ def test_metrics_command_prints_prometheus_or_rejects_unknown_format(
         cli.runtime_metrics(format="xml")
     assert error.value.exit_code == 2
     assert "json or 'prometheus'" in capsys.readouterr().out
+
+
+def test_prometheus_live_check_returns_nonzero_for_unreachable_service(monkeypatch):
+    from typer.testing import CliRunner
+
+    monkeypatch.setattr(
+        cli,
+        "check_prometheus_integration",
+        lambda *_args: {
+            "status": "unreachable",
+            "findings": ["PROM_ACCEPTANCE_UNREACHABLE"],
+        },
+    )
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "observability",
+            "check-prometheus",
+            "--prometheus-url",
+            "http://127.0.0.1:9090",
+            "--harness-metrics-url",
+            "http://127.0.0.1:9091/metrics/prometheus",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert json.loads(result.stdout) == {
+        "status": "unreachable",
+        "findings": ["PROM_ACCEPTANCE_UNREACHABLE"],
+    }
+
+
+def test_prometheus_live_check_returns_success_for_healthy_service(monkeypatch):
+    from typer.testing import CliRunner
+
+    monkeypatch.setattr(
+        cli,
+        "check_prometheus_integration",
+        lambda *_args: {"status": "passed", "findings": []},
+    )
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "observability",
+            "check-prometheus",
+            "--prometheus-url",
+            "http://127.0.0.1:9090",
+            "--harness-metrics-url",
+            "http://127.0.0.1:9091/metrics/prometheus",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert json.loads(result.stdout) == {"status": "passed", "findings": []}
 
 
 def test_completion_command_reports_gap_count_and_returns_incomplete(

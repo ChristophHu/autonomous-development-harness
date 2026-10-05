@@ -2,6 +2,7 @@
 
 import hashlib
 import re
+import uuid
 
 from .memory import EMBEDDING_BATCH_SIZE_DEFAULT, EMBEDDING_BATCH_SIZE_MAX
 
@@ -91,13 +92,27 @@ class MemoryService:
                 for point_id, text, payload in batch:
                     self.vectors.upsert(point_id, text, payload)
         indexed = self._source_points(name)
-        keep = {
-            point.get("id")
-            for point in indexed
-            if self._owned_point(point)
-            and point.get("payload", {}).get("source_hash") == source_hash
-            and point.get("payload", {}).get("chunk") in range(len(chunks))
-        }
+        keep = set()
+        for index, text in enumerate(chunks):
+            candidates = [
+                point.get("id")
+                for point in indexed
+                if self._owned_point(point)
+                and point.get("payload", {}).get("source_hash") == source_hash
+                and point.get("payload", {}).get("chunk") == index
+                and point.get("payload", {}).get("text") == text
+                and point.get("id") is not None
+            ]
+            raw_id = f"obsidian:{name}:{index}"
+            canonical_id = str(uuid.uuid5(uuid.NAMESPACE_URL, raw_id))
+            if candidates:
+                keep.add(
+                    raw_id
+                    if raw_id in candidates
+                    else canonical_id
+                    if canonical_id in candidates
+                    else min(candidates, key=str)
+                )
         stale = {
             point.get("id")
             for point in source_points + indexed
@@ -125,37 +140,82 @@ class MemoryService:
         return len(point_ids)
 
     def reconcile(self):
+        plan = self.plan_reconciliation()
+        for name in plan["needs_index"]:
+            self.index(name)
+        stale = plan["orphan_points"]
+        removed_points = 0
+        removed_sources = 0
+        for source, point_ids in stale.items():
+            # A note created after preview must never be removed from its index.
+            try:
+                current = self.notes.read(source)
+            except (PermissionError, ValueError):
+                continue
+            if current is not None:
+                continue
+            self.vectors.delete(point_ids)
+            removed_points += len(point_ids)
+            removed_sources += 1
+        return {
+            "notes": plan["notes"],
+            "chunks": plan["chunks"],
+            "removed_sources": removed_sources,
+            "removed_points": removed_points,
+        }
+
+    def plan_reconciliation(self):
+        """Read-only comparison of authoritative notes with Harness-owned points."""
         documents = self.notes.list_documents()
-        chunks = sum(self.index(name) for name in documents)
         present = set(documents)
         indexed = self.vectors.scroll_source()
+        by_source = {}
         stale = {}
         for point in indexed:
             payload = point.get("payload", {})
             if not isinstance(payload, dict):
                 continue
             source = payload.get("source")
-            if (
-                self._owned_point(point)
-                and isinstance(source, str)
-                and source not in present
-                and point.get("id") is not None
-            ):
+            if not self._owned_point(point) or not isinstance(source, str):
+                continue
+            if source in present:
+                by_source.setdefault(source, []).append(point)
+            elif point.get("id") is not None:
                 try:
                     self.notes.path(source)
                 except PermissionError:
                     continue
                 stale.setdefault(source, set()).add(point.get("id"))
-        removed_points = 0
-        for point_ids in stale.values():
-            ids = sorted((item for item in point_ids if item is not None), key=str)
-            self.vectors.delete(ids)
-            removed_points += len(ids)
+        needs_index = []
+        total_chunks = 0
+        for name in documents:
+            content = self.notes.read(name)
+            if content is None:
+                continue
+            chunks = list(self.chunks(content))
+            total_chunks += len(chunks)
+            digest = self.digest(content)
+            actual = by_source.get(name, [])
+            expected = {(index, digest, text) for index, text in enumerate(chunks)}
+            observed = {
+                (
+                    point["payload"].get("chunk"),
+                    point["payload"].get("source_hash"),
+                    point["payload"].get("text"),
+                )
+                for point in actual
+            }
+            if len(actual) != len(expected) or observed != expected:
+                needs_index.append(name)
         return {
             "notes": len(documents),
-            "chunks": chunks,
-            "removed_sources": len(stale),
-            "removed_points": removed_points,
+            "chunks": total_chunks,
+            "needs_index": needs_index,
+            "orphan_sources": sorted(stale),
+            "orphan_points": {
+                source: sorted(point_ids, key=str)
+                for source, point_ids in stale.items()
+            },
         }
 
     def search(self, query, limit=5):

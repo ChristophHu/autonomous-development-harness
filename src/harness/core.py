@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
 import logging
@@ -20,6 +21,7 @@ import yaml
 from pydantic import BaseModel, ValidationError
 
 from .agents import (
+    CorrectionFinding,
     Executor,
     ModelRegistry,
     ModelRouter,
@@ -63,6 +65,87 @@ from .workflows import GitWorkflow
 ROOT = Path(__file__).resolve().parents[2]
 LOGGER = logging.getLogger("harness")
 
+
+def corrections_for_step(step, findings):
+    """Route scoped validator findings only to the plan steps they affect."""
+    step_paths = {
+        path.replace("\\", "/").strip("/").casefold()
+        for path in step.write_paths
+        if isinstance(path, str) and path
+    }
+    selected = []
+    for finding in findings:
+        subtask_id = finding.get("subtask_id")
+        affected = {
+            path.replace("\\", "/").strip("/").casefold()
+            for path in finding.get("affected_paths", [])
+            if isinstance(path, str) and path
+        }
+        if not subtask_id and not affected:
+            selected.append(finding)
+            continue
+        matches_step = subtask_id == step.id
+        matches_path = any(
+            left == right
+            or left.startswith(right + "/")
+            or right.startswith(left + "/")
+            for left in step_paths
+            for right in affected
+        )
+        if matches_step or matches_path:
+            selected.append(finding)
+    return selected
+
+
+def reusable_correction_outputs(steps, outputs, findings, *, workspace_unchanged):
+    """Reuse only successful, disjoint steps from the immediately prior pass.
+
+    A restart, plan replacement, global finding, or changed workspace supplies no
+    trustworthy prior evidence and therefore forces the ordinary full rerun.
+    """
+    if not workspace_unchanged or not outputs or not findings:
+        return {}
+    if any(
+        not finding.get("subtask_id") and not finding.get("affected_paths")
+        for finding in findings
+    ):
+        return {}
+    if any(
+        not any(corrections_for_step(step, [finding]) for step in steps)
+        for finding in findings
+    ):
+        return {}
+    previous = {output.subtask_id: output for output in outputs}
+    rerun = {
+        step.id
+        for step in steps
+        if not step.write_paths
+        or step.id not in previous
+        or not previous[step.id].success
+        or corrections_for_step(step, findings)
+    }
+    # Changes to a dependency invalidate the step even if the finding names
+    # only its parent. This closure also handles transitive dependencies.
+    for step in steps:
+        if set(step.dependencies) & rerun:
+            rerun.add(step.id)
+    return {step.id: previous[step.id] for step in steps if step.id not in rerun}
+
+
+def workspace_fingerprint(snapshot):
+    """Bind a validation to the exact observed workspace and Git identity."""
+    if not isinstance(snapshot, dict):
+        raise TypeError("workspace snapshot is invalid")
+    encoded = json.dumps(
+        snapshot,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
 CONFIG_DEFAULTS = {
     "harness": {"name": "autonomous-development-harness", "environment": "development"},
     "paths": {
@@ -96,7 +179,17 @@ CONFIG_DEFAULTS = {
         "rates": {},
     },
     "profiles": {},
-    "api": {"host": "127.0.0.1", "port": 8080, "swagger": True},
+    "api": {
+        "host": "127.0.0.1",
+        "port": 8080,
+        "swagger": True,
+        "metrics_listener": {
+            "enabled": False,
+            "host": "127.0.0.1",
+            "port": 9091,
+            "bearer_file": None,
+        },
+    },
     "logging": {"level": "INFO", "file": "./logs/harness.log"},
     "tools": {"permissions": {}},
     "secrets": {},
@@ -761,6 +854,19 @@ class Store:
             self.audit.sanitize(payload),
         )
 
+    def save_execution_plan(self, task, plan):
+        safe_plan = self.audit.sanitize(plan.model_dump(mode="json"))
+        metadata = self.audit.sanitize(
+            task.model_dump(mode="json") | {"plan": plan.model_dump(mode="json")}
+        )
+        return self.plans.save_execution_plan(
+            task.id,
+            self.audit.sanitize(plan.summary),
+            safe_plan,
+            plan.subtasks,
+            metadata,
+        )
+
     def save_subtasks(self, task_id, subtasks, plan_id=None):
         from .agents import Subtask
 
@@ -775,6 +881,19 @@ class Store:
             json.dumps(self.audit.sanitize(output)) if output is not None else None
         )
         return self.subtasks.update(task_id, external_id, status, safe_output, plan_id)
+
+    def persist_step_result(self, task_id, step, output, plan_id):
+        safe_output = self.audit.sanitize(output.model_dump(mode="json"))
+        status = "completed" if output.success else "failed"
+        return self.subtasks.persist_result(
+            task_id,
+            step.id,
+            plan_id,
+            status,
+            json.dumps(safe_output, ensure_ascii=False, allow_nan=False),
+            self.audit.sanitize(f"agent/{step.id}"),
+            json.dumps(safe_output, ensure_ascii=False, allow_nan=False),
+        )
 
     def record_validation(self, task_id, valid, report):
         return self.validations.record(task_id, valid, self.audit.sanitize(report))
@@ -901,8 +1020,12 @@ class Orchestrator:
         self.store = store
         self.config = config or store.config
         from .observability import ObservabilityService
+        from .services import ObservabilityApplicationService
 
         self.observability = ObservabilityService(store.database, EventKind)
+        self.observability_operations = ObservabilityApplicationService(
+            self.observability
+        )
         self.role_profiles = ProfileRegistry(self.config)
         self.role_profiles.role_profiles()
         self.planner_profile = self.role_profiles.for_role("planner").name
@@ -1000,6 +1123,83 @@ class Orchestrator:
     def _record_model_usage(self, usage):
         self.store.model_runs.record(usage)
 
+    def _check_correction_time_budget(self, task_id, *, now=None):
+        """Keep correction wall time bounded across retries and process restarts."""
+        events = self.store.events.list(
+            task_id, event_type=EventKind.CORRECTION_STARTED.value
+        )
+        if not events:
+            return
+        started = datetime.fromisoformat(events[0]["created_at"])
+        current = now or datetime.now(UTC)
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=UTC)
+        elapsed = max(0.0, (current - started).total_seconds())
+        settings = self.config.data.get("harness", {})
+        payload = json.loads(events[0]["payload"])
+        limits = payload.get("budget_limits") if isinstance(payload, dict) else None
+        if limits is not None:
+            if not isinstance(limits, dict):
+                raise RuntimeError("correction budget snapshot is invalid")
+            limit = limits.get("elapsed_seconds")
+            token_limit = limits.get("input_estimate_limit", limits.get("input_tokens"))
+            if (
+                isinstance(limit, bool)
+                or not isinstance(limit, int)
+                or limit < 1
+                or (
+                    token_limit is not None
+                    and (
+                        isinstance(token_limit, bool)
+                        or not isinstance(token_limit, int)
+                        or token_limit < 1
+                    )
+                )
+            ):
+                raise RuntimeError("correction budget snapshot is invalid")
+        else:
+            # Legacy correction events predate immutable budget snapshots.
+            limit = settings.get("max_correction_elapsed_seconds", 1800)
+            token_limit = settings.get("max_correction_input_tokens")
+        if elapsed >= limit:
+            self.store.event(
+                task_id,
+                EventKind.CORRECTION_BUDGET_EXHAUSTED,
+                {"budget": "elapsed_seconds", "limit": limit},
+            )
+            raise RuntimeError("correction loop elapsed-time budget exhausted")
+        if token_limit is None:
+            return
+        with self.store.database.connect() as connection:
+            usage = connection.execute(
+                "SELECT COUNT(*) AS runs, SUM(calibration_raw_tokens) AS estimated, "
+                "SUM(CASE WHEN status='running' OR calibration_raw_tokens IS NULL "
+                "THEN 1 ELSE 0 END) AS missing "
+                "FROM model_runs WHERE task_id=? AND created_at>=? "
+                "AND status IN ('running','completed','failed')",
+                (task_id, events[0]["created_at"]),
+            ).fetchone()
+        if usage["missing"]:
+            self.store.event(
+                task_id,
+                EventKind.CORRECTION_BUDGET_EXHAUSTED,
+                {"budget": "input_tokens", "reason": "estimate_unavailable"},
+            )
+            raise RuntimeError("correction loop input-token usage is unverifiable")
+        estimated = usage["estimated"] or 0
+        if estimated >= token_limit:
+            self.store.event(
+                task_id,
+                EventKind.CORRECTION_BUDGET_EXHAUSTED,
+                {
+                    "budget": "input_tokens",
+                    "basis": "calibrated_input_estimate",
+                    "estimated": estimated,
+                    "limit": token_limit,
+                },
+            )
+            raise RuntimeError("correction loop input-token budget exhausted")
+
     def _execute_step(self, task, step, context, recovery_scope):
         repair = task.git_state.get("repair", {})
         repair_paths = (
@@ -1012,7 +1212,7 @@ class Orchestrator:
             if recovery_scope or repair_paths is not None
             else nullcontext()
         )
-        with guard:
+        with self.tools.step_writes(step.write_paths), guard:
             execute = self.executor.execute
             parameters = inspect.signature(execute).parameters.values()
             accepts_complexity = any(
@@ -1058,6 +1258,19 @@ class Orchestrator:
                 self.store.corrections.set_status(item["id"], "open")
             reconciliation = None
             recovery_scope = None
+            latest_plan = self.store.latest_plan(task_id)
+            plan_contract = self.store.plans.inspect_latest_contract(task_id)
+            plan_contract_current = latest_plan is None or plan_contract["current"]
+            if latest_plan is not None and not plan_contract_current:
+                self.store.event(
+                    task_id,
+                    EventKind.PLAN_CONTRACT_STALE,
+                    {
+                        "plan_id": plan_contract["plan_id"],
+                        "stored_sha256": plan_contract["stored_sha256"],
+                        "current_sha256": plan_contract["current_sha256"],
+                    },
+                )
             interrupted = task.status not in {
                 Status.PENDING,
                 Status.FAILED,
@@ -1083,6 +1296,7 @@ class Orchestrator:
                         self.store, self.tools, self.validator
                     ).inspect,
                     task,
+                    previous_plan_current=plan_contract_current,
                 )
                 self.store.event(
                     task_id,
@@ -1213,8 +1427,7 @@ class Orchestrator:
                 recovery_scope.verify_preserved()
             task.complexity = str(plan.complexity)
             safe_plan = self.store.audit.sanitize(plan.model_dump(mode="json"))
-            plan_id = self.store.save_plan(task_id, plan.summary, safe_plan)
-            self.store.save_subtasks(task_id, plan.subtasks, plan_id)
+            plan_id = self.store.save_execution_plan(task, plan)
             self.context.memory.write(
                 f"tasks/{task_id}/plan", json.dumps(safe_plan, indent=2)
             )
@@ -1230,20 +1443,22 @@ class Orchestrator:
                         EventKind.MEMORY_INDEX_FAILED,
                         {"error": type(exc).__name__},
                     )
-            self.store.update_task_fields(
-                task_id,
-                metadata=task.model_dump(mode="json")
-                | {"plan": plan.model_dump(mode="json")},
-            )
             transition(Status.READY)
             attempt = 0
+            workspace_baseline = None
+            prior_outputs = None
+            prior_workspace_after_tests = None
             while True:
+                self._check_correction_time_budget(task_id)
                 transition(Status.EXECUTING)
-                open_corrections = self.store.corrections.list_for_task(
-                    task_id, status="open"
+                self.store.corrections.start_open_for_task(
+                    task_id,
+                    int(
+                        self.config.data.get("harness", {}).get(
+                            "max_correction_attempts", 2
+                        )
+                    ),
                 )
-                for item in open_corrections:
-                    self.store.corrections.set_status(item["id"], "in_progress")
                 active_corrections = self.store.corrections.list_for_task(
                     task_id, status="in_progress"
                 )
@@ -1259,14 +1474,26 @@ class Orchestrator:
                     }
                     for item in active_corrections
                 ]
-                workspace_before = await asyncio.to_thread(
+                observed_workspace_before = await asyncio.to_thread(
                     self._invoke,
                     task,
                     "validator",
                     self.validator_profile,
                     self.validator.workspace_snapshot,
                 )
+                if workspace_baseline is None:
+                    workspace_baseline = observed_workspace_before
+                workspace_before = workspace_baseline
                 ordered_steps = plan.ordered_steps()
+                reusable = reusable_correction_outputs(
+                    ordered_steps,
+                    prior_outputs,
+                    correction_context,
+                    workspace_unchanged=(
+                        prior_workspace_after_tests is not None
+                        and observed_workspace_before == prior_workspace_after_tests
+                    ),
+                )
 
                 async def execute_step(step, corrections=correction_context):
                     self.store.subtasks.update(
@@ -1276,30 +1503,16 @@ class Orchestrator:
                         self._execute_step,
                         task,
                         step,
-                        context + "\\nCorrections: " + json.dumps(corrections),
+                        context
+                        + "\\nCorrections: "
+                        + json.dumps(corrections_for_step(step, corrections)),
                         recovery_scope,
                     )
 
                     return output
 
                 def persist_step(step, output):
-                    self.store.update_subtask(
-                        task_id,
-                        step.id,
-                        "completed" if output.success else "failed",
-                        output.model_dump(mode="json"),
-                        plan_id,
-                    )
-                    artifact_key = f"agent/{step.id}"
-                    prior_artifact = self.store.artifact(task_id, artifact_key)
-                    self.store.save_artifact(
-                        task_id,
-                        artifact_key,
-                        json.dumps(output.model_dump(mode="json"), ensure_ascii=False),
-                        expected_version=(
-                            prior_artifact["version"] if prior_artifact else 0
-                        ),
-                    )
+                    self.store.persist_step_result(task_id, step, output, plan_id)
 
                 outputs = await execute_plan_dag(
                     ordered_steps,
@@ -1308,6 +1521,7 @@ class Orchestrator:
                         "max_parallel_steps", 4
                     ),
                     on_complete=persist_step,
+                    prior_outputs=reusable,
                 )
                 workspace_after = await asyncio.to_thread(
                     self._invoke,
@@ -1325,6 +1539,13 @@ class Orchestrator:
                     self.validator.run_tests,
                     task,
                 )
+                workspace_after_tests = await asyncio.to_thread(
+                    self._invoke,
+                    task,
+                    "validator",
+                    self.validator_profile,
+                    self.validator.workspace_snapshot,
+                )
                 self.store.event(task_id, EventKind.TESTS_COMPLETED, tests)
                 if recovery_scope is not None:
                     recovery_scope.verify_preserved()
@@ -1341,11 +1562,47 @@ class Orchestrator:
                     self.store.questions.has_open_required(task_id),
                     workspace_before,
                     workspace_after,
+                    workspace_after_tests=workspace_after_tests,
                 )
-                self.store.record_validation(
+                after_review = await asyncio.to_thread(
+                    self._invoke,
+                    task,
+                    "validator",
+                    self.validator_profile,
+                    self.validator.workspace_snapshot,
+                )
+                if after_review != workspace_after_tests:
+                    message = "workspace changed during independent validation"
+                    validation = validation.model_copy(
+                        update={
+                            "valid": False,
+                            "errors": [*validation.errors, message],
+                            "findings": [
+                                *validation.findings,
+                                CorrectionFinding(
+                                    category="workspace",
+                                    source="workspace_validator",
+                                    rule="validation.workspace_changed",
+                                    message=message,
+                                ),
+                            ],
+                        }
+                    )
+                # Recheck after each correction pass so an over-budget pass
+                # cannot complete merely because it was the final retry.
+                self._check_correction_time_budget(task_id)
+                completion_evidence = {
+                    "plan_id": plan_id,
+                    "task_contract_sha256": PlanRepository.contract_digest(
+                        task.model_dump(mode="json")
+                    ),
+                    "workspace_sha256": workspace_fingerprint(after_review),
+                }
+                validation_id = self.store.record_validation(
                     task_id,
                     validation.valid,
-                    validation.model_dump(mode="json"),
+                    validation.model_dump(mode="json")
+                    | {"completion_evidence": completion_evidence},
                 )
                 self.store.update_task_fields(
                     task_id,
@@ -1376,6 +1633,8 @@ class Orchestrator:
                     ]
                 for finding in validation_findings:
                     self.store.record_correction(task_id, finding, plan_id)
+                prior_outputs = outputs
+                prior_workspace_after_tests = workspace_after_tests
                 if validation.valid:
                     for item in self.store.corrections.list_for_task(
                         task_id, status="in_progress"
@@ -1386,6 +1645,7 @@ class Orchestrator:
                     if self.git_enabled:
 
                         def validate_merged_target(branch, step_outputs=outputs):
+                            nonlocal validation_id, completion_evidence
                             target_tests = self._invoke(
                                 task,
                                 "target-tester",
@@ -1417,10 +1677,28 @@ class Orchestrator:
                                 target_workspace,
                                 False,
                             )
-                            self.store.record_validation(
+                            target_after_review = self._invoke(
+                                task,
+                                "target-validator",
+                                self.validator_profile,
+                                self.validator.workspace_snapshot,
+                            )
+                            if target_after_review != target_workspace:
+                                return False
+                            completion_evidence = {
+                                "plan_id": plan_id,
+                                "task_contract_sha256": PlanRepository.contract_digest(
+                                    task.model_dump(mode="json")
+                                ),
+                                "workspace_sha256": workspace_fingerprint(
+                                    target_after_review
+                                ),
+                            }
+                            validation_id = self.store.record_validation(
                                 task_id,
                                 target_validation.valid,
-                                target_validation.model_dump(mode="json"),
+                                target_validation.model_dump(mode="json")
+                                | {"completion_evidence": completion_evidence},
                             )
                             current = self.store.get(task_id)
                             self.store.update_task_fields(
@@ -1460,13 +1738,30 @@ class Orchestrator:
                         )
                         if not merged:
                             return self.store.get(task_id)
-                    transition(Status.COMPLETED)
-                    self.store.update_task_fields(
+                    else:
+                        current_workspace = await asyncio.to_thread(
+                            self._invoke,
+                            task,
+                            "validator",
+                            self.validator_profile,
+                            self.validator.workspace_snapshot,
+                        )
+                        if (
+                            workspace_fingerprint(current_workspace)
+                            != (completion_evidence["workspace_sha256"])
+                        ):
+                            raise RuntimeError(
+                                "workspace changed after independent validation"
+                            )
+                    self.store.tasks.complete(
                         task_id,
-                        result="Tests, coverage and independent acceptance validation passed.",
-                    )
-                    self.store.event(
-                        task_id, EventKind.TASK_COMPLETED, {"attempt": attempt}
+                        "Tests, coverage and independent acceptance validation passed.",
+                        attempt,
+                        owner,
+                        evidence={
+                            "validation_id": validation_id,
+                            "workspace_sha256": completion_evidence["workspace_sha256"],
+                        },
                     )
                     return self.store.get(task_id)
                 for item in self.store.corrections.list_for_task(
@@ -1485,7 +1780,18 @@ class Orchestrator:
                 self.store.event(
                     task_id,
                     EventKind.CORRECTION_STARTED,
-                    {"attempt": attempt, "findings": findings},
+                    {
+                        "attempt": attempt,
+                        "findings": findings,
+                        "budget_limits": {
+                            "elapsed_seconds": self.config.data.get("harness", {}).get(
+                                "max_correction_elapsed_seconds", 1800
+                            ),
+                            "input_estimate_limit": self.config.data.get(
+                                "harness", {}
+                            ).get("max_correction_input_tokens"),
+                        },
+                    },
                 )
         except ApprovalRequired:
             # ApprovalService.ask atomically persisted the exact action and

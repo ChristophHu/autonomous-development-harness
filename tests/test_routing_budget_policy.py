@@ -87,6 +87,16 @@ def test_token_budget_rejects_unreported_usage_without_fallback(tmp_path):
     assert first.calls == 1 and second.calls == 0
 
 
+def test_audit_calibration_report_reads_only_matching_numeric_samples(tmp_path):
+    config = router_config()
+    config.data["paths"]["database"] = str(tmp_path / "calibration.sqlite")
+    audit = AuditRecorder(Store(config).database)
+
+    report = audit.model_token_calibration("model", "characters_per_token:20")
+
+    assert report == {"sample_count": 0, "calibrated": False, "multiplier": 1.0}
+
+
 def test_task_budget_rejects_legacy_response_without_usage(tmp_path):
     config = router_config()
     config.data["paths"]["database"] = str(tmp_path / "legacy.sqlite")

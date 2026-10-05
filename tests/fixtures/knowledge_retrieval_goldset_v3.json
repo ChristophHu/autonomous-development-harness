@@ -1,0 +1,10 @@
+{
+  "version": 3,
+  "cases": [
+    {"id": "vault-source", "expected_refs": ["context:vault/knowledge/qdrant-current.md", "context:vault/knowledge/task-context.md#task-context"], "expected_rejections": [], "expected_conflicts": []},
+    {"id": "current-qdrant-source", "expected_refs": ["context:vault/knowledge/qdrant-current.md", "context:vault/knowledge/task-context.md#task-context", "context:qdrant/vector-current"], "expected_rejections": [], "expected_conflicts": []},
+    {"id": "stale-qdrant-source", "expected_refs": ["context:vault/knowledge/qdrant-current.md", "context:vault/knowledge/task-context.md#task-context"], "expected_rejections": [{"ref": "context:qdrant/vector-stale", "status": "source_hash_stale"}], "expected_conflicts": []},
+    {"id": "no-match-query", "expected_refs": [], "expected_rejections": [], "expected_conflicts": []},
+    {"id": "deleted-qdrant-source", "expected_refs": ["context:vault/knowledge/qdrant-current.md", "context:vault/knowledge/task-context.md#task-context"], "expected_rejections": [{"ref": "context:qdrant/vector-deleted", "status": "source_unavailable"}], "expected_conflicts": []}
+  ]
+}

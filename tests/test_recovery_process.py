@@ -142,6 +142,12 @@ def test_harness_crash_lease_expiry_restart_remaining_work_and_completion(tmp_pa
     assert all(result["returncode"] == 0 for result in reconciliation["git"].values())
     assert "addition.py" in reconciliation["git"]["status"]["stdout"]
     assert store.events.list(task.id, "task.completed")
+    assert len(store.events.list(task.id, "task.completed")) == 1
+    assert store.events.list(task.id, "plan.contract_stale") == []
+    assert len(store.artifacts.history(task.id, "agent/addition")) == 1
+    assert len(store.artifacts.history(task.id, "agent/remaining")) == 1
+    artifact_events = store.events.list(task.id, "artifact.recorded")
+    assert len(artifact_events) == 2
     tests = store.get(task.id).test_result
     assert all(result["returncode"] == 0 for result in tests["commands"])
     assert tests["coverage"]["totals"]["percent_covered"] == 100

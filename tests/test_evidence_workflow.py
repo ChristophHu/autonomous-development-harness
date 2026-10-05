@@ -102,22 +102,34 @@ def runtime(tmp_path):
                 )
             payload = json.loads(prompt.split("\n", 1)[1])
             available = payload["available_evidence_ids"]
-            reference = available[0] if available else None
             requirements = payload["task"]["requirements"]
             criteria = [item["id"] for item in payload["task"]["acceptance_criteria"]]
+            plan = payload["task"].get("plan") or {}
+            steps = plan.get("subtasks", [])
+
+            def references(key, requirement):
+                field = "requirement_ids" if requirement else "acceptance_criteria"
+                matching = [
+                    f"plan-step:{step['id']}"
+                    for step in steps
+                    if key in step.get(field, [])
+                ]
+                observed = next(
+                    (item for item in available if not item.startswith("plan-step:")),
+                    None,
+                )
+                return [*matching[:1], *([observed] if observed else [])]
+
             return json.dumps(
                 {
                     "requirements": dict.fromkeys(requirements, True),
                     "criteria": dict.fromkeys(criteria, True),
                     "evidence": "Observed real subprocess tests and source artifacts.",
                     "requirement_evidence": {
-                        name: [reference] if reference else [] for name in requirements
+                        name: references(name, True) for name in requirements
                     },
                     "criterion_evidence": {
-                        name: [f"criterion:{name}"]
-                        if f"criterion:{name}" in available
-                        else ([reference] if reference else [])
-                        for name in criteria
+                        name: references(name, False) for name in criteria
                     },
                 }
             )
@@ -258,7 +270,7 @@ def test_persisted_correction_is_retried_and_resolved_without_subprocesses(tmp_p
         def run_tests(self, _task):
             return {"commands": [], "coverage": {"totals": {}}}
 
-        def validate(self, *_args):
+        def validate(self, *_args, **_kwargs):
             self.calls += 1
             if self.calls == 1:
                 return ValidatorOutput(
@@ -309,7 +321,7 @@ def test_unresolved_correction_stays_open_when_retry_budget_exhausts(tmp_path):
         def run_tests(self, _task):
             return {"commands": [], "coverage": {"totals": {}}}
 
-        def validate(self, *_args):
+        def validate(self, *_args, **_kwargs):
             return ValidatorOutput(
                 valid=False,
                 errors=["acceptance criterion failed: sum"],
@@ -350,7 +362,7 @@ def test_interrupted_in_progress_correction_is_reopened_on_restart(tmp_path):
         def run_tests(self, _task):
             return {"commands": [], "coverage": {"totals": {}}}
 
-        def validate(self, *_args):
+        def validate(self, *_args, **_kwargs):
             return ValidatorOutput(valid=True)
 
     orchestrator.validator = ValidatorFixture()
@@ -515,22 +527,34 @@ def test_real_executor_tool_loop_corrects_a_real_test_failure(tmp_path):
             assert '"artifacts"' in prompt
             payload = json.loads(prompt.split("\n", 1)[1])
             available = payload["available_evidence_ids"]
-            reference = available[0] if available else None
             requirements = payload["task"]["requirements"]
             criteria = [item["id"] for item in payload["task"]["acceptance_criteria"]]
+            plan = payload["task"].get("plan") or {}
+            steps = plan.get("subtasks", [])
+
+            def references(key, requirement):
+                field = "requirement_ids" if requirement else "acceptance_criteria"
+                matching = [
+                    f"plan-step:{step['id']}"
+                    for step in steps
+                    if key in step.get(field, [])
+                ]
+                observed = next(
+                    (item for item in available if not item.startswith("plan-step:")),
+                    None,
+                )
+                return [*matching[:1], *([observed] if observed else [])]
+
             return json.dumps(
                 {
                     "requirements": dict.fromkeys(requirements, True),
                     "criteria": dict.fromkeys(criteria, True),
                     "evidence": "Reviewed observed source artifacts and test reports",
                     "requirement_evidence": {
-                        name: [reference] if reference else [] for name in requirements
+                        name: references(name, True) for name in requirements
                     },
                     "criterion_evidence": {
-                        name: [f"criterion:{name}"]
-                        if f"criterion:{name}" in available
-                        else ([reference] if reference else [])
-                        for name in criteria
+                        name: references(name, False) for name in criteria
                     },
                 }
             )
@@ -548,6 +572,116 @@ def test_real_executor_tool_loop_corrects_a_real_test_failure(tmp_path):
     assert sum(event["tool"] == "test.run_tests" for event in completed_tools) == 2
     assert sum(event["tool"] == "test.run_coverage" for event in completed_tools) == 2
     assert len(store.events.list(result.id, "correction.started")) == 1
+
+
+def test_test_side_effect_blocks_task_completion_even_when_tests_pass(tmp_path):
+    store, orchestrator, task = ready_runtime(tmp_path)
+    task.test_commands = [
+        [
+            sys.executable,
+            "-m",
+            "coverage",
+            "run",
+            "--branch",
+            "--source=addition",
+            "check.py",
+        ]
+    ]
+    task.coverage_command = [
+        sys.executable,
+        "-m",
+        "coverage",
+        "json",
+        "-o",
+        "coverage.json",
+    ]
+    (tmp_path / "check.py").write_text(
+        "from pathlib import Path\n"
+        "from addition import add\n"
+        "assert add(2, 3) == 5\n"
+        "Path('test-side-effect.txt').write_text('unauthorized')\n"
+    )
+    created = store.create(task)
+    orchestrator.config.data["harness"] = {"max_correction_attempts": 1}
+
+    def execute(_task, step, _context, _scope):
+        (tmp_path / "addition.py").write_text(
+            "def add(a, b):\n    return sum((a, b))\n"
+        )
+        return ExecutorOutput(
+            subtask_id=step.id,
+            success=True,
+            output="implemented",
+            changed_files=["addition.py"],
+            tool_evidence=[{"tool": "filesystem.write", "changed_path": "addition.py"}],
+        )
+
+    orchestrator._execute_step = execute
+    with pytest.raises(
+        RuntimeError,
+        match="workspace change is absent from executor results|test execution modified workspace",
+    ):
+        asyncio.run(orchestrator.run(created.id))
+    failed = store.get(created.id)
+    assert failed.status == "failed"
+    assert any(
+        finding["rule"] == "workspace.integrity"
+        for finding in failed.validation_result["findings"]
+    )
+    assert store.events.list(created.id, "task.completed") == []
+
+
+def test_validator_side_effect_invalidates_completion_evidence(tmp_path):
+    store, orchestrator, task = ready_runtime(tmp_path)
+    created = store.create(task)
+    orchestrator.config.data["harness"] = {"max_correction_attempts": 1}
+    original = orchestrator.validator.validate
+    calls = 0
+
+    def changing_review(*args, **kwargs):
+        nonlocal calls
+        result = original(*args, **kwargs)
+        calls += 1
+        (tmp_path / "review-side-effect.txt").write_text(str(calls))
+        return result
+
+    orchestrator.validator.validate = changing_review
+    with pytest.raises(
+        RuntimeError, match="workspace changed during independent validation"
+    ):
+        asyncio.run(orchestrator.run(created.id))
+    assert calls == 2
+    assert store.events.list(created.id, "task.completed") == []
+    assert any(
+        item["rule"] == "validation.workspace_changed"
+        for item in store.corrections.list_for_task(created.id)
+    )
+
+
+def test_workspace_change_after_validation_commit_prevents_completion(tmp_path):
+    store, orchestrator, task = ready_runtime(tmp_path)
+    created = store.create(task)
+    original = store.record_validation
+
+    def record_then_mutate(task_id, valid, report):
+        validation_id = original(task_id, valid, report)
+        if valid:
+            (tmp_path / "late-change.txt").write_text("changed after validation")
+        return validation_id
+
+    store.record_validation = record_then_mutate
+    with pytest.raises(
+        RuntimeError, match="workspace changed after independent validation"
+    ):
+        asyncio.run(orchestrator.run(created.id))
+    assert store.events.list(created.id, "task.completed") == []
+
+
+def test_workspace_fingerprint_rejects_non_snapshot():
+    from harness.core import workspace_fingerprint
+
+    with pytest.raises(TypeError, match="snapshot is invalid"):
+        workspace_fingerprint(None)
 
 
 def test_concurrent_application_starts_execute_exactly_once(tmp_path):

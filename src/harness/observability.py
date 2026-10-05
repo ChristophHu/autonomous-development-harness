@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import ctypes
 import json
 import logging
 import math
 import os
 import re
 import resource
+import shutil
 import sys
 import time
 from datetime import UTC, datetime
@@ -19,6 +21,92 @@ _ASSIGNMENT = re.compile(
     r"(\s*[:=]\s*)(?:bearer\s+)?([^\s,;]+)"
 )
 _BEARER = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
+
+
+def _safe_sysconf(name):
+    try:
+        value = os.sysconf(name)
+    except (AttributeError, OSError, ValueError):
+        return None
+    return value if isinstance(value, int) and value >= 0 else None
+
+
+_MACH_HOST_PORT = None
+
+
+def _macos_cpu_ticks():
+    """Read cumulative user/system/idle/nice CPU ticks using Apple's Mach API."""
+    global _MACH_HOST_PORT
+    try:
+        library = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+        if _MACH_HOST_PORT is None:
+            host_self = library.mach_host_self
+            host_self.restype = ctypes.c_uint
+            _MACH_HOST_PORT = host_self()
+        host_statistics = library.host_statistics
+        host_statistics.restype = ctypes.c_int
+        host_statistics.argtypes = (
+            ctypes.c_uint,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_uint),
+        )
+        ticks = (ctypes.c_int * 4)()
+        count = ctypes.c_uint(4)
+        result = host_statistics(
+            _MACH_HOST_PORT,
+            3,  # HOST_CPU_LOAD_INFO
+            ctypes.cast(ticks, ctypes.POINTER(ctypes.c_int)),
+            ctypes.byref(count),
+        )
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+    if result != 0 or count.value < 4:
+        return None
+    return tuple(int(tick) for tick in ticks)
+
+
+def _linux_cpu_ticks():
+    try:
+        first = Path("/proc/stat").read_text(encoding="ascii").splitlines()[0]
+        fields = first.split()
+        if fields[0] != "cpu" or len(fields) < 5:
+            return None
+        values = [int(value) for value in fields[1:]]
+        return (
+            values[0],
+            values[2],
+            values[3] + (values[4] if len(values) > 4 else 0),
+            values[1],
+        )
+    except (IndexError, OSError, UnicodeError, ValueError):
+        return None
+
+
+def _host_cpu_ticks():
+    if sys.platform == "darwin":
+        return _macos_cpu_ticks()
+    if sys.platform.startswith("linux"):
+        return _linux_cpu_ticks()
+    return None
+
+
+def _cpu_utilization_percent(previous, current):
+    if (
+        previous is None
+        or current is None
+        or len(previous) != len(current)
+        or len(current) < 4
+    ):
+        return None
+    deltas = [now - before for before, now in zip(previous, current, strict=True)]
+    if any(delta < 0 for delta in deltas):
+        return None
+    total = sum(deltas)
+    if total <= 0:
+        return None
+    idle = deltas[2]
+    return min(100.0, max(0.0, (total - idle) * 100.0 / total))
 
 
 def redact_log_message(message, secrets=()):
@@ -91,6 +179,7 @@ class ObservabilityService:
         self.database = database
         self.event_kinds = tuple(sorted(str(item.value) for item in event_kinds))
         self.started_monotonic = time.monotonic()
+        self._previous_cpu_ticks = None
 
     def runtime_metrics(self):
         """Return bounded process and local SQLite resource gauges."""
@@ -106,6 +195,40 @@ class ObservabilityService:
             ),
             "process_max_rss_bytes": rss_bytes,
             "database_bytes": database_bytes,
+        }
+
+    def host_metrics(self):
+        """Return bounded host gauges; unsupported probes are explicitly unknown."""
+        cpu_ticks = _host_cpu_ticks()
+        cpu_utilization = _cpu_utilization_percent(self._previous_cpu_ticks, cpu_ticks)
+        self._previous_cpu_ticks = cpu_ticks
+        try:
+            load1 = os.getloadavg()[0]
+        except (AttributeError, OSError, ValueError):
+            load1 = None
+        cpu_count = os.cpu_count()
+        memory_total = memory_available = None
+        page_size = _safe_sysconf("SC_PAGE_SIZE")
+        total_pages = _safe_sysconf("SC_PHYS_PAGES")
+        available_pages = _safe_sysconf("SC_AVPHYS_PAGES")
+        if page_size and page_size > 0:
+            if total_pages is not None:
+                memory_total = page_size * total_pages
+            if available_pages is not None:
+                memory_available = page_size * available_pages
+        try:
+            disk = shutil.disk_usage(Path(self.database.path).parent)
+            disk_total, disk_free = disk.total, disk.free
+        except OSError:
+            disk_total = disk_free = None
+        return {
+            "cpu_count": cpu_count,
+            "cpu_utilization_percent": cpu_utilization,
+            "load1": load1,
+            "memory_total_bytes": memory_total,
+            "memory_available_bytes": memory_available,
+            "workspace_disk_total_bytes": disk_total,
+            "workspace_disk_free_bytes": disk_free,
         }
 
     @staticmethod
@@ -147,6 +270,25 @@ class ObservabilityService:
             "process_max_rss_bytes"
         ]
         gauges["harness_sqlite_database_bytes"] = report["runtime"]["database_bytes"]
+        gauges.update(
+            {
+                "harness_host_cpu_count": report["host"]["cpu_count"],
+                "harness_host_cpu_utilization_percent": report["host"][
+                    "cpu_utilization_percent"
+                ],
+                "harness_host_load1": report["host"]["load1"],
+                "harness_host_memory_total_bytes": report["host"]["memory_total_bytes"],
+                "harness_host_memory_available_bytes": report["host"][
+                    "memory_available_bytes"
+                ],
+                "harness_workspace_disk_total_bytes": report["host"][
+                    "workspace_disk_total_bytes"
+                ],
+                "harness_workspace_disk_free_bytes": report["host"][
+                    "workspace_disk_free_bytes"
+                ],
+            }
+        )
         lines = []
         for name, value in (*counters.items(), *gauges.items()):
             metric_type = "counter" if name in counters else "gauge"
@@ -296,4 +438,5 @@ class ObservabilityService:
                 else None,
             },
             "runtime": self.runtime_metrics(),
+            "host": self.host_metrics(),
         }

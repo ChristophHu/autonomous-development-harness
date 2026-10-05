@@ -32,9 +32,15 @@ from .core import ROOT, Config, Task, build
 from .database import Database, OperationalSnapshotRepository
 from .docker_broker import DockerComposeBroker
 from .isolation_diagnostics import probe_sandbox_capability
+from .mcp_status import MCPStatusApplicationService
+from .prometheus_acceptance import check_prometheus_integration
+from .prometheus_audit import audit_prometheus_scrape, audit_prometheus_ui
 from .security import SecretResolver
 from .service_lifecycle import ServiceLifecycle
-from .services import ModelOperationsService, OperationalDiagnosticsService
+from .services import (
+    ModelOperationsService,
+    OperationalDiagnosticsService,
+)
 from .sqlite_operations import inspect_sqlite
 from .verification import source_tree_sha256
 from .verify_clusters import write_failure_clusters
@@ -50,6 +56,7 @@ memory_service = typer.Typer(no_args_is_help=True)
 evidence = typer.Typer(no_args_is_help=True)
 mcp = typer.Typer(no_args_is_help=True)
 isolation = typer.Typer(no_args_is_help=True)
+observability = typer.Typer(no_args_is_help=True)
 app.add_typer(tasks, name="tasks")
 app.add_typer(models, name="models")
 app.add_typer(config, name="config")
@@ -60,6 +67,7 @@ memory.add_typer(memory_service, name="service")
 app.add_typer(evidence, name="evidence")
 app.add_typer(mcp, name="mcp")
 app.add_typer(isolation, name="isolation")
+app.add_typer(observability, name="observability")
 
 
 @isolation.command("doctor")
@@ -108,33 +116,13 @@ def mcp_status():
 
     conf = Config()
     manager = MCPServerManager(conf.data.get("tools", {}).get("mcp", {}))
-    reports = manager.report()
-    snapshots = {
-        row["server"]: row
-        for row in OperationalSnapshotRepository.read_latest_mcp_statuses(
+    service = MCPStatusApplicationService(
+        manager.report,
+        lambda: OperationalSnapshotRepository.read_latest_mcp_statuses(
             conf.path("database")
-        )
-    }
-    now = datetime.now(UTC)
-    for item in reports:
-        previous = snapshots.get(item["name"])
-        item["last_probe"] = None
-        if previous:
-            item["last_probe"] = {
-                "observed_at": previous["observed_at"],
-                "state": previous["state"],
-                "error_type": previous["error_type"],
-            }
-            try:
-                observed = datetime.fromisoformat(previous["observed_at"])
-                if observed.tzinfo is None:
-                    observed = observed.replace(tzinfo=UTC)
-                item["last_probe"]["age_seconds"] = max(
-                    0, int((now - observed).total_seconds())
-                )
-            except (TypeError, ValueError):
-                item["last_probe"]["age_seconds"] = None
-    typer.echo(json.dumps(reports, ensure_ascii=False, indent=2))
+        ),
+    )
+    typer.echo(json.dumps(service.status(), ensure_ascii=False, indent=2))
 
 
 @mcp.command("doctor")
@@ -153,6 +141,12 @@ def mcp_doctor():
     except (OSError, RuntimeError, TypeError, ValueError) as error:
         typer.echo(f"MCP doctor could not initialize: {type(error).__name__}")
         raise typer.Exit(2) from None
+    reports = MCPStatusApplicationService(
+        list,
+        lambda: OperationalSnapshotRepository.read_latest_mcp_statuses(
+            conf.path("database")
+        ),
+    ).status(reports)
     typer.echo(json.dumps(reports, ensure_ascii=False, indent=2))
     if any(item["state"] in {"unavailable", "invalid_config"} for item in reports):
         raise typer.Exit(1)
@@ -187,8 +181,8 @@ def decision_query(
 @artifacts.command("list")
 def artifact_list(task_id: int = typer.Option(..., "--task-id", min=1)):
     """List the latest version of each task artifact."""
-    _config, store, _orchestrator = build()
-    typer.echo(json.dumps(store.artifacts_for_task(task_id), ensure_ascii=False))
+    _config, _store, orchestrator = build()
+    typer.echo(json.dumps(orchestrator.service.artifacts(task_id), ensure_ascii=False))
 
 
 @artifacts.command("history")
@@ -197,8 +191,12 @@ def artifact_history(
     key: str = typer.Option(..., "--key"),
 ):
     """Show append-only versions of one task artifact."""
-    _config, store, _orchestrator = build()
-    typer.echo(json.dumps(store.artifact_history(task_id, key), ensure_ascii=False))
+    _config, _store, orchestrator = build()
+    typer.echo(
+        json.dumps(
+            orchestrator.service.artifact_history(task_id, key), ensure_ascii=False
+        )
+    )
 
 
 @app.command("completion")
@@ -322,7 +320,16 @@ def _lifecycle():
     return ServiceLifecycle(ROOT / "data" / "harness.pid")
 
 
-def _serve_api(host, port, lifecycle, timeout=10.0):
+def _serve_api(
+    host,
+    port,
+    lifecycle,
+    timeout=10.0,
+    *,
+    metrics_listener=None,
+    metrics_token=None,
+    metrics_provider=None,
+):
     startup_finished = threading.Event()
     startup_succeeded = threading.Event()
     readiness_confirmed = threading.Event()
@@ -335,6 +342,41 @@ def _serve_api(host, port, lifecycle, timeout=10.0):
                     startup_succeeded.set()
             finally:
                 startup_finished.set()
+
+    metrics_server = None
+    metrics_thread = None
+    if metrics_listener is not None and metrics_listener.enabled:
+        if not metrics_token or not callable(metrics_provider):
+            return False
+        from .metrics_api import create_metrics_app
+
+        metrics_started = threading.Event()
+
+        class ReadyMetricsServer(uvicorn.Server):
+            async def startup(self, sockets=None):
+                try:
+                    await super().startup(sockets)
+                    if self.started:
+                        startup_succeeded.set()
+                finally:
+                    metrics_started.set()
+
+        startup_succeeded = threading.Event()
+        metrics_server = ReadyMetricsServer(
+            uvicorn.Config(
+                create_metrics_app(metrics_provider, metrics_token),
+                host=metrics_listener.host,
+                port=metrics_listener.port,
+                access_log=False,
+                log_config=None,
+            )
+        )
+        metrics_thread = threading.Thread(target=metrics_server.run, daemon=True)
+        metrics_thread.start()
+        if not metrics_started.wait(timeout) or not startup_succeeded.is_set():
+            metrics_server.should_exit = True
+            metrics_thread.join(timeout)
+            return False
 
     server = ReadyServer(
         uvicorn.Config("harness.api:app", host=host, port=port, reload=False)
@@ -356,7 +398,12 @@ def _serve_api(host, port, lifecycle, timeout=10.0):
 
     monitor = threading.Thread(target=announce_readiness, daemon=True)
     monitor.start()
-    server.run()
+    try:
+        server.run()
+    finally:
+        if metrics_server is not None:
+            metrics_server.should_exit = True
+            metrics_thread.join(timeout)
     monitor.join(timeout + 0.2)
     return readiness_confirmed.is_set()
 
@@ -518,13 +565,34 @@ def start(host: str | None = None, port: int | None = None):
     settings = conf.data.get("api", {})
     host = host or settings.get("host", "127.0.0.1")
     port = settings.get("port", 8080) if port is None else port
+    metrics_listener = conf.settings.api.metrics_listener
+    metrics_token = None
+    if metrics_listener.enabled:
+        from .metrics_api import read_bearer_token
+
+        try:
+            metrics_token = read_bearer_token(metrics_listener.bearer_file)
+        except (OSError, ValueError):
+            typer.echo("Start blocked: metrics listener token file is unavailable")
+            raise typer.Exit(1)
     lifecycle = _lifecycle()
     try:
         record = lifecycle.register_current(host, port)
     except (OSError, RuntimeError, ValueError) as error:
         raise typer.BadParameter(str(error)) from error
     try:
-        if not _serve_api(host, port, lifecycle):
+        if metrics_listener.enabled:
+            ready = _serve_api(
+                host,
+                port,
+                lifecycle,
+                metrics_listener=metrics_listener,
+                metrics_token=metrics_token,
+                metrics_provider=orchestrator.observability_operations.prometheus,
+            )
+        else:
+            ready = _serve_api(host, port, lifecycle)
+        if not ready:
             raise typer.Exit(1)
     finally:
         lifecycle.remove_record(record)
@@ -576,12 +644,68 @@ def runtime_metrics(
     """Print durable task, event-catalogue, and model-usage counters."""
     _conf, _store, orchestrator = build()
     if format.casefold() == "prometheus":
-        typer.echo(orchestrator.observability.prometheus(), nl=False)
+        typer.echo(orchestrator.observability_operations.prometheus(), nl=False)
         return
     if format.casefold() != "json":
         typer.echo("Metrics format must be json or 'prometheus'.")
         raise typer.Exit(2)
-    typer.echo(json.dumps(orchestrator.observability.metrics(), indent=2))
+    typer.echo(json.dumps(orchestrator.observability_operations.metrics(), indent=2))
+
+
+@observability.command("audit-prometheus-ui")
+def audit_prometheus_ui_command(
+    compose_file: Annotated[
+        Path, typer.Option(..., "--compose-file", exists=True, dir_okay=False)
+    ],
+    web_config_file: Annotated[
+        Path, typer.Option(..., "--web-config-file", exists=True, dir_okay=False)
+    ],
+):
+    """Read-only audit of Prometheus UI exposure, TLS, auth, and config mount."""
+    try:
+        compose = yaml.safe_load(compose_file.read_text(encoding="utf-8"))
+        web_config = yaml.safe_load(web_config_file.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, yaml.YAMLError) as error:
+        typer.echo(
+            f"Prometheus UI audit could not read configuration: {type(error).__name__}"
+        )
+        raise typer.Exit(2) from None
+    report = audit_prometheus_ui(compose, web_config)
+    typer.echo(json.dumps(report, sort_keys=True))
+    if report["status"] in {"unsafe", "unknown"}:
+        raise typer.Exit(1)
+
+
+@observability.command("audit-prometheus-scrape")
+def audit_prometheus_scrape_command(
+    scrape_config_file: Annotated[
+        Path, typer.Option(..., "--scrape-config-file", exists=True, dir_okay=False)
+    ],
+):
+    """Read-only audit of the documented Prometheus-to-Harness scrape contract."""
+    try:
+        scrape_config = yaml.safe_load(scrape_config_file.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, yaml.YAMLError) as error:
+        typer.echo(
+            f"Prometheus scrape audit could not read configuration: {type(error).__name__}"
+        )
+        raise typer.Exit(2) from None
+    report = audit_prometheus_scrape(scrape_config)
+    typer.echo(json.dumps(report, sort_keys=True))
+    if report["status"] != "valid":
+        raise typer.Exit(1)
+
+
+@observability.command("check-prometheus")
+def check_prometheus_command(
+    prometheus_url: Annotated[str, typer.Option(..., "--prometheus-url")],
+    harness_metrics_url: Annotated[str, typer.Option(..., "--harness-metrics-url")],
+):
+    """Live-check Prometheus readiness, Harness scrape, query, and 401 contract."""
+    report = check_prometheus_integration(prometheus_url, harness_metrics_url)
+    typer.echo(json.dumps(report, sort_keys=True))
+    if report["status"] != "passed":
+        raise typer.Exit(1)
 
 
 @app.command()
@@ -1339,6 +1463,35 @@ def qdrant_reconcile(confirm: bool = typer.Option(False, "--confirm")):
     typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
 
 
+@memory.command("qdrant-reconcile-plan")
+def qdrant_reconcile_plan():
+    """Preview Vault/Qdrant drift without embedding or writing vectors."""
+    conf, _store, orchestrator = build()
+    if not conf.data.get("memory", {}).get("qdrant", {}).get("enabled", False):
+        typer.echo("Qdrant is disabled in configuration")
+        raise typer.Exit(1)
+    try:
+        plan = orchestrator.memory_service.plan_reconciliation()
+    except (OSError, RuntimeError, ValueError, httpx.HTTPError) as error:
+        typer.echo(f"Qdrant reconciliation preview failed: {type(error).__name__}")
+        raise typer.Exit(1) from None
+    # Point IDs are an implementation detail; only actionable counts/sources
+    # are exposed. Applying always computes a fresh plan.
+    typer.echo(
+        json.dumps(
+            {
+                "notes": plan["notes"],
+                "chunks": plan["chunks"],
+                "needs_index": plan["needs_index"],
+                "orphan_sources": plan["orphan_sources"],
+                "orphan_points": sum(map(len, plan["orphan_points"].values())),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+
+
 @tasks.command("create")
 def task_create(
     title: str | None = typer.Argument(None),
@@ -1588,7 +1741,9 @@ def model_test(model_name: str):
     _, _, orchestrator = build()
     result = orchestrator.model_operations.test_model(model_name)
     if result["status"] != "successful":
-        typer.echo(f"Model test failed ({result['error_type']})")
+        typer.echo(
+            f"Model test failed ({result['error_category']}/{result['error_type']})"
+        )
         raise typer.Exit(1)
     typer.echo(f"Model test successful: {model_name}")
 

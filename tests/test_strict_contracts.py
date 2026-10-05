@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 import subprocess
+from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
@@ -23,7 +24,7 @@ from harness.providers import (
     ProviderError,
     ToolCall,
 )
-from harness.requirements import RequirementCompleter
+from harness.requirements import RequirementCompleter, RequirementProposal
 from harness.tools import ToolSpec
 
 
@@ -659,6 +660,291 @@ def test_repository_claim_accepts_current_hash_bound_source(tmp_path):
     ]
 
 
+def test_repository_fragment_current_rejects_unsafe_and_stale_sources(tmp_path):
+    store, orchestrator = runtime(tmp_path)
+    completer = RequirementCompleter(store, orchestrator.router)
+    source = tmp_path / "current.py"
+    source.write_text("current")
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    valid = {
+        "ref": "context:repository/current.py#symbol",
+        "provenance": {"sha256": digest},
+    }
+    assert completer._repository_fragment_current(valid)
+    for reference, provenance in (
+        (None, {"sha256": digest}),
+        ("context:repository/current.py", None),
+        ("context:repository/", {"sha256": digest}),
+        ("context:repository//etc/passwd", {"sha256": digest}),
+        ("context:repository/../outside", {"sha256": digest}),
+        ("context:repository/a\\b", {"sha256": digest}),
+        ("context:repository/current.py", {"sha256": "A" * 64}),
+        ("context:repository/missing.py", {"sha256": digest}),
+    ):
+        assert not completer._repository_fragment_current(
+            {"ref": reference, "provenance": provenance}
+        )
+    link = tmp_path / "linked.py"
+    link.symlink_to(source)
+    assert not completer._repository_fragment_current(
+        {
+            "ref": "context:repository/linked.py",
+            "provenance": {"sha256": digest},
+        }
+    )
+    assert not completer._repository_fragment_current(
+        {
+            "ref": "context:repository/current.py",
+            "provenance": {"sha256": "0" * 64},
+        }
+    )
+
+
+def test_repository_fragment_current_rejects_nonfiles_oversize_and_read_errors(
+    tmp_path, monkeypatch
+):
+    store, orchestrator = runtime(tmp_path)
+    completer = RequirementCompleter(store, orchestrator.router)
+    directory = tmp_path / "directory"
+    directory.mkdir()
+    large = tmp_path / "large.py"
+    large.write_bytes(b"x" * 512_001)
+    for relative, digest in (("directory", "0" * 64), ("large.py", "0" * 64)):
+        assert not completer._repository_fragment_current(
+            {
+                "ref": f"context:repository/{relative}",
+                "provenance": {"sha256": digest},
+            }
+        )
+    source = tmp_path / "unreadable.py"
+    source.write_text("contents")
+    original_open = Path.open
+
+    def fail_source(path, *args, **kwargs):
+        if path == source:
+            raise OSError("read denied")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", fail_source)
+    assert not completer._repository_fragment_current(
+        {
+            "ref": "context:repository/unreadable.py",
+            "provenance": {"sha256": "0" * 64},
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "proposal",
+    [
+        {"fields": {"invented": "x"}, "rationale": "grounded", "evidence": {}},
+        {"fields": {}, "rationale": "grounded", "evidence": {"invented": []}},
+    ],
+)
+def test_requirement_proposal_rejects_unknown_fields(proposal):
+    with pytest.raises(ValueError, match="unknown field"):
+        RequirementProposal.model_validate(proposal)
+
+
+def test_requirement_completion_quarantines_invalid_human_claims(tmp_path):
+    store, orchestrator = runtime(tmp_path)
+    task = store.create(Task(title="human claim validation"))
+    for index, answer in enumerate(
+        (
+            "not-json",
+            "[]",
+            '{"goal":NaN}',
+            json.dumps({"goal": "x" * 4097}),
+            json.dumps({"goal": "human fact"}),
+        )
+    ):
+        question = store.ask(
+            task.id, f"clarification {index}", "requirements:incomplete"
+        )
+        store.answer(question, answer, task.id)
+    _, raw_context = RequirementCompleter(store, orchestrator.router).complete(
+        task, {"fragments": [], "claim_issues": {"requirements": ["prechecked"]}}
+    )
+    context = next(
+        item["data"]
+        for item in json.loads(raw_context)
+        if item["source"] == "memory_and_repository"
+    )
+    assert context["claims"]["goal"] == [
+        {
+            "ref": f"answer:{store.list_questions(task.id)[-1]['id']}",
+            "value": "human fact",
+        }
+    ]
+    assert context["claim_issues"]["goal"] == [
+        "human claim is not valid JSON",
+        "human claim exceeds the evidence size limit",
+    ]
+    assert context["claim_issues"]["requirements"] == ["prechecked"]
+
+
+def test_requirement_completion_rejects_context_that_grows_past_budget(tmp_path):
+    from harness.memory import context_evidence_size
+
+    store, orchestrator = runtime(tmp_path)
+    task = store.create(Task(title="budget after claim verification"))
+    reference = "context:vault/goal.md#Goal"
+    context = {
+        "fragments": [{"ref": reference, "text": "alpha"}],
+        "claims": {"goal": [{"ref": reference, "value": "alpha"}]},
+    }
+    context["budget_bytes"] = context_evidence_size(context) + 32
+    with pytest.raises(ValueError, match="validated context evidence exceeds"):
+        RequirementCompleter(store, orchestrator.router).complete(task, context)
+
+
+@pytest.mark.parametrize(
+    ("answer", "task_goal"),
+    [
+        ("not-json", ""),
+        ("[]", ""),
+        (json.dumps({"value": "new", "rationale": ""}), ""),
+        (json.dumps({"value": "new", "rationale": "x" * 4001}), ""),
+        (json.dumps({"value": "x" * 5000, "rationale": "supported"}), ""),
+        (json.dumps({"value": [], "rationale": "supported"}), ""),
+        (json.dumps({"value": "", "rationale": "supported"}), ""),
+        (json.dumps({"value": "new", "rationale": "supported"}), "existing"),
+        ("x" * 8193, ""),
+    ],
+)
+def test_requirement_conflict_resolution_rejects_invalid_answers(
+    tmp_path, answer, task_goal
+):
+    store, orchestrator = runtime(tmp_path)
+    task = store.create(Task(title="invalid conflict resolution", goal=task_goal))
+    retrieved = {
+        "fragments": [
+            {"ref": "context:vault/a.md#Goal", "text": "alpha"},
+            {"ref": "context:qdrant/b", "text": "beta"},
+        ],
+        "claims": {
+            "goal": [
+                {"ref": "context:vault/a.md#Goal", "value": "alpha"},
+                {"ref": "context:qdrant/b", "value": "beta"},
+            ]
+        },
+    }
+    completer = RequirementCompleter(store, orchestrator.router)
+    if task_goal:
+        question_id = store.ask(
+            task.id,
+            "Resolve the current goal conflict",
+            "requirements:conflict:goal:existing",
+            purpose="decision",
+        )
+        store.answer(question_id, answer, task.id)
+        completed, _ = completer.complete(task, retrieved)
+        assert completed.goal == task_goal
+        assert store.decisions.list(task.id) == []
+        return
+    completer.complete(task, retrieved)
+    question = next(
+        item
+        for item in store.list_questions(task.id)
+        if item["purpose"] == "decision" and item["status"] == "open"
+    )
+    store.answer(question["id"], answer, task.id)
+    completed, _ = completer.complete(store.get(task.id), retrieved)
+    assert completed.goal == task_goal
+    assert store.decisions.list(task.id) == []
+
+
+def test_requirement_completion_ignores_answer_for_unknown_conflict_field(tmp_path):
+    store, orchestrator = runtime(tmp_path)
+    task = store.create(Task(title="unknown conflict field"))
+    question_id = store.ask(
+        task.id,
+        "invalid field",
+        "requirements:conflict:unknown:123456789abc",
+        purpose="decision",
+    )
+    store.answer(question_id, '{"value":"bad","rationale":"invalid"}', task.id)
+    completed, _ = RequirementCompleter(store, orchestrator.router).complete(
+        task, "no context"
+    )
+    assert completed.goal == ""
+    assert store.decisions.list(task.id) == []
+
+
+def test_requirement_completion_quarantines_malformed_context_claims(tmp_path):
+    store, orchestrator = runtime(tmp_path)
+    task = store.create(Task(title="claim validation"))
+    reference = "context:vault/source.md#Goal"
+    claims = [{"ref": reference, "value": "supported"} for _ in range(33)]
+    claims.extend(
+        [
+            None,
+            {"ref": "context:missing", "value": "supported"},
+            {"ref": reference},
+            {"ref": reference, "value": float("nan")},
+            {"ref": reference, "value": "x" * 4097},
+        ]
+    )
+    _, raw_context = RequirementCompleter(store, orchestrator.router).complete(
+        task,
+        {
+            "fragments": [
+                None,
+                {"ref": "not-context", "text": "ignored"},
+                {"ref": reference, "text": "supported"},
+            ],
+            "claims": {
+                "unknown": [],
+                "goal": claims,
+                "requirements": "not-a-list",
+            },
+            "claim_issues": {"acceptance_criteria": "not-a-list", "unknown": []},
+        },
+    )
+    context = next(
+        item["data"]
+        for item in json.loads(raw_context)
+        if item["source"] == "memory_and_repository"
+    )
+    assert len(context["claims"]["goal"]) == 32
+    assert (
+        "context claim payload exceeds the evidence limit"
+        in context["claim_issues"]["goal"]
+    )
+    assert (
+        "claim reference is absent from supplied context fragments"
+        in context["claim_issues"]["goal"]
+    )
+    assert "claim value is not valid JSON" in context["claim_issues"]["goal"]
+    assert (
+        "claim value exceeds the evidence size limit" in context["claim_issues"]["goal"]
+    )
+    assert context["claim_issues"]["requirements"] == ["claims must be a list"]
+    assert context["claim_issues"]["acceptance_criteria"] == [
+        "claim integrity metadata is invalid"
+    ]
+
+
+def test_requirement_completion_ignores_unstructured_context_metadata(tmp_path):
+    store, orchestrator = runtime(tmp_path)
+    task = store.create(Task(title="unstructured context"))
+    _, raw_context = RequirementCompleter(store, orchestrator.router).complete(
+        task,
+        {
+            "fragments": [{"ref": "context:vault/item", "text": 17}],
+            "claims": ["not", "a", "mapping"],
+            "claim_issues": "not a mapping",
+        },
+    )
+    context = next(
+        item["data"]
+        for item in json.loads(raw_context)
+        if item["source"] == "memory_and_repository"
+    )
+    assert context["claims"] == {}
+    assert context["claim_issues"] == {}
+
+
 def test_context_claim_without_source_quote_is_quarantined(tmp_path):
     store, orchestrator = runtime(tmp_path)
     task = store.create(Task(title="fabricated claim"))
@@ -1114,7 +1400,7 @@ def test_executor_observation_and_failure_paths(tmp_path):
         )
 
 
-def test_remaining_validator_paths(tmp_path):
+def test_remaining_validator_paths(tmp_path, monkeypatch):
     _, orchestrator = runtime(tmp_path)
     task = specification()
     task.plan = {
@@ -1151,6 +1437,15 @@ def test_remaining_validator_paths(tmp_path):
         "reason": "workspace is not a Git repository",
         "filesystem": {},
     }
+    monkeypatch.setattr(
+        orchestrator.validator.tools,
+        "execute",
+        lambda name, *_args, **_kwargs: (
+            SimpleNamespace(returncode=0, stdout="criterion passed", stderr="")
+            if name == "test.run_tests"
+            else pytest.fail(f"unexpected tool execution: {name}")
+        ),
+    )
     assert orchestrator.validator.validate(
         task,
         [ExecutorOutput(subtask_id="planned", success=True, output="done")],
@@ -1231,7 +1526,7 @@ def test_validator_rejects_bad_fresh_coverage_file(tmp_path):
     ],
 )
 def test_validator_coverage_threshold_and_branch_gate(
-    tmp_path, threshold, percent, missing_lines, missing_branches, expected
+    tmp_path, monkeypatch, threshold, percent, missing_lines, missing_branches, expected
 ):
     _store, orchestrator = runtime(tmp_path)
     task = specification()
@@ -1269,6 +1564,15 @@ def test_validator_coverage_threshold_and_branch_gate(
         "reason": "workspace is not a Git repository",
         "filesystem": {},
     }
+    monkeypatch.setattr(
+        orchestrator.validator.tools,
+        "execute",
+        lambda name, *_args, **_kwargs: (
+            SimpleNamespace(returncode=0, stdout="criterion passed", stderr="")
+            if name == "test.run_tests"
+            else pytest.fail(f"unexpected tool execution: {name}")
+        ),
+    )
     assert (
         orchestrator.validator.validate(
             task,

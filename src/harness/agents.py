@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time  # noqa: F401 - compatibility clock hook used by routing tests
 from contextlib import nullcontext
+from pathlib import Path
 from typing import ClassVar
 
 import httpx
@@ -57,6 +59,21 @@ class Subtask(BaseModel):
     recovery_targets: list[str] = Field(default_factory=list)
     write_paths: list[str] = Field(default_factory=list)
 
+    @model_validator(mode="after")
+    def write_scope(self):
+        for path in self.write_paths:
+            normalized = path.replace("\\", "/")
+            parts = normalized.split("/")
+            if (
+                normalized.startswith("/")
+                or re.match(r"^[a-zA-Z]:", normalized)
+                or any(part in {"", ".", ".."} for part in parts)
+                or any(part.casefold() == ".git" for part in parts)
+                or "\x00" in normalized
+            ):
+                raise ValueError("plan write path must be a safe relative path")
+        return self
+
 
 class PlannerOutput(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -65,6 +82,42 @@ class PlannerOutput(BaseModel):
     complexity: Complexity
     subtasks: list[Subtask] = Field(min_length=1)
     assumptions: list[str] = Field(default_factory=list)
+
+    def observable_target_findings(self, task, workspace):
+        """Detect file criteria no linked step can satisfy from this workspace."""
+        root = Path(workspace).resolve()
+        findings = []
+        for criterion in task.acceptance_criteria:
+            if criterion.kind not in {"file_exists", "file_contains"}:
+                continue
+            target = (root / criterion.path).resolve()
+            if not target.is_relative_to(root):
+                findings.append(f"criterion path escapes workspace: {criterion.id}")
+                continue
+            try:
+                already_met = target.is_file() and (
+                    criterion.kind == "file_exists"
+                    or criterion.contains in target.read_text()
+                )
+            except (OSError, UnicodeError):
+                already_met = False
+            if already_met:
+                continue
+            linked = [
+                step
+                for step in self.subtasks
+                if criterion.id in step.acceptance_criteria
+            ]
+            if not any(
+                target == (root / path).resolve()
+                or target.is_relative_to((root / path).resolve())
+                for step in linked
+                for path in step.write_paths
+            ):
+                findings.append(
+                    f"criterion target has no linked write scope: {criterion.id}"
+                )
+        return findings
 
     def validate_task_coverage(
         self, task, required_requirements=None, required_criteria=None
@@ -86,6 +139,7 @@ class PlannerOutput(BaseModel):
             if required_criteria is None
             else set(required_criteria)
         )
+        task_criteria = {criterion.id for criterion in task.acceptance_criteria}
         for requirement in required_requirements:
             if requirement not in requirement_ids:
                 errors.append(f"requirement has no plan step: {requirement}")
@@ -93,7 +147,9 @@ class PlannerOutput(BaseModel):
             linked = [
                 step for step in self.subtasks if requirement in step.requirement_ids
             ]
-            if not any(step.acceptance_criteria for step in linked):
+            if not any(
+                set(step.acceptance_criteria) & task_criteria for step in linked
+            ):
                 errors.append(
                     f"requirement has no linked acceptance criterion: {requirement}"
                 )
@@ -105,7 +161,7 @@ class PlannerOutput(BaseModel):
             unknown_requirements = requirement_ids - all_requirements
             for requirement in sorted(unknown_requirements):
                 errors.append(f"plan references unknown requirement: {requirement}")
-        all_criteria = {criterion.id for criterion in task.acceptance_criteria}
+        all_criteria = task_criteria
         if all_criteria:
             for criterion in sorted(criterion_ids - all_criteria):
                 errors.append(
@@ -140,7 +196,9 @@ class PlannerOutput(BaseModel):
         return ordered
 
 
-async def execute_plan_dag(subtasks, worker, *, max_parallel_steps=4, on_complete=None):
+async def execute_plan_dag(
+    subtasks, worker, *, max_parallel_steps=4, on_complete=None, prior_outputs=None
+):
     """Execute ready, write-disjoint DAG steps concurrently and return plan order."""
     if (
         not isinstance(max_parallel_steps, int)
@@ -148,8 +206,21 @@ async def execute_plan_dag(subtasks, worker, *, max_parallel_steps=4, on_complet
         or not 1 <= max_parallel_steps <= 32
     ):
         raise ValueError("max_parallel_steps must be between 1 and 32")
-    pending = list(subtasks)
-    results = {}
+    if prior_outputs is None:
+        prior_outputs = {}
+    if (
+        not isinstance(prior_outputs, dict)
+        or not set(prior_outputs) <= {step.id for step in subtasks}
+        or any(
+            not isinstance(output, ExecutorOutput)
+            or output.subtask_id != step_id
+            or not output.success
+            for step_id, output in prior_outputs.items()
+        )
+    ):
+        raise ValueError("prior step outputs are invalid")
+    pending = [step for step in subtasks if step.id not in prior_outputs]
+    results = dict(prior_outputs)
 
     def normalized(path):
         value = path.replace("\\", "/")
@@ -1049,6 +1120,28 @@ class ModelRouter:
                             "hard input token budgets must cover every routed model"
                         )
                     if token_settings is not None:
+                        calibration_key = self.token_counters.calibration_key(
+                            resolved_model
+                        )
+                        calibration = {
+                            "sample_count": 0,
+                            "calibrated": False,
+                            "multiplier": 1.0,
+                        }
+                        calibration_reader = getattr(
+                            self.audit, "model_token_calibration", None
+                        )
+                        if calibration_key is not None and callable(calibration_reader):
+                            calibration = calibration_reader(
+                                resolved_model,
+                                calibration_key,
+                                min_samples=token_settings.get(
+                                    "calibration_min_samples", 5
+                                ),
+                                max_multiplier=token_settings.get(
+                                    "calibration_max_multiplier", 1.5
+                                ),
+                            )
                         count = enforce_token_budget(
                             self.token_counters,
                             resolved_model,
@@ -1059,6 +1152,7 @@ class ModelRouter:
                             safety_margin_percent=token_settings.get(
                                 "safety_margin_percent", 20
                             ),
+                            calibration_multiplier=calibration["multiplier"],
                         )
                         estimate = self.token_counters.estimate(
                             resolved_model,
@@ -1068,10 +1162,14 @@ class ModelRouter:
                             safety_margin_percent=token_settings.get(
                                 "safety_margin_percent", 20
                             ),
+                            calibration_multiplier=calibration["multiplier"],
                         )
                         span["input_token_preflight"] = {
                             "estimated_tokens": count,
                             "raw_tokens": estimate.raw_tokens,
+                            "calibration_key": calibration_key,
+                            "calibration_multiplier": calibration["multiplier"],
+                            "calibration_samples": calibration["sample_count"],
                             "method": estimate.method,
                             "safety_margin_percent": estimate.safety_margin_percent,
                             "limit": token_settings["max_input_tokens"],
@@ -1113,6 +1211,9 @@ class ModelRouter:
                                     estimated - usage.prompt_tokens
                                 ),
                                 "estimate_method": estimate_data.get("method"),
+                                "calibration_multiplier": estimate_data.get(
+                                    "calibration_multiplier", 1.0
+                                ),
                             }
                         if run_context:
                             cost_budget = run_context.get("model_cost_budget")
@@ -1207,6 +1308,7 @@ class Planner:
             + json.dumps(PlannerOutput.model_json_schema())
             + "\nFor every step that may change workspace files, declare the narrowest possible write_paths."
             + "\nFor every task requirement, include its exact text in requirement_ids on at least one step; map every acceptance criterion by its ID in that step's acceptance_criteria."
+            + "\nFor each requirement, link it on a step to at least one criterion that tests that requirement; do not use unrelated criteria merely to satisfy coverage. The independent reviewer will compare this mapping with the observed diff and fresh test evidence."
             + "\nTask:\n"
             + json.dumps(payload)
             + "\nContext:\n"
@@ -1248,6 +1350,16 @@ class Planner:
         if coverage_errors:
             raise ValueError(
                 "plan does not cover task contract: " + "; ".join(coverage_errors)
+            )
+        workspace = self.router.config.data.get("paths", {}).get("workspace")
+        target_errors = (
+            plan.observable_target_findings(task, workspace)
+            if workspace is not None
+            else []
+        )
+        if target_errors:
+            raise ValueError(
+                "plan cannot satisfy observable criterion: " + "; ".join(target_errors)
             )
         return plan
 

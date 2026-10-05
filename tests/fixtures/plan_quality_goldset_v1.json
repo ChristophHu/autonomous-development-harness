@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "cases": [
+    {"id": "missing-target-linked-write", "existing": null, "kind": "file_contains", "criterion_path": "src/result.py", "contains": "correct", "write_paths": ["src/result.py"], "expected_findings": []},
+    {"id": "missing-target-unrelated-write", "existing": null, "kind": "file_contains", "criterion_path": "src/result.py", "contains": "correct", "write_paths": ["src/unrelated.py"], "expected_findings": ["criterion target has no linked write scope: result"]},
+    {"id": "existing-target-no-write", "existing": "correct", "kind": "file_contains", "criterion_path": "src/result.py", "contains": "correct", "write_paths": [], "expected_findings": []},
+    {"id": "stale-target-unrelated-write", "existing": "wrong", "kind": "file_contains", "criterion_path": "src/result.py", "contains": "correct", "write_paths": ["src/unrelated.py"], "expected_findings": ["criterion target has no linked write scope: result"]},
+    {"id": "directory-write-covers-target", "existing": null, "kind": "file_exists", "criterion_path": "src/result.py", "contains": "", "write_paths": ["src"], "expected_findings": []},
+    {"id": "criterion-escapes-workspace", "existing": null, "kind": "file_exists", "criterion_path": "../outside.py", "contains": "", "write_paths": ["src/result.py"], "expected_findings": ["criterion path escapes workspace: result"]}
+  ]
+}

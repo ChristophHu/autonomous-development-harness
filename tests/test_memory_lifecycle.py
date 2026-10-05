@@ -138,6 +138,137 @@ def test_reconcile_skips_symlinks_and_is_idempotent(tmp_path):
     }
 
 
+def test_reconcile_plan_is_read_only_and_apply_is_selective(tmp_path):
+    notes, vectors, service = lifecycle(tmp_path)
+    notes.write("stable", "unchanged")
+    notes.write("changed", "old")
+    service.index("stable")
+    service.index("changed")
+    notes.write("changed", "new")
+    notes.write("missing", "new note")
+    vectors.points["orphan"] = {
+        "id": "orphan",
+        "payload": {
+            "source": "removed",
+            "source_type": "obsidian",
+            "source_hash": "0" * 64,
+            "chunk": 0,
+            "text": "old",
+        },
+    }
+    before = dict(vectors.points)
+    upserts = vectors.upserts
+
+    plan = service.plan_reconciliation()
+
+    assert plan["needs_index"] == ["changed", "missing"]
+    assert plan["orphan_sources"] == ["removed"]
+    assert plan["orphan_points"] == {"removed": ["orphan"]}
+    assert vectors.points == before
+    assert vectors.upserts == upserts
+    result = service.reconcile()
+    assert result["removed_sources"] == 1
+    assert result["removed_points"] == 1
+    assert "orphan" not in vectors.points
+    assert service.plan_reconciliation()["needs_index"] == []
+    assert service.plan_reconciliation()["orphan_sources"] == []
+    after_apply = vectors.upserts
+    assert service.reconcile()["removed_points"] == 0
+    assert vectors.upserts == after_apply
+
+
+def test_reconcile_rechecks_orphan_before_delete(tmp_path, monkeypatch):
+    notes, vectors, service = lifecycle(tmp_path)
+    vectors.points["orphan"] = {
+        "id": "orphan",
+        "payload": {"source": "appeared", "source_type": "obsidian"},
+    }
+    preview = service.plan_reconciliation()
+    assert preview["orphan_sources"] == ["appeared"]
+    original = service.plan_reconciliation
+
+    def raced_plan():
+        plan = original()
+        notes.write("appeared", "now present")
+        return plan
+
+    monkeypatch.setattr(service, "plan_reconciliation", raced_plan)
+    assert service.reconcile()["removed_points"] == 0
+    assert "orphan" in vectors.points
+
+
+def test_reconcile_prunes_duplicate_owned_point_for_unchanged_note(tmp_path):
+    notes, vectors, service = lifecycle(tmp_path)
+    notes.write("guide", "short")
+    service.index("guide")
+    duplicate = dict(vectors.points["obsidian:guide:0"])
+    duplicate["id"] = "duplicate"
+    vectors.points["duplicate"] = duplicate
+
+    assert service.plan_reconciliation()["needs_index"] == ["guide"]
+    service.reconcile()
+
+    assert set(vectors.points) == {"obsidian:guide:0"}
+    assert service.plan_reconciliation()["needs_index"] == []
+
+
+def test_memory_service_rejects_invalid_batch_size(tmp_path):
+    notes, vectors, _service = lifecycle(tmp_path)
+    with pytest.raises(ValueError, match="batch"):
+        MemoryService(notes, vectors, batch_size=0)
+
+
+def test_index_uses_batch_upsert_when_available(tmp_path):
+    notes, vectors, service = lifecycle(tmp_path)
+    notes.write("guide", "short")
+    batches = []
+
+    def upsert_many(batch):
+        batches.append(batch)
+        for point_id, text, payload in batch:
+            vectors.upsert(point_id, text, payload)
+
+    vectors.upsert_many = upsert_many
+    assert service.index("guide") == 1
+    assert len(batches) == 1
+
+
+def test_index_removes_prior_points_when_upsert_does_not_materialize(tmp_path):
+    notes, vectors, service = lifecycle(tmp_path)
+    notes.write("guide", "old")
+    service.index("guide")
+    notes.write("guide", "new")
+    vectors.upsert = lambda *_args: None
+
+    assert service.index("guide") == 1
+    assert vectors.points == {}
+    assert service.plan_reconciliation()["needs_index"] == ["guide"]
+
+
+def test_reconcile_skips_orphan_if_source_becomes_unsafe(tmp_path, monkeypatch):
+    notes, vectors, service = lifecycle(tmp_path)
+    vectors.points["orphan"] = {
+        "id": "orphan",
+        "payload": {"source": "appeared", "source_type": "obsidian"},
+    }
+    original = notes.read
+
+    def changing_read(name):
+        if name == "appeared":
+            raise PermissionError("became unsafe")
+        return original(name)
+
+    monkeypatch.setattr(notes, "read", changing_read)
+    assert service.reconcile()["removed_points"] == 0
+    assert "orphan" in vectors.points
+
+
+def test_reconcile_preview_tolerates_note_removed_after_listing(tmp_path, monkeypatch):
+    notes, _vectors, service = lifecycle(tmp_path)
+    monkeypatch.setattr(notes, "list_documents", lambda: ["missing"])
+    assert service.plan_reconciliation()["needs_index"] == []
+
+
 def test_qdrant_index_excludes_generated_and_hidden_vault_documents(tmp_path):
     notes, _vectors, service = lifecycle(tmp_path)
     notes.write("rules/Harness-Prinzipien", "Keep memory local.")

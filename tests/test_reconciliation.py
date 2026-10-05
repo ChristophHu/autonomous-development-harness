@@ -40,7 +40,14 @@ def test_restart_reconciles_actual_state_before_replanning(tmp_path):
         if prompt.startswith("REVIEW:"):
             review = json.loads(result)
             review["criteria"]["missing"] = True
-            review["criterion_evidence"]["missing"] = ["criterion:missing"]
+            payload = json.loads(prompt.split("\n", 1)[1])
+            steps = payload["task"]["plan"]["subtasks"]
+            mapped = next(
+                f"plan-step:{step['id']}"
+                for step in steps
+                if "missing" in step["acceptance_criteria"]
+            )
+            review["criterion_evidence"]["missing"] = [mapped, "criterion:missing"]
             return json.dumps(review)
         return result
 
@@ -124,6 +131,34 @@ def test_reconciliation_distrusts_history_and_inspects_commands(tmp_path):
         ["diff", "--no-ext-diff", "--no-textconv", "HEAD", "--"],
     ]
     assert report.tests["acceptance_commands"]["fail"]["returncode"] == 2
+
+
+def test_reconciliation_does_not_pass_stale_plan_as_current_context(tmp_path):
+    from harness.agents import PlannerOutput, Subtask
+
+    store, orchestrator, task = ready_runtime(tmp_path)
+    created = store.create(task)
+    plan = PlannerOutput(
+        summary="stale plan",
+        complexity="low",
+        subtasks=[Subtask(id="old-step", title="Old", description="old")],
+    )
+    store.save_execution_plan(created, plan)
+    orchestrator.tools.git = lambda _args: SimpleNamespace(
+        returncode=0, stdout="", stderr=""
+    )
+    orchestrator.validator.run_tests = lambda _task: {
+        "commands": [],
+        "coverage": {"totals": {"percent_covered": 100}},
+    }
+
+    report = ReconciliationService(
+        store, orchestrator.tools, orchestrator.validator
+    ).inspect(created, previous_plan_current=False)
+
+    assert report.previous_plan is None
+    assert report.previous_plan_current is False
+    assert "stale or unverified" in report.planner_context()
 
 
 def test_reconciliation_rejects_external_files_and_propagates_inspection_errors(

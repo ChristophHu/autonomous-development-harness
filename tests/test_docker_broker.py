@@ -44,7 +44,14 @@ def broker(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "harness.docker_broker.shutil.which", lambda *_a, **_k: "/usr/bin/true"
     )
-    return DockerComposeBroker(compose, socket_path), compose, socket_path
+    service = DockerComposeBroker(compose, socket_path)
+    compose_plugin = tmp_path / "docker-compose"
+    compose_plugin.write_text("fixture compose plugin")
+    compose_plugin.chmod(0o700)
+    monkeypatch.setattr(
+        docker_broker_module, "DOCKER_COMPOSE_PLUGIN_PATHS", (compose_plugin,)
+    )
+    return service, compose, socket_path
 
 
 @pytest.mark.parametrize(
@@ -64,6 +71,7 @@ def test_docker_actions_build_only_fixed_compose_commands(broker, action, suffix
     assert f"unix://{sock.resolve()}" in command
     assert "--project-name" in command
     assert "--env-file" in command
+    assert command[command.index("--env-file") + 1].endswith("/docker-config/empty.env")
 
 
 @pytest.mark.parametrize("tail", [0, 501, True, 1.2, "100"])
@@ -143,6 +151,33 @@ def test_docker_manifest_rejects_missing_file_and_symlink(tmp_path):
 def test_docker_broker_resolves_relative_compose_file_from_project_root():
     broker = DockerComposeBroker("docker-compose.yml", "/tmp/docker.sock")
     assert broker.compose_file == PROJECT_ROOT / "docker-compose.yml"
+
+
+def test_docker_compose_plugin_resolves_only_known_install_locations(
+    broker, monkeypatch, tmp_path
+):
+    service, _compose, _sock = broker
+    plugin = tmp_path / "docker-compose-plugin"
+    plugin.write_text("compose plugin")
+    plugin.chmod(0o700)
+    non_executable = tmp_path / "non-executable-plugin"
+    non_executable.write_text("not executable")
+    non_executable.chmod(0o600)
+    monkeypatch.setattr(
+        docker_broker_module,
+        "DOCKER_COMPOSE_PLUGIN_PATHS",
+        (non_executable, plugin),
+    )
+
+    assert service._compose_plugin() == plugin.resolve()
+
+    monkeypatch.setattr(
+        docker_broker_module,
+        "DOCKER_COMPOSE_PLUGIN_PATHS",
+        (tmp_path / "missing-compose-plugin",),
+    )
+    with pytest.raises(PermissionError, match="Compose plugin is unavailable"):
+        service._compose_plugin()
 
 
 @pytest.mark.parametrize("home_socket_exists", [True, False])
@@ -243,6 +278,12 @@ def test_docker_run_uses_scrubbed_environment_and_caps_output(broker, monkeypatc
     def fake_run(command, **kwargs):
         captured["command"] = command
         captured.update(kwargs)
+        captured["docker_config_contents"] = (
+            Path(kwargs["env"]["DOCKER_CONFIG"]) / "config.json"
+        ).read_text()
+        captured["empty_env_contents"] = Path(
+            command[command.index("--env-file") + 1]
+        ).read_text()
         return subprocess.CompletedProcess(command, 0, "x" * (MAX_OUTPUT + 5), None)
 
     monkeypatch.setenv("DOCKER_HOST", "tcp://attacker.invalid:2375")
@@ -258,6 +299,13 @@ def test_docker_run_uses_scrubbed_environment_and_caps_output(broker, monkeypatc
     assert captured["env"].get("DOCKER_CONTEXT") is None
     assert Path(captured["env"]["HOME"]).parent == Path("/private/tmp")
     assert captured["env"]["HOME"] != str(Path.home())
+    docker_config = Path(captured["env"]["DOCKER_CONFIG"])
+    assert docker_config.parent.parent == Path(captured["env"]["HOME"])
+    assert yaml.safe_load(captured["docker_config_contents"]) == {
+        "cliPluginsExtraDirs": [str(broker[0]._compose_plugin().parent)]
+    }
+    assert captured["empty_env_contents"] == ""
+    assert captured["env"].get("DOCKER_AUTH_CONFIG") is None
     assert captured["timeout"] == 120
     assert result.returncode == 0
     assert result.stdout.endswith("[output truncated by Docker broker]")
@@ -278,6 +326,12 @@ def test_isolated_compose_uses_unique_project_port_and_scoped_volume(
             Path(command[command.index("-f") + 1]).read_text()
         )
         captured.update(kwargs)
+        captured["docker_config_contents"] = (
+            Path(kwargs["env"]["DOCKER_CONFIG"]) / "config.json"
+        ).read_text()
+        captured["empty_env_contents"] = Path(
+            command[command.index("--env-file") + 1]
+        ).read_text()
         return subprocess.CompletedProcess(command, 0, "", "")
 
     monkeypatch.setattr("harness.docker_broker.subprocess.run", fake_run)
@@ -298,6 +352,14 @@ def test_isolated_compose_uses_unique_project_port_and_scoped_volume(
     assert captured["manifest"]["volumes"] == {"qdrant_data": None}
     assert Path(captured["env"]["HOME"]).parent == Path("/private/tmp")
     assert captured["env"]["HOME"] != str(Path.home())
+    assert Path(captured["env"]["DOCKER_CONFIG"]).parent.parent == Path(
+        captured["env"]["HOME"]
+    )
+    assert yaml.safe_load(captured["docker_config_contents"]) == {
+        "cliPluginsExtraDirs": [str(service._compose_plugin().parent)]
+    }
+    assert captured["empty_env_contents"] == ""
+    assert str(service._compose_plugin().resolve()) in command[2]
     assert compose.read_text() == compose_text()
 
 
